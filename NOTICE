@@ -1,0 +1,27 @@
+pi-go
+Copyright (c) 2026 guanshan
+
+This product is a Go port of the Pi coding agent originally written in
+TypeScript by Mario Zechner and the upstream Pi contributors:
+
+    https://github.com/badlogic/pi-mono
+    Copyright (c) 2025 Mario Zechner
+    Licensed under the MIT License.
+
+The upstream MIT license notice is retained in LICENSE. Significant portions
+of the architecture, protocols, on-disk session format, and tool semantics
+are derived from that upstream work. Behavioural compatibility is tracked in
+docs/TS_COMPATIBILITY.md.
+
+The TypeScript/JavaScript extension samples under examples/extensions/ are
+carried over from the upstream Pi project (MIT) and are provided for reference.
+pi-go ships a minimal Node-based script bridge that can execute simple custom
+tool extensions, but it does not yet implement the full upstream extension API,
+so most of these samples will not run end to end. The examples/extensions/doom-overlay demo
+integrates DOOM via doomgeneric (https://github.com/ozkl/doomgeneric) and id
+Software's DOOM source, which are licensed under GPL-2.0. No compiled DOOM
+artifacts are distributed in this repository; they are built locally from
+GPL-2.0 sources and are not covered by this project's MIT license.
+
+Trademarks and project names mentioned in this repository are the property
+of their respective owners.

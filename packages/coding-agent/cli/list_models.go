@@ -1,0 +1,170 @@
+package cli
+
+import (
+	"fmt"
+	"io"
+	"sort"
+	"strings"
+
+	"github.com/guanshan/pi-go/packages/ai"
+	"github.com/guanshan/pi-go/packages/tui"
+)
+
+// ModelLister is the small registry surface needed by PrintModels.
+type ModelLister interface {
+	List(search string) []ai.Model
+}
+
+// PrintModels renders the TS-compatible model table used by --list-models.
+func PrintModels(w io.Writer, registry ModelLister, searchPattern string) {
+	models := registry.List("")
+	if searchPattern != "" {
+		models = fuzzyFilterModels(models, searchPattern)
+	}
+	if len(models) == 0 {
+		if searchPattern != "" {
+			fmt.Fprintf(w, "No models matching %q\n", searchPattern)
+			return
+		}
+		fmt.Fprintln(w, "No models available. Configure API keys or models.json and try again.")
+		return
+	}
+
+	sort.Slice(models, func(i, j int) bool {
+		if models[i].Provider != models[j].Provider {
+			return models[i].Provider < models[j].Provider
+		}
+		return models[i].ID < models[j].ID
+	})
+
+	rows := make([]modelListRow, 0, len(models))
+	for _, model := range models {
+		rows = append(rows, modelListRow{
+			Provider: model.Provider,
+			Model:    model.ID,
+			Context:  formatTokenCount(model.ContextWindow),
+			MaxOut:   formatTokenCount(model.MaxOutput),
+			Thinking: yesNo(model.Reasoning || len(model.ThinkingLevels) > 1),
+			Images:   yesNo(modelSupportsInput(model, "image")),
+		})
+	}
+	printModelRows(w, rows)
+}
+
+type modelListRow struct {
+	Provider string
+	Model    string
+	Context  string
+	MaxOut   string
+	Thinking string
+	Images   string
+}
+
+func printModelRows(w io.Writer, rows []modelListRow) {
+	widths := modelListRow{
+		Provider: "provider",
+		Model:    "model",
+		Context:  "context",
+		MaxOut:   "max-out",
+		Thinking: "thinking",
+		Images:   "images",
+	}
+	for _, row := range rows {
+		widths.Provider = wider(widths.Provider, row.Provider)
+		widths.Model = wider(widths.Model, row.Model)
+		widths.Context = wider(widths.Context, row.Context)
+		widths.MaxOut = wider(widths.MaxOut, row.MaxOut)
+		widths.Thinking = wider(widths.Thinking, row.Thinking)
+		widths.Images = wider(widths.Images, row.Images)
+	}
+
+	fmt.Fprintf(w, "%-*s  %-*s  %-*s  %-*s  %-*s  %-*s\n",
+		len(widths.Provider), "provider",
+		len(widths.Model), "model",
+		len(widths.Context), "context",
+		len(widths.MaxOut), "max-out",
+		len(widths.Thinking), "thinking",
+		len(widths.Images), "images",
+	)
+	for _, row := range rows {
+		fmt.Fprintf(w, "%-*s  %-*s  %-*s  %-*s  %-*s  %-*s\n",
+			len(widths.Provider), row.Provider,
+			len(widths.Model), row.Model,
+			len(widths.Context), row.Context,
+			len(widths.MaxOut), row.MaxOut,
+			len(widths.Thinking), row.Thinking,
+			len(widths.Images), row.Images,
+		)
+	}
+}
+
+func fuzzyFilterModels(models []ai.Model, pattern string) []ai.Model {
+	type scored struct {
+		model ai.Model
+		score int
+	}
+	var matches []scored
+	for _, model := range models {
+		haystack := model.Provider + " " + model.ID + " " + model.Name
+		match, ok := tui.FuzzyMatchString(pattern, haystack)
+		if !ok {
+			continue
+		}
+		matches = append(matches, scored{model: model, score: match.Score})
+	}
+	sort.SliceStable(matches, func(i, j int) bool {
+		if matches[i].score != matches[j].score {
+			return matches[i].score < matches[j].score
+		}
+		left := matches[i].model.Provider + "/" + matches[i].model.ID
+		right := matches[j].model.Provider + "/" + matches[j].model.ID
+		return left < right
+	})
+	out := make([]ai.Model, 0, len(matches))
+	for _, match := range matches {
+		out = append(out, match.model)
+	}
+	return out
+}
+
+func formatTokenCount(count int) string {
+	switch {
+	case count >= 1_000_000:
+		if count%1_000_000 == 0 {
+			return fmt.Sprintf("%dM", count/1_000_000)
+		}
+		return fmt.Sprintf("%.1fM", float64(count)/1_000_000)
+	case count >= 1_000:
+		if count%1_000 == 0 {
+			return fmt.Sprintf("%dK", count/1_000)
+		}
+		return fmt.Sprintf("%.1fK", float64(count)/1_000)
+	case count > 0:
+		return fmt.Sprintf("%d", count)
+	default:
+		return "-"
+	}
+}
+
+func modelSupportsInput(model ai.Model, input string) bool {
+	for _, value := range model.Input {
+		if strings.EqualFold(value, input) {
+			return true
+		}
+	}
+	return false
+}
+
+func yesNo(value bool) string {
+	if value {
+		return "yes"
+	}
+	return "no"
+}
+
+func wider(left, right string) string {
+	if len(right) > len(left) {
+		return right
+	}
+	return left
+}

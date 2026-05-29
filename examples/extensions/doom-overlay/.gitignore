@@ -1,0 +1,6 @@
+# Auto-downloaded on first run
+doom1.wad
+
+# Build output (GPL-derived; build locally via doom/build.sh, do not commit)
+doom/build/
+doom/doomgeneric/

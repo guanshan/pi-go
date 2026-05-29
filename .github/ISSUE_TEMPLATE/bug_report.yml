@@ -1,0 +1,54 @@
+name: Bug report
+description: Report a defect in pi-go
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to file a bug report. Please be concrete and concise.
+  - type: input
+    id: version
+    attributes:
+      label: pi-go version
+      description: Output of `pi --version` or the commit SHA you built from.
+      placeholder: "v0.1.0 / commit abc1234"
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: OS and architecture
+      placeholder: "macOS 14.4 arm64 / Ubuntu 24.04 amd64 / Windows 11 x64"
+    validations:
+      required: true
+  - type: input
+    id: go-version
+    attributes:
+      label: Go version (if built from source)
+      placeholder: "go version go1.26.0 linux/amd64"
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What did you do, what did you expect, what did you get?
+      placeholder: |
+        1. Ran `pi --model ...`
+        2. Expected: ...
+        3. Got: ...
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs / session output
+      description: Paste any error output. Redact API keys.
+      render: shell
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Pre-flight
+      options:
+        - label: I searched existing issues for duplicates.
+          required: true
+        - label: I am running a recent release (or main).
+          required: true

@@ -1,0 +1,46 @@
+# Built binaries
+/pi
+/pi.exe
+/bin/
+/dist/
+
+# Go test/coverage artifacts
+*.test
+*.out
+*.prof
+coverage.txt
+coverage.html
+
+# goreleaser output
+/dist/
+
+# Editor / IDE
+.vscode/
+.idea/
+.zed/
+.workspace/
+.claude/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# Local pi state
+.pi/
+tui-debug.log
+pi-*.html
+out.html
+out.jsonl
+syntax.jsonl
+*.cpuprofile
+
+# Vendored deps (we don't commit vendor by default)
+/vendor/
+
+# Logs
+*.log

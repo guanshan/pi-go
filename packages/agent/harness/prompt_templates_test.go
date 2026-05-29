@@ -1,0 +1,101 @@
+package harness
+
+import (
+	"context"
+	"os"
+	"path/filepath"
+	"testing"
+
+	harnessenv "github.com/guanshan/pi-go/packages/agent/harness/env"
+)
+
+func TestLoadPromptTemplatesNonRecursiveExplicitAndDiagnostics(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	env, err := harnessenv.NewLocalExecutionEnv(root, "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeHarnessTestFile(t, filepath.Join(root, "a", "one.md"), "---\ndescription: One template\n---\nHello $1")
+	writeHarnessTestFile(t, filepath.Join(root, "a", "nested", "ignored.md"), "Ignored")
+	writeHarnessTestFile(t, filepath.Join(root, "a", "skip.txt"), "Ignored")
+	writeHarnessTestFile(t, filepath.Join(root, "b", "two.md"), "First line description\nBody")
+	writeHarnessTestFile(t, filepath.Join(root, "broken.md"), "---\ndescription: [unterminated\n---\nBody")
+	if err := os.Symlink(filepath.Join(root, "b", "two.md"), filepath.Join(root, "link.md")); err != nil {
+		t.Fatal(err)
+	}
+
+	loaded := LoadPromptTemplates(ctx, env, "a", "b", "broken.md", "link.md", "missing.txt", "a/skip.txt")
+
+	if len(loaded.PromptTemplates) != 3 {
+		t.Fatalf("templates=%#v diagnostics=%#v", loaded.PromptTemplates, loaded.Diagnostics)
+	}
+	if loaded.PromptTemplates[0] != (PromptTemplate{Name: "one", Description: "One template", Content: "Hello $1"}) {
+		t.Fatalf("first template=%#v", loaded.PromptTemplates[0])
+	}
+	if loaded.PromptTemplates[1].Name != "two" || loaded.PromptTemplates[1].Description != "First line description" {
+		t.Fatalf("second template=%#v", loaded.PromptTemplates[1])
+	}
+	if loaded.PromptTemplates[2].Name != "link" || loaded.PromptTemplates[2].Content != "First line description\nBody" {
+		t.Fatalf("link template=%#v", loaded.PromptTemplates[2])
+	}
+	if len(loaded.Diagnostics) != 1 || loaded.Diagnostics[0].Code != "parse_failed" {
+		t.Fatalf("diagnostics=%#v", loaded.Diagnostics)
+	}
+}
+
+func TestLoadSourcedPromptTemplatesPreservesDuplicatesAndSources(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	env, err := harnessenv.NewLocalExecutionEnv(root, "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeHarnessTestFile(t, filepath.Join(root, "user", "demo.md"), "---\ndescription: User\n---\nuser")
+	writeHarnessTestFile(t, filepath.Join(root, "project", "demo.md"), "---\ndescription: Project\n---\nproject")
+	writeHarnessTestFile(t, filepath.Join(root, "project", "broken.md"), "---\ndescription: [bad\n---\nbad")
+
+	loaded := LoadSourcedPromptTemplates(ctx, env, []SourcedPromptTemplateInput{
+		{Path: "user", Source: "user"},
+		{Path: "project", Source: "project"},
+	})
+
+	if len(loaded.PromptTemplates) != 2 || loaded.PromptTemplates[0].PromptTemplate.Content != "user" || loaded.PromptTemplates[1].PromptTemplate.Content != "project" {
+		t.Fatalf("templates=%#v", loaded.PromptTemplates)
+	}
+	if loaded.PromptTemplates[0].Source != "user" || loaded.PromptTemplates[1].Source != "project" {
+		t.Fatalf("sources=%#v", loaded.PromptTemplates)
+	}
+	if len(loaded.Diagnostics) != 1 || loaded.Diagnostics[0].Source != "project" {
+		t.Fatalf("diagnostics=%#v", loaded.Diagnostics)
+	}
+}
+
+func TestPromptTemplateArgumentSubstitution(t *testing.T) {
+	tmpl := PromptTemplate{Name: "demo", Content: "$1 ${@:2} ${@:2:1} $ARGUMENTS $@ {1} {{1}}"}
+	got := FormatPromptTemplateInvocation(tmpl, []string{"hello world", "test", "again"})
+	want := "hello world test again test hello world test again hello world test again {1} {{1}}"
+	if got != want {
+		t.Fatalf("formatted=%q", got)
+	}
+	args := ParseCommandArgs(`one "two words" 'three words' escaped\ space`)
+	wantArgs := []string{"one", "two words", "three words", `escaped\`, "space"}
+	if len(args) != len(wantArgs) {
+		t.Fatalf("args=%#v", args)
+	}
+	for i := range wantArgs {
+		if args[i] != wantArgs[i] {
+			t.Fatalf("args=%#v", args)
+		}
+	}
+}
+
+func writeHarnessTestFile(t *testing.T, filePath string, content string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(filePath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filePath, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}

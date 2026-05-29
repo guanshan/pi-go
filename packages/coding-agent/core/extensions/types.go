@@ -1,0 +1,196 @@
+package extensions
+
+import (
+	"context"
+
+	agentcore "github.com/guanshan/pi-go/packages/agent"
+	"github.com/guanshan/pi-go/packages/ai"
+)
+
+type CommandInfo struct {
+	Name        string
+	Description string
+	Source      string
+	Execute     func(context.Context, string) (string, error) `json:"-"`
+}
+
+// FlagDefinition is a CLI flag declared by an extension (mirroring the upstream
+// ExtensionFlag). Type is "boolean" or "string"; Default is the value used when
+// the flag is not supplied on the command line.
+type FlagDefinition struct {
+	Name        string
+	Description string
+	Type        string
+	Default     any
+}
+
+type ToolDefinition struct {
+	Name        string
+	Label       string
+	Description string
+	Parameters  map[string]any
+	Execute     func(context.Context, []byte) (ai.ToolResult, error)
+}
+
+func DefineTool(name, description string, parameters map[string]any, execute func(context.Context, []byte) (ai.ToolResult, error)) ToolDefinition {
+	return ToolDefinition{Name: name, Label: name, Description: description, Parameters: parameters, Execute: execute}
+}
+
+type SessionStartReason string
+
+const (
+	SessionStartStartup SessionStartReason = "startup"
+	SessionStartReload  SessionStartReason = "reload"
+	SessionStartNew     SessionStartReason = "new"
+	SessionStartResume  SessionStartReason = "resume"
+	SessionStartFork    SessionStartReason = "fork"
+)
+
+type SessionStartEvent struct {
+	Type                string
+	Reason              SessionStartReason
+	PreviousSessionFile string
+}
+
+type SessionBeforeSwitchEvent struct {
+	Type              string
+	Reason            SessionStartReason
+	TargetSessionFile string
+	Cancel            bool
+}
+
+type SessionBeforeForkEvent struct {
+	Type     string
+	EntryID  string
+	Position string
+	Cancel   bool
+}
+
+type CompactionResult struct {
+	Summary          string
+	FirstKeptEntryID string
+	TokensBefore     int
+	Details          any
+}
+
+type SessionBeforeCompactEvent struct {
+	Type               string
+	Preparation        any
+	BranchEntries      any
+	CustomInstructions string
+	Signal             context.Context
+	Cancel             bool
+	Result             *CompactionResult
+}
+
+type SessionCompactEvent struct {
+	Type            string
+	CompactionEntry any
+	FromExtension   bool
+}
+
+type SessionShutdownReason string
+
+const (
+	SessionShutdownQuit   SessionShutdownReason = "quit"
+	SessionShutdownReload SessionShutdownReason = "reload"
+	SessionShutdownNew    SessionShutdownReason = "new"
+	SessionShutdownResume SessionShutdownReason = "resume"
+	SessionShutdownFork   SessionShutdownReason = "fork"
+)
+
+type SessionShutdownEvent struct {
+	Type              string
+	Reason            SessionShutdownReason
+	TargetSessionFile string
+}
+
+type BranchSummary struct {
+	Summary string
+	Details any
+}
+
+type TreePreparation struct {
+	TargetID            string
+	OldLeafID           string
+	CommonAncestorID    string
+	EntriesToSummarize  any
+	UserWantsSummary    bool
+	CustomInstructions  string
+	ReplaceInstructions bool
+	Label               string
+}
+
+type SessionBeforeTreeEvent struct {
+	Type                string
+	Preparation         TreePreparation
+	Signal              context.Context
+	Cancel              bool
+	Summary             *BranchSummary
+	CustomInstructions  *string
+	ReplaceInstructions *bool
+	Label               *string
+}
+
+type SessionTreeEvent struct {
+	Type          string
+	NewLeafID     string
+	OldLeafID     string
+	SummaryEntry  any
+	FromExtension bool
+}
+
+type AgentStartEvent struct {
+	Type string
+}
+
+type AgentEndEvent struct {
+	Type     string
+	Messages []agentcore.AgentMessage
+}
+
+type TurnStartEvent struct {
+	Type      string
+	TurnIndex int
+	Timestamp int64
+}
+
+type TurnEndEvent struct {
+	Type        string
+	TurnIndex   int
+	Message     agentcore.AgentMessage
+	ToolResults []ai.ToolResultMessage
+}
+
+type MessageStartEvent struct {
+	Type    string
+	Message agentcore.AgentMessage
+}
+
+type MessageUpdateEvent struct {
+	Type                  string
+	Message               agentcore.AgentMessage
+	AssistantMessageEvent ai.AssistantMessageEvent
+}
+
+type MessageEndEvent struct {
+	Type    string
+	Message agentcore.AgentMessage
+}
+
+type ToolCallEvent struct {
+	Type       string
+	ToolCallID string
+	ToolName   string
+	Args       any
+}
+
+type ToolResultEvent struct {
+	Type       string
+	ToolCallID string
+	ToolName   string
+	Args       any
+	Content    []ai.ContentBlock
+	Details    any
+	IsError    bool
+}

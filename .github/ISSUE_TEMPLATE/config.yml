@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Upstream Pi (TypeScript)
+    url: https://github.com/badlogic/pi-mono/issues
+    about: For questions about pi behavior shared with the original TypeScript implementation.

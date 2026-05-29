@@ -1,0 +1,606 @@
+package extensions
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"sync"
+	"sync/atomic"
+
+	"github.com/guanshan/pi-go/packages/ai"
+)
+
+type scriptToolMetadata struct {
+	Name        string         `json:"name"`
+	Label       string         `json:"label"`
+	Description string         `json:"description"`
+	Parameters  map[string]any `json:"parameters"`
+}
+
+type scriptCommandMetadata struct {
+	Name        string `json:"name"`
+	Description string `json:"description"`
+}
+
+type scriptFlagMetadata struct {
+	Name        string `json:"name"`
+	Description string `json:"description"`
+	Type        string `json:"type"`
+	Default     any    `json:"default"`
+}
+
+type scriptReadyMessage struct {
+	Type     string                  `json:"type"`
+	Tools    []scriptToolMetadata    `json:"tools"`
+	Commands []scriptCommandMetadata `json:"commands"`
+	Flags    []scriptFlagMetadata    `json:"flags"`
+	Events   []string                `json:"events"`
+	Error    string                  `json:"error"`
+}
+
+type scriptResponseMessage struct {
+	ID     int64           `json:"id"`
+	OK     bool            `json:"ok"`
+	Result json.RawMessage `json:"result"`
+	Error  string          `json:"error"`
+}
+
+type scriptRuntime struct {
+	path    string
+	cmd     *exec.Cmd
+	stdin   io.WriteCloser
+	scanner *bufio.Scanner
+	stderr  *bytes.Buffer
+	mu      sync.Mutex
+	nextID  int64
+}
+
+func LoadScriptExtensions(ctx context.Context, api *API, paths []string, flagValues map[string]any) []error {
+	if api == nil || len(paths) == 0 {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	var errs []error
+	for _, path := range paths {
+		if strings.TrimSpace(path) == "" {
+			continue
+		}
+		if err := loadScriptExtension(ctx, api, path, flagValues); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errs
+}
+
+func loadScriptExtension(ctx context.Context, api *API, path string, flagValues map[string]any) error {
+	runtime, ready, err := startScriptRuntime(ctx, path, flagValues)
+	if err != nil {
+		return err
+	}
+	for _, flag := range ready.Flags {
+		if flag.Name == "" {
+			continue
+		}
+		// Declared so the host can surface it in --help; the flag's value is
+		// resolved inside the script runtime (seeded from flagValues at spawn).
+		// scriptFlagMetadata is layout-identical to FlagDefinition by design.
+		api.RegisterFlag(FlagDefinition(flag))
+	}
+	for _, tool := range ready.Tools {
+		tool := tool
+		if tool.Name == "" {
+			continue
+		}
+		api.RegisterTool(ToolDefinition{
+			Name:        tool.Name,
+			Label:       firstNonEmpty(tool.Label, tool.Name),
+			Description: tool.Description,
+			Parameters:  tool.Parameters,
+			Execute: func(ctx context.Context, raw []byte) (ai.ToolResult, error) {
+				return runtime.ExecuteTool(ctx, tool.Name, raw)
+			},
+		})
+	}
+	for _, command := range ready.Commands {
+		command := command
+		if command.Name != "" {
+			api.RegisterCommandHandler(command.Name, command.Description, func(ctx context.Context, args string) (string, error) {
+				return runtime.ExecuteCommand(ctx, command.Name, args)
+			})
+		}
+	}
+	for _, event := range ready.Events {
+		event := event
+		if strings.TrimSpace(event) == "" {
+			continue
+		}
+		api.On(event, func(payload any) {
+			result, err := runtime.Emit(context.Background(), event, payload)
+			if err == nil {
+				applyScriptEventResult(event, payload, result)
+			}
+		})
+	}
+	api.OnShutdown(runtime.Shutdown)
+	return nil
+}
+
+func startScriptRuntime(ctx context.Context, path string, flagValues map[string]any) (*scriptRuntime, scriptReadyMessage, error) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		return nil, scriptReadyMessage{}, fmt.Errorf("%s: node executable is required to load script extensions", path)
+	}
+	cmd := exec.CommandContext(ctx, node, "--input-type=module", "--eval", scriptRuntimeBridge, "--", path)
+	cmd.Dir = filepath.Dir(path)
+	// Seed extension CLI flag values before the factory runs so getFlag resolves
+	// command-line values (the host does not yet know which flags the extension
+	// declares, so it forwards all unknown flags; the bridge gates by name).
+	if len(flagValues) > 0 {
+		if encoded, err := json.Marshal(flagValues); err == nil {
+			cmd.Env = append(os.Environ(), "PI_EXTENSION_FLAG_VALUES="+string(encoded))
+		}
+	}
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		return nil, scriptReadyMessage{}, fmt.Errorf("%s: %w", path, err)
+	}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return nil, scriptReadyMessage{}, fmt.Errorf("%s: %w", path, err)
+	}
+	stderr := &bytes.Buffer{}
+	cmd.Stderr = stderr
+	if err := cmd.Start(); err != nil {
+		return nil, scriptReadyMessage{}, fmt.Errorf("%s: %w", path, err)
+	}
+	scanner := bufio.NewScanner(stdout)
+	scanner.Buffer(make([]byte, 0, 64*1024), 10*1024*1024)
+	if !scanner.Scan() {
+		_ = cmd.Wait()
+		return nil, scriptReadyMessage{}, fmt.Errorf("%s: extension loader exited before ready%s", path, scriptStderrSuffix(stderr))
+	}
+	var ready scriptReadyMessage
+	if err := json.Unmarshal(scanner.Bytes(), &ready); err != nil {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+		return nil, scriptReadyMessage{}, fmt.Errorf("%s: invalid extension loader response: %w", path, err)
+	}
+	if ready.Type == "error" || ready.Error != "" {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+		return nil, scriptReadyMessage{}, fmt.Errorf("%s: %s%s", path, firstNonEmpty(ready.Error, "extension failed to load"), scriptStderrSuffix(stderr))
+	}
+	return &scriptRuntime{path: path, cmd: cmd, stdin: stdin, scanner: scanner, stderr: stderr}, ready, nil
+}
+
+func (r *scriptRuntime) ExecuteTool(ctx context.Context, toolName string, raw []byte) (ai.ToolResult, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	var params json.RawMessage
+	if len(raw) > 0 {
+		params = append(json.RawMessage(nil), raw...)
+	} else {
+		params = json.RawMessage(`{}`)
+	}
+	response, err := r.request(ctx, map[string]any{
+		"type":     "execute_tool",
+		"toolName": toolName,
+		"params":   params,
+	})
+	if err != nil {
+		return ai.ToolResult{}, err
+	}
+	var result ai.ToolResult
+	if len(response.Result) == 0 || string(response.Result) == "null" {
+		return result, nil
+	}
+	if err := json.Unmarshal(response.Result, &result); err != nil {
+		return ai.ToolResult{}, fmt.Errorf("%s: invalid tool result for %s: %w", r.path, toolName, err)
+	}
+	return result, nil
+}
+
+func (r *scriptRuntime) ExecuteCommand(ctx context.Context, commandName, args string) (string, error) {
+	response, err := r.request(ctx, map[string]any{
+		"type":        "execute_command",
+		"commandName": commandName,
+		"args":        args,
+	})
+	if err != nil {
+		return "", err
+	}
+	if len(response.Result) == 0 || string(response.Result) == "null" {
+		return "", nil
+	}
+	var text string
+	if err := json.Unmarshal(response.Result, &text); err == nil {
+		return text, nil
+	}
+	return strings.TrimSpace(string(response.Result)), nil
+}
+
+func (r *scriptRuntime) Emit(ctx context.Context, event string, payload any) (json.RawMessage, error) {
+	response, err := r.request(ctx, map[string]any{
+		"type":    "emit",
+		"event":   event,
+		"payload": payload,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return response.Result, nil
+}
+
+func applyScriptEventResult(event string, payload any, result json.RawMessage) {
+	if payload == nil || len(result) == 0 || string(result) == "null" {
+		return
+	}
+	switch normalizeEventKey(event) {
+	case "session_before_switch", "session_before_fork", "session_before_compact", "session_before_tree":
+	default:
+		return
+	}
+	_ = json.Unmarshal(result, payload)
+}
+
+func (r *scriptRuntime) Shutdown(ctx context.Context) error {
+	if r == nil {
+		return nil
+	}
+	_, err := r.request(ctx, map[string]any{"type": "shutdown"})
+	_ = r.stdin.Close()
+	if r.cmd != nil && r.cmd.Process != nil {
+		_ = r.cmd.Process.Kill()
+	}
+	if r.cmd != nil {
+		_ = r.cmd.Wait()
+	}
+	return err
+}
+
+func (r *scriptRuntime) request(ctx context.Context, payload map[string]any) (scriptResponseMessage, error) {
+	if r == nil {
+		return scriptResponseMessage{}, fmt.Errorf("script extension runtime is nil")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return scriptResponseMessage{}, err
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	id := atomic.AddInt64(&r.nextID, 1)
+	payload["id"] = id
+	line, err := json.Marshal(payload)
+	if err != nil {
+		return scriptResponseMessage{}, err
+	}
+	if _, err := r.stdin.Write(append(line, '\n')); err != nil {
+		return scriptResponseMessage{}, fmt.Errorf("%s: failed to write extension request: %w%s", r.path, err, scriptStderrSuffix(r.stderr))
+	}
+	if !r.scanner.Scan() {
+		err := r.scanner.Err()
+		if err == nil {
+			err = io.EOF
+		}
+		return scriptResponseMessage{}, fmt.Errorf("%s: extension runtime stopped: %w%s", r.path, err, scriptStderrSuffix(r.stderr))
+	}
+	var response scriptResponseMessage
+	if err := json.Unmarshal(r.scanner.Bytes(), &response); err != nil {
+		return scriptResponseMessage{}, fmt.Errorf("%s: invalid extension response: %w", r.path, err)
+	}
+	if response.ID != id {
+		return scriptResponseMessage{}, fmt.Errorf("%s: extension response id mismatch: got %d want %d", r.path, response.ID, id)
+	}
+	if !response.OK {
+		return scriptResponseMessage{}, fmt.Errorf("%s: %s%s", r.path, firstNonEmpty(response.Error, "extension request failed"), scriptStderrSuffix(r.stderr))
+	}
+	return response, nil
+}
+
+func scriptStderrSuffix(stderr *bytes.Buffer) string {
+	if stderr == nil || stderr.Len() == 0 {
+		return ""
+	}
+	text := strings.TrimSpace(stderr.String())
+	if text == "" {
+		return ""
+	}
+	if len(text) > 4096 {
+		text = text[len(text)-4096:]
+	}
+	return ": " + text
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+const scriptRuntimeBridge = `
+import { registerHooks } from "node:module";
+import { createInterface } from "node:readline";
+import { pathToFileURL } from "node:url";
+import { inspect } from "node:util";
+
+const extensionPath = process.argv[1];
+const tools = new Map();
+const commands = new Map();
+const flags = new Map();
+const eventHandlers = new Map();
+const shutdownHandlers = [];
+let flagValues = {};
+try {
+	flagValues = JSON.parse(process.env.PI_EXTENSION_FLAG_VALUES || "{}") || {};
+} catch {
+	flagValues = {};
+}
+
+for (const level of ["log", "info", "warn", "error"]) {
+	console[level] = (...args) => {
+		process.stderr.write(args.map((arg) => typeof arg === "string" ? arg : inspect(arg, { depth: 4 })).join(" ") + "\n");
+	};
+}
+
+function write(message) {
+	process.stdout.write(JSON.stringify(message) + "\n");
+}
+
+function typeModuleSource() {
+	return [
+		"const optionalKey = \"__piOptional\";",
+		"function clean(schema) {",
+		"  if (!schema || typeof schema !== \"object\") return schema;",
+		"  const out = { ...schema };",
+		"  delete out[optionalKey];",
+		"  return out;",
+		"}",
+		"export const Type = {",
+		"  Object(properties = {}, options = {}) {",
+		"    const required = [];",
+		"    const cleaned = {};",
+		"    for (const [key, schema] of Object.entries(properties ?? {})) {",
+		"      if (!schema || schema[optionalKey] !== true) required.push(key);",
+		"      cleaned[key] = clean(schema);",
+		"    }",
+		"    const result = { type: \"object\", properties: cleaned, additionalProperties: false, ...options };",
+		"    if (required.length > 0) result.required = required;",
+		"    return result;",
+		"  },",
+		"  String(options = {}) { return { type: \"string\", ...options }; },",
+		"  Number(options = {}) { return { type: \"number\", ...options }; },",
+		"  Integer(options = {}) { return { type: \"integer\", ...options }; },",
+		"  Boolean(options = {}) { return { type: \"boolean\", ...options }; },",
+		"  Array(items = {}, options = {}) { return { type: \"array\", items, ...options }; },",
+		"  Optional(schema = {}) { return { ...schema, [optionalKey]: true }; },",
+		"  Literal(value, options = {}) { return { const: value, ...options }; },",
+		"  Union(anyOf = [], options = {}) { return { anyOf, ...options }; },",
+		"  Record(keySchema = {}, valueSchema = {}, options = {}) { return { type: \"object\", additionalProperties: valueSchema, ...options }; },",
+		"  Any(options = {}) { return { ...options }; },",
+		"  Unknown(options = {}) { return { ...options }; },",
+		"  Null(options = {}) { return { type: \"null\", ...options }; },",
+		"};",
+		"export function StringEnum(values, options = {}) {",
+		"  return { type: \"string\", enum: Array.from(values ?? []), ...options };",
+		"}",
+		"export default { Type, StringEnum };",
+	].join("\n");
+}
+
+const virtualModules = new Map([
+	["pi-virtual:ai", typeModuleSource()],
+	["pi-virtual:typebox", typeModuleSource()],
+	["pi-virtual:coding-agent", [
+		"export function defineTool(definition) { return definition; }",
+		"export function createEventBus() {",
+		"  const listeners = new Map();",
+		"  return {",
+		"    on(event, listener) {",
+		"      const list = listeners.get(event) ?? [];",
+		"      list.push(listener);",
+		"      listeners.set(event, list);",
+		"      return () => listeners.set(event, (listeners.get(event) ?? []).filter((item) => item !== listener));",
+		"    },",
+		"    emit(event, payload) {",
+		"      for (const listener of listeners.get(event) ?? []) listener(payload);",
+		"    },",
+		"  };",
+		"}",
+		"export default { defineTool, createEventBus };",
+	].join("\n")],
+	["pi-virtual:tui", [
+		"export function matchesKey(data, key) { return data === key; }",
+		"export function truncateToWidth(value, width) { const text = String(value ?? \"\"); return text.length > width ? text.slice(0, Math.max(0, width)) : text; }",
+		"export class Text { constructor(text = \"\") { this.text = text; } render() { return [String(this.text)]; } }",
+		"export class Container { constructor(children = []) { this.children = children; } render(width) { return this.children.flatMap((child) => typeof child?.render === \"function\" ? child.render(width) : [String(child ?? \"\")]); } }",
+		"export class Box extends Container {}",
+		"export class Spacer { render() { return [\"\"]; } }",
+		"export class Input {}",
+		"export class SelectList {}",
+		"export class SettingsList {}",
+		"export class Loader {}",
+		"export class CancellableLoader {}",
+		"export class Markdown { constructor(markdown = \"\") { this.markdown = markdown; } render() { return String(this.markdown).split(\"\\n\"); } }",
+		"export default { matchesKey, truncateToWidth, Text, Container, Box, Spacer, Input, SelectList, SettingsList, Loader, CancellableLoader, Markdown };",
+	].join("\n")],
+]);
+
+function virtualURL(specifier) {
+	if (specifier === "@earendil-works/pi-ai" || specifier.startsWith("@earendil-works/pi-ai/")) return "pi-virtual:ai";
+	if (specifier === "typebox") return "pi-virtual:typebox";
+	if (specifier === "@earendil-works/pi-coding-agent" || specifier.startsWith("@earendil-works/pi-coding-agent/")) return "pi-virtual:coding-agent";
+	if (specifier === "@earendil-works/pi-tui" || specifier.startsWith("@earendil-works/pi-tui/")) return "pi-virtual:tui";
+	return "";
+}
+
+if (typeof registerHooks !== "function") {
+	throw new Error("Node.js module.registerHooks is required for script extension loading");
+}
+
+registerHooks({
+	resolve(specifier, context, nextResolve) {
+		const url = virtualURL(specifier);
+		if (url) return { url, shortCircuit: true };
+		return nextResolve(specifier, context);
+	},
+	load(url, context, nextLoad) {
+		if (virtualModules.has(url)) {
+			return { format: "module", source: virtualModules.get(url), shortCircuit: true };
+		}
+		return nextLoad(url, context);
+	},
+});
+
+function normalizeToolResult(result) {
+	if (result == null) return { content: [], isError: false };
+	if (typeof result === "string") return { content: [{ type: "text", text: result }], isError: false };
+	const out = { ...result };
+	if (typeof out.content === "string") out.content = [{ type: "text", text: out.content }];
+	if (!Array.isArray(out.content)) out.content = [];
+	out.isError = Boolean(out.isError);
+	return out;
+}
+
+const api = {
+	registerTool(definition) {
+		if (!definition?.name) throw new Error("Extension tool is missing a name");
+		tools.set(definition.name, definition);
+	},
+	registerCommand(name, info = {}) {
+		if (!name) throw new Error("Extension command is missing a name");
+		let description = "";
+		let handler;
+		if (typeof info === "string") {
+			description = info;
+		} else if (typeof info === "function") {
+			handler = info;
+		} else {
+			description = info.description ?? "";
+			handler = info.handler ?? info.execute ?? info.run;
+		}
+		commands.set(name, { name, description, handler: typeof handler === "function" ? handler : undefined });
+	},
+	registerFlag(name, options = {}) {
+		if (!name) throw new Error("Extension flag is missing a name");
+		const type = options.type === "string" ? "string" : "boolean";
+		flags.set(name, { name, description: options.description ?? "", type, default: options.default });
+		if (!(name in flagValues) && options.default !== undefined) {
+			flagValues[name] = options.default;
+		}
+	},
+	getFlag(name) {
+		if (!flags.has(name)) return undefined;
+		return flagValues[name];
+	},
+	on(event, handler) {
+		const key = String(event ?? "").trim();
+		if (!key || typeof handler !== "function") return () => {};
+		const list = eventHandlers.get(key) ?? [];
+		list.push(handler);
+		eventHandlers.set(key, list);
+		return () => eventHandlers.set(key, (eventHandlers.get(key) ?? []).filter((item) => item !== handler));
+	},
+	onShutdown(handler) {
+		if (typeof handler === "function") shutdownHandlers.push(handler);
+	},
+	events: {
+		on(event, handler) { return api.on(event, handler); },
+		emit() {},
+	},
+	ui: {
+		notify(message) { console.error(String(message ?? "")); },
+		async select(_message, options = []) { return Array.isArray(options) ? options[0] : undefined; },
+		async confirm() { return false; },
+	},
+};
+
+function extensionContext() {
+	return {
+		hasUI: false,
+		ui: api.ui,
+		sessionManager: { getBranch() { return []; } },
+	};
+}
+
+try {
+	if (!extensionPath) throw new Error("extension path is required");
+	const mod = await import(pathToFileURL(extensionPath).href);
+	const factory = mod.default ?? mod;
+	if (typeof factory !== "function") throw new Error("extension default export must be a function");
+	await factory(api);
+	write({
+		type: "ready",
+		tools: Array.from(tools.values()).map((tool) => ({
+			name: tool.name,
+			label: tool.label ?? tool.name,
+			description: tool.description ?? "",
+			parameters: tool.parameters ?? { type: "object", properties: {} },
+		})),
+		commands: Array.from(commands.values()).map((command) => ({ name: command.name, description: command.description ?? "" })),
+		flags: Array.from(flags.values()),
+		events: Array.from(eventHandlers.keys()),
+	});
+} catch (error) {
+	write({ type: "error", error: error?.stack ?? error?.message ?? String(error) });
+	process.exit(1);
+}
+
+const rl = createInterface({ input: process.stdin, crlfDelay: Infinity });
+rl.on("line", async (line) => {
+	let request;
+		try {
+			request = JSON.parse(line);
+			if (request.type === "execute_tool") {
+				const tool = tools.get(request.toolName);
+				if (!tool) throw new Error("unknown extension tool: " + request.toolName);
+				const result = await tool.execute(String(request.id ?? ""), request.params ?? {}, undefined, undefined, extensionContext());
+				write({ id: request.id, ok: true, result: normalizeToolResult(result) });
+				return;
+		}
+			if (request.type === "execute_command") {
+				const command = commands.get(request.commandName);
+				if (!command) throw new Error("unknown extension command: " + request.commandName);
+				if (typeof command.handler !== "function") throw new Error("extension command has no handler: " + request.commandName);
+				const result = await command.handler(String(request.args ?? ""), extensionContext());
+				write({ id: request.id, ok: true, result: result ?? null });
+				return;
+			}
+			if (request.type === "emit") {
+				const payload = request.payload ?? {};
+				for (const handler of eventHandlers.get(request.event) ?? []) {
+					const result = await handler(payload, extensionContext());
+					if (result && typeof result === "object") Object.assign(payload, result);
+				}
+				delete payload.signal;
+				delete payload.Signal;
+				write({ id: request.id, ok: true, result: payload });
+				return;
+			}
+		if (request.type === "shutdown") {
+			for (let i = shutdownHandlers.length - 1; i >= 0; i--) {
+				await shutdownHandlers[i](extensionContext());
+			}
+			write({ id: request.id, ok: true, result: null });
+			process.exit(0);
+			}
+			throw new Error("unknown extension request: " + request.type);
+		} catch (error) {
+		write({ id: request?.id ?? 0, ok: false, error: error?.stack ?? error?.message ?? String(error) });
+	}
+});
+`
