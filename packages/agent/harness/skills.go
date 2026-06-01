@@ -217,7 +217,7 @@ func loadSkillFromFile(ctx context.Context, env harnessenv.ExecutionEnv, filePat
 		Name:                   name,
 		Description:            description,
 		Content:                body,
-		FilePath:               filePath,
+		FilePath:               envPath(filePath),
 		DisableModelInvocation: frontmatter["disable-model-invocation"] == true,
 	}, diagnostics
 }

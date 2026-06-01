@@ -50,7 +50,7 @@ func TestHandlePackageCommandDoesNotOwnConfig(t *testing.T) {
 func TestLoadResourcesUsesPackagesSettingAndFilters(t *testing.T) {
 	cwd := t.TempDir()
 	agentDir := t.TempDir()
-	t.Setenv("HOME", t.TempDir())
+	setTestHome(t, t.TempDir())
 	packageDir := filepath.Join(cwd, "package")
 	writeCoreTestFile(t, filepath.Join(packageDir, "prompts", "keep.md"), "keep prompt")
 	writeCoreTestFile(t, filepath.Join(packageDir, "prompts", "drop.md"), "drop prompt")

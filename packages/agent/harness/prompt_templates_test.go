@@ -90,6 +90,23 @@ func TestPromptTemplateArgumentSubstitution(t *testing.T) {
 	}
 }
 
+func TestEnvPathHelpersHandleWindowsSeparators(t *testing.T) {
+	root := `C:\work\project\skills`
+	file := `C:\work\project\skills\inspect\SKILL.md`
+	if got := baseEnvPath(file); got != "SKILL.md" {
+		t.Fatalf("base=%q", got)
+	}
+	if got := dirEnvPath(file); got != "C:/work/project/skills/inspect" {
+		t.Fatalf("dir=%q", got)
+	}
+	if got := relativeEnvPath(root, file); got != "inspect/SKILL.md" {
+		t.Fatalf("relative=%q", got)
+	}
+	if got := joinEnvPath(root, `inspect\SKILL.md`); got != "C:/work/project/skills/inspect/SKILL.md" {
+		t.Fatalf("join=%q", got)
+	}
+}
+
 func writeHarnessTestFile(t *testing.T, filePath string, content string) {
 	t.Helper()
 	if err := os.MkdirAll(filepath.Dir(filePath), 0o755); err != nil {

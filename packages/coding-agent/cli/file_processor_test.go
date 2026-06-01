@@ -64,6 +64,21 @@ func TestProcessFileArgumentsTextImageAndReadPathVariants(t *testing.T) {
 	}
 }
 
+func TestFileURLPathHandlesWindowsDriveForms(t *testing.T) {
+	for _, raw := range []string{
+		"file:///C:/work/from%20url.txt",
+		"file:C:%5Cwork%5Cfrom%20url.txt",
+	} {
+		got, ok := fileURLPath(raw)
+		if !ok {
+			t.Fatalf("fileURLPath(%q) failed", raw)
+		}
+		if normalized := strings.ReplaceAll(got, "\\", "/"); normalized != "C:/work/from url.txt" {
+			t.Fatalf("fileURLPath(%q)=%q", raw, got)
+		}
+	}
+}
+
 func TestParseConfigSelection(t *testing.T) {
 	indexes, err := ParseConfigSelection("1, 2 2\t3", 3)
 	if err != nil {

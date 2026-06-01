@@ -117,15 +117,47 @@ func normalizePathInput(path string, stripAtPrefix bool) string {
 			return r
 		}
 	}, path)
-	if strings.HasPrefix(path, "file://") {
-		if u, err := url.Parse(path); err == nil {
-			if decoded, err := url.PathUnescape(u.Path); err == nil && decoded != "" {
-				path = decoded
-			}
+	if strings.HasPrefix(path, "file:") {
+		if decoded, ok := fileURLPath(path); ok {
+			path = decoded
 		}
 	}
 	path = expandTilde(path)
 	return strings.TrimFunc(path, unicode.IsControl)
+}
+
+func fileURLPath(raw string) (string, bool) {
+	u, err := url.Parse(raw)
+	if err != nil || u.Scheme != "file" {
+		return "", false
+	}
+	path := u.Path
+	if path == "" {
+		path = u.Opaque
+	}
+	if u.Host != "" && u.Host != "localhost" {
+		if path == "" {
+			path = u.Host
+		} else {
+			path = "//" + u.Host + path
+		}
+	}
+	decoded, err := url.PathUnescape(path)
+	if err != nil || decoded == "" {
+		return "", false
+	}
+	if strings.HasPrefix(decoded, "/") && isWindowsDrivePath(decoded[1:]) {
+		decoded = decoded[1:]
+	}
+	return filepath.FromSlash(decoded), true
+}
+
+func isWindowsDrivePath(path string) bool {
+	if len(path) < 2 || path[1] != ':' {
+		return false
+	}
+	c := path[0]
+	return c >= 'A' && c <= 'Z' || c >= 'a' && c <= 'z'
 }
 
 func expandTilde(path string) string {

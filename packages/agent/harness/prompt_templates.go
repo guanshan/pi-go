@@ -332,6 +332,8 @@ func errorMessage(err error) string {
 }
 
 func joinEnvPath(base string, child string) string {
+	base = envPath(base)
+	child = envPath(child)
 	if base == "" || base == "/" {
 		return "/" + strings.TrimLeft(child, "/")
 	}
@@ -339,7 +341,7 @@ func joinEnvPath(base string, child string) string {
 }
 
 func dirEnvPath(p string) string {
-	normalized := strings.TrimRight(p, "/")
+	normalized := strings.TrimRight(envPath(p), "/")
 	idx := strings.LastIndex(normalized, "/")
 	if idx <= 0 {
 		return "/"
@@ -348,7 +350,7 @@ func dirEnvPath(p string) string {
 }
 
 func baseEnvPath(p string) string {
-	normalized := strings.TrimRight(p, "/")
+	normalized := strings.TrimRight(envPath(p), "/")
 	idx := strings.LastIndex(normalized, "/")
 	if idx < 0 {
 		return normalized
@@ -357,8 +359,8 @@ func baseEnvPath(p string) string {
 }
 
 func relativeEnvPath(root string, p string) string {
-	root = strings.TrimRight(root, "/")
-	p = strings.TrimRight(p, "/")
+	root = strings.TrimRight(envPath(root), "/")
+	p = strings.TrimRight(envPath(p), "/")
 	if p == root {
 		return ""
 	}
@@ -366,4 +368,8 @@ func relativeEnvPath(root string, p string) string {
 		return p[len(root)+1:]
 	}
 	return strings.TrimLeft(p, "/")
+}
+
+func envPath(p string) string {
+	return strings.ReplaceAll(p, "\\", "/")
 }

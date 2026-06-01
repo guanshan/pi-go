@@ -31,7 +31,7 @@ func TestSessionDirSupportsLegacyEnv(t *testing.T) {
 
 func TestExpandTildePathAndPackageDir(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	setTestHome(t, home)
 	if got := ExpandTildePath("~/sessions"); got != filepath.Join(home, "sessions") {
 		t.Fatalf("expanded path = %q", got)
 	}
@@ -77,4 +77,12 @@ func TestSettingsManagerMigratesLegacySettings(t *testing.T) {
 	if settings.ProviderRetryMaxDelayMS() != 1234 {
 		t.Fatalf("provider max delay=%d", settings.ProviderRetryMaxDelayMS())
 	}
+}
+
+func setTestHome(t *testing.T, home string) {
+	t.Helper()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	t.Setenv("HOMEDRIVE", "")
+	t.Setenv("HOMEPATH", "")
 }
