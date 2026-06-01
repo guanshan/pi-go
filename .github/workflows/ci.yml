@@ -56,7 +56,16 @@ jobs:
 
       - name: Test
         if: matrix.os == 'windows-latest'
-        run: go test -timeout 5m ./...
+        shell: pwsh
+        run: |
+          go test -timeout 5m ./... 2>&1 | Tee-Object -FilePath test-output.txt
+          $exitCode = $LASTEXITCODE
+          if ($exitCode -ne 0) {
+            $tail = Get-Content test-output.txt -Tail 120 | Out-String
+            $tail = $tail -replace '%', '%25' -replace "`r", '%0D' -replace "`n", '%0A'
+            Write-Host "::error title=Windows go test failed::$tail"
+            exit $exitCode
+          }
 
       - name: Upload coverage
         if: matrix.os == 'ubuntu-latest'
