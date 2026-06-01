@@ -128,6 +128,9 @@ func normalizePathInput(path string, stripAtPrefix bool) string {
 
 func fileURLPath(raw string) (string, bool) {
 	raw = strings.ReplaceAll(raw, "\\", "/")
+	if path, ok := windowsDriveFileURLPath(raw); ok {
+		return path, true
+	}
 	u, err := url.Parse(raw)
 	if err != nil || u.Scheme != "file" {
 		return "", false
@@ -149,6 +152,27 @@ func fileURLPath(raw string) (string, bool) {
 	}
 	if strings.HasPrefix(decoded, "/") && isWindowsDrivePath(decoded[1:]) {
 		decoded = decoded[1:]
+	}
+	return filepath.FromSlash(decoded), true
+}
+
+func windowsDriveFileURLPath(raw string) (string, bool) {
+	const scheme = "file:"
+	if !strings.HasPrefix(raw, scheme) {
+		return "", false
+	}
+	path := strings.TrimPrefix(raw, scheme)
+	if strings.HasPrefix(path, "//") {
+		path = strings.TrimPrefix(path, "//")
+	} else if strings.HasPrefix(path, "/") {
+		path = strings.TrimLeft(path, "/")
+	}
+	if !isWindowsDrivePath(path) {
+		return "", false
+	}
+	decoded, err := url.PathUnescape(path)
+	if err != nil || decoded == "" {
+		return "", false
 	}
 	return filepath.FromSlash(decoded), true
 }

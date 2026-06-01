@@ -18,6 +18,7 @@ require (
 	github.com/rivo/uniseg v0.4.7
 	github.com/yuin/goldmark v1.8.2
 	go.uber.org/goleak v1.3.0
+	golang.org/x/sys v0.43.0
 	golang.org/x/text v0.27.0
 	google.golang.org/genai v1.58.0
 	gopkg.in/yaml.v3 v3.0.1
@@ -70,7 +71,6 @@ require (
 	golang.org/x/crypto v0.40.0 // indirect
 	golang.org/x/net v0.41.0 // indirect
 	golang.org/x/sync v0.20.0 // indirect
-	golang.org/x/sys v0.43.0 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20240903143218-8af14fe29dc1 // indirect
 	google.golang.org/grpc v1.66.2 // indirect
 	google.golang.org/protobuf v1.34.2 // indirect
