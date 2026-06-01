@@ -13,7 +13,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 	"unicode/utf8"
 
@@ -396,19 +395,6 @@ func KillTrackedDetachedChildren() {
 	trackedDetachedChildren.Unlock()
 	for _, pid := range pids {
 		KillProcessTree(pid)
-	}
-}
-
-func KillProcessTree(pid int) {
-	if pid <= 0 {
-		return
-	}
-	if runtime.GOOS == "windows" {
-		_ = exec.Command("taskkill", "/F", "/T", "/PID", strconv.Itoa(pid)).Start()
-		return
-	}
-	if err := syscall.Kill(-pid, syscall.SIGKILL); err != nil {
-		_ = syscall.Kill(pid, syscall.SIGKILL)
 	}
 }
 

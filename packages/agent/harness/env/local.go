@@ -322,9 +322,7 @@ func (e *LocalExecutionEnv) Exec(ctx context.Context, command string, opts ExecO
 	cmd := exec.CommandContext(execCtx, shell, append(args, command)...)
 	cmd.Dir = cwd
 	cmd.Env = e.shellEnvironment(opts.Env)
-	if runtime.GOOS != "windows" {
-		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	}
+	configureProcessGroup(cmd)
 	var stdoutBuf, stderrBuf bytes.Buffer
 	cmd.Stdout = &executionStreamWriter{buffer: &stdoutBuf, callback: opts.OnStdout}
 	cmd.Stderr = &executionStreamWriter{buffer: &stderrBuf, callback: opts.OnStderr}
@@ -487,19 +485,6 @@ func cloneStringMap(input map[string]string) map[string]string {
 		out[key] = value
 	}
 	return out
-}
-
-func killProcessTree(pid int) {
-	if pid <= 0 {
-		return
-	}
-	if runtime.GOOS == "windows" {
-		_ = exec.Command("taskkill", "/F", "/T", "/PID", fmt.Sprint(pid)).Start()
-		return
-	}
-	if err := syscall.Kill(-pid, syscall.SIGKILL); err != nil {
-		_ = syscall.Kill(pid, syscall.SIGKILL)
-	}
 }
 
 var _ ExecutionEnv = (*LocalExecutionEnv)(nil)
