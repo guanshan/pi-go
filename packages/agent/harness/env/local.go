@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 )
 
 type LocalExecutionEnv struct {
@@ -323,6 +324,13 @@ func (e *LocalExecutionEnv) Exec(ctx context.Context, command string, opts ExecO
 	cmd.Dir = cwd
 	cmd.Env = e.shellEnvironment(opts.Env)
 	configureProcessGroup(cmd)
+	cmd.Cancel = func() error {
+		if cmd.Process != nil {
+			killProcessTree(cmd.Process.Pid)
+		}
+		return nil
+	}
+	cmd.WaitDelay = 2 * time.Second
 	var stdoutBuf, stderrBuf bytes.Buffer
 	cmd.Stdout = &executionStreamWriter{buffer: &stdoutBuf, callback: opts.OnStdout}
 	cmd.Stderr = &executionStreamWriter{buffer: &stderrBuf, callback: opts.OnStderr}

@@ -22,7 +22,7 @@ func TestLoadPromptTemplatesNonRecursiveExplicitAndDiagnostics(t *testing.T) {
 	writeHarnessTestFile(t, filepath.Join(root, "b", "two.md"), "First line description\nBody")
 	writeHarnessTestFile(t, filepath.Join(root, "broken.md"), "---\ndescription: [unterminated\n---\nBody")
 	if err := os.Symlink(filepath.Join(root, "b", "two.md"), filepath.Join(root, "link.md")); err != nil {
-		t.Fatal(err)
+		t.Skipf("requires symlink support: %v", err)
 	}
 
 	loaded := LoadPromptTemplates(ctx, env, "a", "b", "broken.md", "link.md", "missing.txt", "a/skip.txt")

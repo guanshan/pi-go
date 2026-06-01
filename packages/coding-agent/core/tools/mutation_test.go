@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -61,6 +62,9 @@ func TestWriteMutationQueueSerializesSameFile(t *testing.T) {
 }
 
 func TestWritePreservesExistingMode(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows does not preserve Unix permission bits")
+	}
 	cwd := t.TempDir()
 	path := filepath.Join(cwd, "secret.txt")
 	if err := os.WriteFile(path, []byte("old"), 0o600); err != nil {
@@ -84,6 +88,9 @@ func TestWritePreservesExistingMode(t *testing.T) {
 }
 
 func TestEditPreservesExistingMode(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows does not preserve Unix permission bits")
+	}
 	cwd := t.TempDir()
 	path := filepath.Join(cwd, "script.sh")
 	if err := os.WriteFile(path, []byte("echo old\n"), 0o755); err != nil {

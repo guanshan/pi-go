@@ -37,7 +37,7 @@ func TestDefaultResourceLoaderLoadsTSStyleResources(t *testing.T) {
 	if agentsFiles[0].Path != filepath.Join(agentDir, "AGENTS.md") || agentsFiles[0].Content != "global agents" {
 		t.Fatalf("global context not first: %#v", agentsFiles)
 	}
-	if agentsFiles[1].Path != filepath.Join(root, "workspace", "AGENTS.MD") {
+	if filepath.Dir(agentsFiles[1].Path) != filepath.Join(root, "workspace") || !strings.EqualFold(filepath.Base(agentsFiles[1].Path), "AGENTS.md") || agentsFiles[1].Content != "project agents" {
 		t.Fatalf("uppercase ancestor context not loaded: %#v", agentsFiles)
 	}
 

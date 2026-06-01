@@ -51,7 +51,12 @@ jobs:
         run: ./scripts/check_release_hygiene.sh
 
       - name: Test
+        if: matrix.os != 'windows-latest'
         run: go test -race -timeout 5m -coverprofile=coverage.txt -covermode=atomic ./...
+
+      - name: Test
+        if: matrix.os == 'windows-latest'
+        run: go test -timeout 5m ./...
 
       - name: Upload coverage
         if: matrix.os == 'ubuntu-latest'

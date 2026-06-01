@@ -5,6 +5,7 @@ package tools
 import (
 	"context"
 	"os"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -73,10 +74,8 @@ func TestBashToolStreamsUpdates(t *testing.T) {
 func TestBashToolTimeout(t *testing.T) {
 	tool := BashTool{CWD: t.TempDir()}
 	start := time.Now()
-	// seq completes and flushes its output to the pipe before the sleep, so the
-	// partial output survives the SIGKILL (a single buffered echo would not).
 	result := tool.Execute(context.Background(), raw(map[string]any{
-		"command": "seq 1 2000; sleep 30",
+		"command": "printf 'ready\\n'; sleep 30",
 		"timeout": 3.0,
 	}), nil)
 	if elapsed := time.Since(start); elapsed > 10*time.Second {
@@ -89,7 +88,7 @@ func TestBashToolTimeout(t *testing.T) {
 	if !strings.Contains(text, "timed out") {
 		t.Fatalf("missing timeout message: %q", text)
 	}
-	if !strings.Contains(text, "2000") {
+	if !strings.Contains(text, "ready") {
 		t.Fatalf("partial output not preserved on timeout: %q", lastLines(text, 3))
 	}
 }
@@ -107,7 +106,7 @@ func TestBashToolAbort(t *testing.T) {
 		}
 	}
 	start := time.Now()
-	result := tool.Execute(ctx, raw(map[string]any{"command": "seq 1 2000; sleep 30"}), onUpdate)
+	result := tool.Execute(ctx, raw(map[string]any{"command": "printf 'ready\\n'; sleep 30"}), onUpdate)
 	if elapsed := time.Since(start); elapsed > 10*time.Second {
 		t.Fatalf("abort did not terminate promptly: %s", elapsed)
 	}
@@ -118,12 +117,15 @@ func TestBashToolAbort(t *testing.T) {
 	if !strings.Contains(text, "Command aborted") {
 		t.Fatalf("missing abort message: %q", text)
 	}
-	if !strings.Contains(text, "2000") {
+	if !strings.Contains(text, "ready") {
 		t.Fatalf("partial output not preserved on abort: %q", lastLines(text, 3))
 	}
 }
 
 func TestBashToolKillsProcessGroupOnAbort(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("process liveness probe is Linux-specific")
+	}
 	if _, err := os.Stat("/bin/sh"); err != nil {
 		t.Skip("requires unix shell")
 	}
@@ -177,7 +179,7 @@ func TestBashToolTruncationWritesFullOutput(t *testing.T) {
 	tool := BashTool{CWD: t.TempDir()}
 	totalLines := DefaultMaxLines + 500
 	result := tool.Execute(context.Background(), raw(map[string]any{
-		"command": "seq 1 " + strconv.Itoa(totalLines),
+		"command": linePrinterCommand(totalLines),
 	}), nil)
 	if result.IsError {
 		t.Fatalf("unexpected error: %s", toolText(result.Content))
@@ -214,4 +216,8 @@ func lastLines(s string, n int) string {
 		lines = lines[len(lines)-n:]
 	}
 	return strings.Join(lines, "\n")
+}
+
+func linePrinterCommand(total int) string {
+	return `i=1; while [ "$i" -le ` + strconv.Itoa(total) + ` ]; do echo "$i"; i=$((i + 1)); done`
 }

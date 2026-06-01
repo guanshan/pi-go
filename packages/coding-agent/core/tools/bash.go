@@ -30,6 +30,9 @@ func (BashTool) Schema() map[string]any {
 const bashUpdateThrottle = 100 * time.Millisecond
 
 func (t BashTool) Execute(ctx context.Context, raw json.RawMessage, onUpdate ToolUpdate) ai.ToolResult {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	var args struct {
 		Command string  `json:"command"`
 		Timeout float64 `json:"timeout"`
@@ -49,9 +52,16 @@ func (t BashTool) Execute(ctx context.Context, raw json.RawMessage, onUpdate Too
 	// The command runs in its own process group so that on abort/timeout the
 	// entire tree (including detached children) can be killed, not just the
 	// shell. See killProcessGroup (bash_exec_*.go).
-	cmd := ShellCommand(shellConfig, command)
+	execCtx, cancelExec := context.WithCancel(ctx)
+	defer cancelExec()
+	cmd := ShellCommandContext(execCtx, shellConfig, command)
 	cmd.Dir = t.CWD
 	configureProcessGroup(cmd)
+	cmd.Cancel = func() error {
+		killProcessGroup(cmd)
+		return nil
+	}
+	cmd.WaitDelay = 2 * time.Second
 
 	acc := newOutputAccumulator("pi-bash")
 	defer acc.cleanup()
@@ -109,18 +119,22 @@ func (t BashTool) Execute(ctx context.Context, raw json.RawMessage, onUpdate Too
 
 	// Watch for context cancellation (abort) and timeout; kill the whole group.
 	done := make(chan struct{})
+	var cancelOnce sync.Once
+	cancelCommand := func() {
+		cancelOnce.Do(cancelExec)
+	}
 	var timer *time.Timer
 	if args.Timeout > 0 {
 		timer = time.AfterFunc(time.Duration(args.Timeout*float64(time.Second)), func() {
 			timedOut.Store(true)
-			killProcessGroup(cmd)
+			cancelCommand()
 		})
 	}
 	go func() {
 		select {
 		case <-ctx.Done():
 			aborted.Store(true)
-			killProcessGroup(cmd)
+			cancelCommand()
 		case <-done:
 		}
 	}()

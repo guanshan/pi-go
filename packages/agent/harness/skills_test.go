@@ -55,7 +55,7 @@ func TestLoadSkillsRecursesHonorsIgnoresRootMarkdownAndSymlinks(t *testing.T) {
 	writeHarnessTestFile(t, filepath.Join(root, "recursive", "skip", "SKILL.md"), "---\nname: skip\ndescription: Skip skill\n---\nSkip")
 	writeHarnessTestFile(t, filepath.Join(root, "recursive", ".gitignore"), "skip/\n")
 	if err := os.Symlink(filepath.Join(root, "recursive"), filepath.Join(root, "skills-link")); err != nil {
-		t.Fatal(err)
+		t.Skipf("requires symlink support: %v", err)
 	}
 
 	rootLoaded := LoadSkills(ctx, env, "skills")
