@@ -68,6 +68,7 @@ func TestFileURLPathHandlesWindowsDriveForms(t *testing.T) {
 	for _, raw := range []string{
 		"file:///C:/work/from%20url.txt",
 		"file:C:%5Cwork%5Cfrom%20url.txt",
+		`file:\C:%5Cwork%5Cfrom%20url.txt`,
 	} {
 		got, ok := fileURLPath(raw)
 		if !ok {

@@ -127,6 +127,7 @@ func normalizePathInput(path string, stripAtPrefix bool) string {
 }
 
 func fileURLPath(raw string) (string, bool) {
+	raw = strings.ReplaceAll(raw, "\\", "/")
 	u, err := url.Parse(raw)
 	if err != nil || u.Scheme != "file" {
 		return "", false
