@@ -174,10 +174,11 @@ func BuildOpenAIChatRequest(key string, options OpenAIChatRequestOptions) Prepar
 		headers = MergeHeaders(headers, OpenAIChatCopilotHeaders(options.Messages))
 	}
 	bearerAuth := true
-	if options.Provider == "azure-openai" {
+	switch options.Provider {
+	case "azure-openai":
 		bearerAuth = false
 		headers = MergeHeaders(headers, map[string]string{"api-key": key})
-	} else if options.Provider == "cloudflare-ai-gateway" {
+	case "cloudflare-ai-gateway":
 		bearerAuth = false
 		headers = applyCloudflareGatewayAuthHeaders(headers, key)
 	}

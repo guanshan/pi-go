@@ -19,6 +19,16 @@ func Main(ctx context.Context, argv []string) error {
 	return MainWithOptions(ctx, argv, MainOptions{})
 }
 
+type ExitCodeError int
+
+func (e ExitCodeError) Error() string {
+	return fmt.Sprintf("exit %d", e)
+}
+
+func (e ExitCodeError) ExitCode() int {
+	return int(e)
+}
+
 type MainOptions struct {
 	ExtensionFactories []coreext.Factory
 	// PackageManagerFactory supplies the full package manager for CLI
@@ -322,9 +332,7 @@ func MainWithOptions(ctx context.Context, argv []string, options MainOptions) er
 	if args.Print || args.Mode == cli.ModeJSON {
 		exit, err := RunPrintMode(ctx, runtime, args.Mode, initial.Message, initial.Images, os.Stdout, os.Stderr, initial.Remaining)
 		if exit != 0 {
-			// os.Exit skips deferred disposal, so dispose explicitly first.
-			disposeRuntime()
-			os.Exit(exit)
+			return ExitCodeError(exit)
 		}
 		return err
 	}
@@ -531,7 +539,7 @@ func validateSessionCWD(session *SessionManager, fallbackCwd string, nonInteract
 		return nil
 	}
 	if nonInteractive {
-		return fmt.Errorf("Stored session working directory does not exist: %s\nSession file: %s\nCurrent working directory: %s", sessionCwd, sessionFile, fallbackCwd)
+		return fmt.Errorf("Stored session working directory does not exist: %s\nSession file: %s\nCurrent working directory: %s", sessionCwd, sessionFile, fallbackCwd) //nolint:staticcheck // TS-compatible user-facing diagnostic.
 	}
 	fmt.Fprintf(stderr, "cwd from session file does not exist\n%s\n\ncontinue in current cwd\n%s\n", sessionCwd, fallbackCwd)
 	confirmed, err := cli.Confirm(stdin, stderr, "Continue in current cwd?")

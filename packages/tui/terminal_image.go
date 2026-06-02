@@ -389,11 +389,11 @@ func EncodeKitty(data []byte, options ImageRenderOptions) string {
 		last := end == len(base64Data)
 		switch {
 		case first:
-			b.WriteString(fmt.Sprintf("\x1b_G%s,m=1;%s\x1b\\", strings.Join(params, ","), chunk))
+			fmt.Fprintf(&b, "\x1b_G%s,m=1;%s\x1b\\", strings.Join(params, ","), chunk)
 		case last:
-			b.WriteString(fmt.Sprintf("\x1b_Gm=0;%s\x1b\\", chunk))
+			fmt.Fprintf(&b, "\x1b_Gm=0;%s\x1b\\", chunk)
 		default:
-			b.WriteString(fmt.Sprintf("\x1b_Gm=1;%s\x1b\\", chunk))
+			fmt.Fprintf(&b, "\x1b_Gm=1;%s\x1b\\", chunk)
 		}
 		offset = end
 	}

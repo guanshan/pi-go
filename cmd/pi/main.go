@@ -20,6 +20,9 @@ func main() {
 		Commit:  commit,
 		Date:    date,
 	}, os.Args[1:]); err != nil {
+		if code, ok := codingagent.ExitCode(err); ok {
+			os.Exit(code)
+		}
 		fmt.Fprintln(os.Stderr, "Error:", err)
 		os.Exit(1)
 	}

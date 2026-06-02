@@ -184,8 +184,8 @@ func TestPrintModeAssistantErrorExitsNonZeroAndShutsDown(t *testing.T) {
 // TestPrintModeAssistantErrorExitsNonZeroAndShutsDown. It scripts the faux
 // provider to fail the turn, registers an extension that records the
 // session_shutdown event to a marker file, and drives the real print-mode
-// entrypoint. RunWithOptions calls os.Exit(1) on the assistant-error path, so
-// this function does not return.
+// entrypoint. RunWithOptions returns an exit-code error on the assistant-error
+// path; the child mirrors cmd/pi/main.go and exits with that code.
 func runPrintErrorChild() {
 	markerPath := os.Getenv(envPrintErrorMarker)
 	errorMessage := os.Getenv(envPrintErrorMessage)
@@ -235,10 +235,10 @@ func runPrintErrorChild() {
 	err := codingagent.RunWithOptions(context.Background(), codingagent.BuildInfo{}, args, codingagent.MainOptions{
 		ExtensionFactories: []codingagent.ExtensionFactory{factory},
 	})
-	// On the assistant-error path RunWithOptions calls os.Exit(1) and never
-	// returns. If it does return, surface the error and exit non-zero so the
-	// parent's assertions still hold for a meaningful reason.
 	if err != nil {
+		if code, ok := codingagent.ExitCode(err); ok {
+			os.Exit(code)
+		}
 		os.Stderr.WriteString(err.Error() + "\n")
 	}
 	os.Exit(2)

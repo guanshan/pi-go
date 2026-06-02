@@ -155,6 +155,7 @@ func TestResponseRetryDelayHeaderParsing(t *testing.T) {
 		h.Set("Retry-After-Ms", "250")
 		h.Set("Retry-After", "5") // would be 5s; must be ignored in favor of -Ms
 		resp := newResponse(http.StatusTooManyRequests, "", h)
+		defer resp.Body.Close()
 		got, err := responseRetryDelay(resp, 0, RequestOptions{})
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
@@ -168,6 +169,7 @@ func TestResponseRetryDelayHeaderParsing(t *testing.T) {
 		h := http.Header{}
 		h.Set("Retry-After", "2")
 		resp := newResponse(http.StatusServiceUnavailable, "", h)
+		defer resp.Body.Close()
 		got, err := responseRetryDelay(resp, 0, RequestOptions{})
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
@@ -181,6 +183,7 @@ func TestResponseRetryDelayHeaderParsing(t *testing.T) {
 		h := http.Header{}
 		h.Set("Retry-After", "1.5")
 		resp := newResponse(http.StatusServiceUnavailable, "", h)
+		defer resp.Body.Close()
 		got, err := responseRetryDelay(resp, 0, RequestOptions{})
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
@@ -195,6 +198,7 @@ func TestResponseRetryDelayHeaderParsing(t *testing.T) {
 		future := time.Now().Add(3 * time.Second).UTC()
 		h.Set("Retry-After", future.Format(http.TimeFormat))
 		resp := newResponse(http.StatusServiceUnavailable, "", h)
+		defer resp.Body.Close()
 		got, err := responseRetryDelay(resp, 0, RequestOptions{})
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
@@ -208,6 +212,7 @@ func TestResponseRetryDelayHeaderParsing(t *testing.T) {
 
 	t.Run("no headers falls back to exponential backoff", func(t *testing.T) {
 		resp := newResponse(http.StatusServiceUnavailable, "", nil)
+		defer resp.Body.Close()
 		got, err := responseRetryDelay(resp, 2, RequestOptions{})
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
@@ -222,6 +227,7 @@ func TestResponseRetryDelayHeaderParsing(t *testing.T) {
 		h.Set("Retry-After-Ms", "not-a-number")
 		h.Set("Retry-After", "2")
 		resp := newResponse(http.StatusTooManyRequests, "", h)
+		defer resp.Body.Close()
 		got, err := responseRetryDelay(resp, 0, RequestOptions{})
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
@@ -245,6 +251,7 @@ func TestResponseRetryDelayHeaderParsing(t *testing.T) {
 		h := http.Header{}
 		h.Set("Retry-After-Ms", "5000")
 		resp := newResponse(http.StatusTooManyRequests, "", h)
+		defer resp.Body.Close()
 		_, err := responseRetryDelay(resp, 0, RequestOptions{MaxRetryDelayMs: 1000})
 		if err == nil {
 			t.Fatalf("expected cap error for 5000ms header against 1000ms cap")

@@ -436,10 +436,6 @@ func (m *interactiveModel) View() tea.View {
 	return view
 }
 
-func (m *interactiveModel) submitInput() tea.Cmd {
-	return m.submitInputWithBehavior("")
-}
-
 func (m *interactiveModel) submitInputWithBehavior(behavior StreamingBehavior) tea.Cmd {
 	raw := m.input.Value()
 	text := strings.TrimSpace(raw)

@@ -42,7 +42,7 @@ func ValidateToolArgumentsWithSchema(tool Tool, toolCall ToolCall) (map[string]a
 		if object, ok := coerced.(map[string]any); ok {
 			return object, nil
 		}
-		return nil, fmt.Errorf("Validation failed for tool %q:\n  - root: Expected object\n\nReceived arguments:\n%s", toolCall.Name, aiutils.PrettyJSON(args))
+		return nil, fmt.Errorf("Validation failed for tool %q:\n  - root: Expected object\n\nReceived arguments:\n%s", toolCall.Name, aiutils.PrettyJSON(args)) //nolint:staticcheck // TS-facing validation diagnostic keeps capitalization.
 	}
 	var builder strings.Builder
 	fmt.Fprintf(&builder, "Validation failed for tool %q:\n", toolCall.Name)

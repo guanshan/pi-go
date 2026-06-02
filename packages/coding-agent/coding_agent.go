@@ -3,6 +3,7 @@ package codingagent
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -35,6 +36,14 @@ type MainOptions struct {
 func RunWithOptions(ctx context.Context, build BuildInfo, argv []string, options MainOptions) error {
 	SetBuildInfo(defaultBuildValue(build.Version, "dev"), defaultBuildValue(build.Commit, "none"), defaultBuildValue(build.Date, "unknown"))
 	return MainWithOptions(ctx, argv, options)
+}
+
+func ExitCode(err error) (int, bool) {
+	var coded interface{ ExitCode() int }
+	if !errors.As(err, &coded) {
+		return 0, false
+	}
+	return coded.ExitCode(), true
 }
 
 func Main(ctx context.Context, argv []string) error {

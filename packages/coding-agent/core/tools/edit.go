@@ -229,6 +229,7 @@ func nodeErrorCode(errno syscall.Errno) string {
 	return ""
 }
 
+//nolint:staticcheck // Edit tool diagnostics intentionally mirror TS user-facing wording.
 func applyEdits(content string, edits []Edit, path string) (string, string, error) {
 	type match struct {
 		index int

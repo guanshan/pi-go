@@ -61,7 +61,7 @@ func resolveEnvPlaceholders(value, provider string) (string, error) {
 		}
 		replacement := os.Getenv(name)
 		if replacement == "" {
-			return "", fmt.Errorf("%s is required for provider %s but is not set.", name, provider)
+			return "", fmt.Errorf("%s is required for provider %s but is not set.", name, provider) //nolint:staticcheck // TS-compatible user-facing diagnostic keeps trailing punctuation.
 		}
 		out.WriteString(replacement)
 		i += end + 2
