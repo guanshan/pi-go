@@ -9,7 +9,7 @@ import (
 )
 
 func TestModelCatalogIncludesGeneratedModels(t *testing.T) {
-	if len(GeneratedModels()) != 924 {
+	if len(GeneratedModels()) != 923 {
 		t.Fatalf("generated model count=%d", len(GeneratedModels()))
 	}
 	models := AllKnownModels()
@@ -34,6 +34,36 @@ func TestModelCatalogIncludesGeneratedModels(t *testing.T) {
 	}
 	if mistral.API != "mistral-conversations" || !mistral.Reasoning || !SupportsInput(mistral, "text") {
 		t.Fatalf("mistral model=%#v", mistral)
+	}
+}
+
+// Opus 4.8's adaptive-thinking + temperature-suppression behavior must come
+// from the generated catalog compat, not runtime id inference:
+// inferredAnthropicForceAdaptiveThinking deliberately omits opus-4-8, so this
+// guards that the regenerated catalog carries forceAdaptiveThinking=true and
+// supportsTemperature=false for the Anthropic Opus 4.8 entry.
+func TestOpus48CatalogDrivenAnthropicCompat(t *testing.T) {
+	model, ok := Find(AllKnownModels(), "anthropic", "claude-opus-4-8")
+	if !ok {
+		t.Fatal("missing anthropic/claude-opus-4-8")
+	}
+	if model.Compat.ForceAdaptiveThinking == nil || !*model.Compat.ForceAdaptiveThinking {
+		t.Fatalf("catalog ForceAdaptiveThinking=%v, want true", model.Compat.ForceAdaptiveThinking)
+	}
+	if model.Compat.SupportsTemperature == nil || *model.Compat.SupportsTemperature {
+		t.Fatalf("catalog SupportsTemperature=%v, want false", model.Compat.SupportsTemperature)
+	}
+	// inferredAnthropicForceAdaptiveThinking must NOT know about opus-4-8: the
+	// adaptive-thinking decision has to ride on the catalog value alone.
+	if inferredAnthropicForceAdaptiveThinking(model) {
+		t.Fatal("inferredAnthropicForceAdaptiveThinking should not match opus-4-8; behavior must be catalog-driven")
+	}
+	compat := GetAnthropicMessagesCompat(model)
+	if !compat.ForceAdaptiveThinking {
+		t.Fatal("GetAnthropicMessagesCompat ForceAdaptiveThinking=false, want true")
+	}
+	if compat.SupportsTemperature {
+		t.Fatal("GetAnthropicMessagesCompat SupportsTemperature=true, want false")
 	}
 }
 

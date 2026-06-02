@@ -149,6 +149,59 @@ func TestAnthropicOAuthHeadersToolChoiceAndToolResultImages(t *testing.T) {
 	}
 }
 
+// Opus 4.7+ rejects non-default temperature. The generated catalog marks
+// claude-opus-4-8 with compat.supportsTemperature=false; this asserts the
+// Anthropic provider drops the temperature field for it while still sending it
+// for a model without that compat. Temperature is also gated on thinking being
+// disabled (off), matching anthropic.ts.
+func TestAnthropicTemperatureSuppressedForOpus48(t *testing.T) {
+	capture := func(model Model) map[string]any {
+		t.Helper()
+		var captured map[string]any
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if err := json.NewDecoder(r.Body).Decode(&captured); err != nil {
+				t.Fatal(err)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn"}`))
+		}))
+		defer server.Close()
+		model.BaseURL = server.URL
+
+		registry := NewModelRegistry(t.TempDir(), NewAuthStorage(t.TempDir()))
+		registry.Auth.SetRuntime("anthropic", "test-key")
+		temp := 0.7
+		if _, err := registry.StreamlessChat(context.Background(), ChatRequest{
+			Model:         model,
+			Messages:      []Message{NewUserMessage("hi", nil)},
+			Temperature:   &temp,
+			ThinkingLevel: ThinkingOff,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		return captured
+	}
+
+	opus48, ok := Find(AllKnownModels(), "anthropic", "claude-opus-4-8")
+	if !ok {
+		t.Fatal("missing anthropic/claude-opus-4-8")
+	}
+	if captured := capture(opus48); captured["temperature"] != nil {
+		t.Fatalf("opus-4-8 temperature=%#v, want omitted", captured["temperature"])
+	}
+
+	// A sibling model without supportsTemperature=false still sends temperature.
+	plain := Model{
+		Provider: "anthropic",
+		ID:       "claude-3-5-sonnet-latest",
+		API:      "anthropic-messages",
+		Input:    []string{"text"},
+	}
+	if captured := capture(plain); captured["temperature"] != 0.7 {
+		t.Fatalf("plain temperature=%#v, want 0.7", captured["temperature"])
+	}
+}
+
 func TestAnthropicEagerToolInputStreamingCompat(t *testing.T) {
 	capture := func(compat OpenAICompat) (http.Header, map[string]any) {
 		t.Helper()

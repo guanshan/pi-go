@@ -141,6 +141,7 @@ type OpenAICompat struct {
 	SendSessionIDHeader                         *bool          `json:"sendSessionIdHeader,omitempty"`
 	SupportsEagerToolInputStreaming             *bool          `json:"supportsEagerToolInputStreaming,omitempty"`
 	SupportsCacheControlOnTools                 *bool          `json:"supportsCacheControlOnTools,omitempty"`
+	SupportsTemperature                         *bool          `json:"supportsTemperature,omitempty"`
 	ForceAdaptiveThinking                       *bool          `json:"forceAdaptiveThinking,omitempty"`
 	AllowEmptySignature                         *bool          `json:"allowEmptySignature,omitempty"`
 }
@@ -175,6 +176,7 @@ type AnthropicMessagesCompat struct {
 	SupportsLongCacheRetention      bool
 	SendSessionAffinityHeaders      bool
 	SupportsCacheControlOnTools     bool
+	SupportsTemperature             bool
 	ForceAdaptiveThinking           bool
 	AllowEmptySignature             bool
 }
@@ -229,6 +231,7 @@ func GetAnthropicMessagesCompat(model Model) AnthropicMessagesCompat {
 		SupportsLongCacheRetention:      compatBool(model.Compat.SupportsLongCacheRetention, !isFireworks),
 		SendSessionAffinityHeaders:      model.Compat.SendSessionAffinityHeaders || isFireworks || isCloudflareAIGatewayAnthropic,
 		SupportsCacheControlOnTools:     compatBool(model.Compat.SupportsCacheControlOnTools, !isFireworks),
+		SupportsTemperature:             compatBool(model.Compat.SupportsTemperature, true),
 		ForceAdaptiveThinking:           compatBool(model.Compat.ForceAdaptiveThinking, inferredAnthropicForceAdaptiveThinking(model)),
 		AllowEmptySignature:             compatBool(model.Compat.AllowEmptySignature, false),
 	}
@@ -279,8 +282,11 @@ func inferredAnthropicForceAdaptiveThinking(model Model) bool {
 }
 
 func inferredXHighThinkingEffort(model Model) (string, bool) {
+	// DeepSeek V4 used to be inferred here; the generated catalog now ships an
+	// explicit xhigh thinkingLevelMap entry for every DeepSeek V4 variant, so
+	// only the Opus 4.6 fallback (for variants without a baked map) remains.
 	identity := modelIdentity(model)
-	if strings.Contains(identity, "opus-4-6") || strings.Contains(identity, "opus-4.6") || strings.Contains(identity, "deepseek-v4") {
+	if strings.Contains(identity, "opus-4-6") || strings.Contains(identity, "opus-4.6") {
 		return "max", true
 	}
 	return "", false
@@ -300,7 +306,11 @@ func detectOpenAICompletionsCompat(model Model) OpenAICompletionsCompat {
 	isCloudflareWorkersAI := provider == "cloudflare-workers-ai" || strings.Contains(baseLower, "api.cloudflare.com")
 	isCloudflareAIGateway := provider == "cloudflare-ai-gateway" || strings.Contains(baseLower, "gateway.ai.cloudflare.com")
 	isOpenRouter := provider == "openrouter" || strings.Contains(baseLower, "openrouter.ai")
-	isDeepSeekThinkingFormat := provider == "deepseek" || strings.Contains(baseLower, "deepseek.com") || strings.Contains(strings.ToLower(model.ID), "deepseek-v4")
+	// Mirrors openai-completions.ts detectCompat: isDeepSeek is provider/baseURL
+	// based only. DeepSeek V4 served through other providers (e.g. OpenRouter)
+	// carries its requiresReasoningContentOnAssistantMessages/thinkingFormat in
+	// the generated catalog compat instead of being inferred from the model id.
+	isDeepSeekThinkingFormat := provider == "deepseek" || strings.Contains(baseLower, "deepseek.com")
 	isNonStandard := provider == "cerebras" ||
 		strings.Contains(baseLower, "cerebras.ai") ||
 		provider == "xai" ||
@@ -367,6 +377,13 @@ func compatBool(value *bool, fallback bool) bool {
 }
 
 func boolPtr(value bool) *bool {
+	return &value
+}
+
+// strPtr returns a pointer to value. Used by the generated model catalog to
+// express thinkingLevelMap entries (map[string]*string) where a string value
+// differs from a null mapping.
+func strPtr(value string) *string {
 	return &value
 }
 

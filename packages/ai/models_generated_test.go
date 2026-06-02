@@ -7,7 +7,7 @@ import (
 )
 
 func TestGeneratedTextModelCatalog(t *testing.T) {
-	if len(GeneratedModels()) != 924 {
+	if len(GeneratedModels()) != 923 {
 		t.Fatalf("generated model count=%d", len(GeneratedModels()))
 	}
 	registry := NewModelRegistry(t.TempDir(), NewAuthStorage(t.TempDir()))

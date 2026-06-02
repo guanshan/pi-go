@@ -337,6 +337,7 @@ func anthropicRequestOptions(req ChatRequest, key string) aiproviders.AnthropicR
 		SupportsEagerToolStreaming:  compat.SupportsEagerToolInputStreaming,
 		SupportsLongCacheRetention:  compat.SupportsLongCacheRetention,
 		SupportsCacheControlOnTools: compat.SupportsCacheControlOnTools,
+		SupportsTemperature:         compat.SupportsTemperature,
 		ForceAdaptiveThinking:       compat.ForceAdaptiveThinking,
 		AllowEmptySignature:         compat.AllowEmptySignature,
 	}

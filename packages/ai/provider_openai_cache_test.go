@@ -147,7 +147,14 @@ func TestOpenAICompatibleGeneratedDeepSeekXHighMapsToMax(t *testing.T) {
 	}
 }
 
-func TestOpenRouterGeneratedDeepSeekV4UsesDeepSeekThinkingFormat(t *testing.T) {
+// OpenRouter-hosted DeepSeek V4 is served through OpenRouter's normalized
+// reasoning protocol, not DeepSeek's native API. The generated catalog carries
+// requiresReasoningContentOnAssistantMessages (compat) and a {xhigh:"xhigh"}
+// thinkingLevelMap, but no thinkingFormat override, so the openai-completions
+// provider falls back to the OpenRouter thinking format and maps xhigh via the
+// catalog. This mirrors openai-completions.ts (isDeepSeek is provider/baseURL
+// based, so an OpenRouter model is never treated as native DeepSeek).
+func TestOpenRouterGeneratedDeepSeekV4UsesOpenRouterThinkingFormat(t *testing.T) {
 	var captured map[string]any
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if err := json.NewDecoder(r.Body).Decode(&captured); err != nil {
@@ -173,12 +180,15 @@ func TestOpenRouterGeneratedDeepSeekV4UsesDeepSeekThinkingFormat(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	thinking := captured["thinking"].(map[string]any)
-	if thinking["type"] != "enabled" || captured["reasoning_effort"] != "max" {
-		t.Fatalf("captured=%#v", captured)
+	reasoning, ok := captured["reasoning"].(map[string]any)
+	if !ok || reasoning["effort"] != "xhigh" {
+		t.Fatalf("captured=%#v, want reasoning.effort=xhigh", captured)
 	}
-	if _, ok := captured["reasoning"]; ok {
-		t.Fatalf("captured reasoning=%#v, want DeepSeek thinking fields", captured["reasoning"])
+	if _, ok := captured["thinking"]; ok {
+		t.Fatalf("captured thinking=%#v, want OpenRouter reasoning object", captured["thinking"])
+	}
+	if _, ok := captured["reasoning_effort"]; ok {
+		t.Fatalf("captured reasoning_effort=%#v, want nested reasoning object", captured["reasoning_effort"])
 	}
 }
 

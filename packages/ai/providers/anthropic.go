@@ -185,6 +185,7 @@ type AnthropicRequestOptions struct {
 	SupportsEagerToolStreaming  bool
 	SupportsLongCacheRetention  bool
 	SupportsCacheControlOnTools bool
+	SupportsTemperature         bool
 	ForceAdaptiveThinking       bool
 	AllowEmptySignature         bool
 	IsOAuth                     bool
@@ -281,7 +282,9 @@ func AnthropicMessageParams(options AnthropicRequestOptions) anthropic.MessageNe
 			}
 		}
 	}
-	if !thinkingEnabled && options.Temperature != nil {
+	// Temperature is incompatible with extended thinking and unsupported on
+	// Claude Opus 4.7+ (compat.supportsTemperature == false).
+	if !thinkingEnabled && options.SupportsTemperature && options.Temperature != nil {
 		params.Temperature = anthropicparam.NewOpt(*options.Temperature)
 	}
 	if userID, _ := options.Metadata["user_id"].(string); userID != "" {
