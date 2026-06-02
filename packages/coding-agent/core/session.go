@@ -97,6 +97,12 @@ type SessionManager struct {
 	InMemory  bool
 	Entries   []SessionEntry
 	CurrentID *string
+	// cwdOverride, when set, replaces the stored Header.CWD at runtime without
+	// rewriting the session file. Used when the recorded cwd no longer exists and
+	// the user chooses to continue in the current directory (mirrors TS using
+	// MissingSessionCwdIssue.fallbackCwd as the runtime cwd while leaving the
+	// session file's cwd intact).
+	cwdOverride string
 }
 
 type SessionContext struct {
@@ -166,45 +172,72 @@ func loadSessionFile(path, fallbackCWD string) (SessionHeader, []SessionEntry, e
 	}
 	defer f.Close()
 
-	scanner := bufio.NewScanner(f)
-	scanner.Buffer(make([]byte, 64*1024), 10*1024*1024)
+	// Read line by line with bufio.Reader instead of bufio.Scanner so a single
+	// entry larger than Scanner's max token size (a big base64 image or paste)
+	// does not make the whole session unopenable. Mirrors the TypeScript reader,
+	// which loads sessions larger than Node's max string length.
+	reader := bufio.NewReader(f)
 	var header SessionHeader
 	haveHeader := false
 	var entries []SessionEntry
-	for scanner.Scan() {
-		line := scanner.Bytes()
-		if len(strings.TrimSpace(string(line))) == 0 {
-			continue
-		}
-		if !haveHeader {
-			var h SessionHeader
-			if err := json.Unmarshal(line, &h); err == nil && h.Type == "session" {
-				header = h
-				if header.CWD == "" {
-					header.CWD = fallbackCWD
+	for {
+		line, readErr := reader.ReadBytes('\n')
+		line = trimLineEnding(line)
+		if len(line) > 0 || readErr == nil {
+			if len(strings.TrimSpace(string(line))) != 0 {
+				if !haveHeader {
+					var h SessionHeader
+					if err := json.Unmarshal(line, &h); err == nil && h.Type == "session" {
+						header = h
+						if header.CWD == "" {
+							header.CWD = fallbackCWD
+						}
+						haveHeader = true
+					}
+					// A non-header first line is malformed/legacy noise: skip it
+					// and keep scanning for the header instead of failing.
+				} else if entry, ok := parseSessionEntry(line); ok {
+					entries = append(entries, entry)
 				}
-				haveHeader = true
 			}
-			// A non-header first line is malformed/legacy noise: skip it and
-			// keep scanning for the header instead of failing the whole load.
-			continue
 		}
-		var entry SessionEntry
-		if err := json.Unmarshal(line, &entry); err != nil {
-			// Skip malformed lines (e.g. a partially written final entry after
-			// a crash) rather than discarding the entire session.
-			continue
+		if readErr != nil {
+			if readErr == io.EOF {
+				break
+			}
+			return SessionHeader{}, nil, readErr
 		}
-		entry.Raw = append([]byte(nil), line...)
-		entries = append(entries, entry)
-	}
-	if err := scanner.Err(); err != nil {
-		return SessionHeader{}, nil, err
 	}
 	if !haveHeader || header.Type == "" {
 		return SessionHeader{}, nil, errors.New("invalid session: missing header")
 	}
 	return header, entries, nil
+}
+
+// trimLineEnding strips a trailing "\n" (and a preceding "\r" if present) so a
+// line read via bufio.Reader.ReadBytes('\n') matches bufio.Scanner.Bytes(),
+// which excludes the newline.
+func trimLineEnding(line []byte) []byte {
+	if n := len(line); n > 0 && line[n-1] == '\n' {
+		line = line[:n-1]
+		if n := len(line); n > 0 && line[n-1] == '\r' {
+			line = line[:n-1]
+		}
+	}
+	return line
+}
+
+// parseSessionEntry decodes a single non-header JSONL entry line. Malformed
+// lines (e.g. a partially written final entry after a crash) are skipped rather
+// than discarding the entire session. The returned entry copies the raw bytes
+// because ReadBytes reuses no buffer but callers retain entry.Raw.
+func parseSessionEntry(line []byte) (SessionEntry, bool) {
+	var entry SessionEntry
+	if err := json.Unmarshal(line, &entry); err != nil {
+		return SessionEntry{}, false
+	}
+	entry.Raw = append([]byte(nil), line...)
+	return entry, true
 }
 
 // OpenSession opens a session as the active session. It loads tolerantly,
@@ -304,7 +337,16 @@ func ForkSessionWithID(sourcePath, cwd, sessionDir, id string) (*SessionManager,
 }
 
 func (s *SessionManager) CWD() string {
+	if s.cwdOverride != "" {
+		return s.cwdOverride
+	}
 	return s.Header.CWD
+}
+
+// OverrideCWD makes CWD() report cwd at runtime without persisting it to the
+// session file. Used to continue a session whose recorded cwd no longer exists.
+func (s *SessionManager) OverrideCWD(cwd string) {
+	s.cwdOverride = cwd
 }
 
 func (s *SessionManager) SessionID() string {
@@ -635,32 +677,46 @@ func readSessionInfo(path string) (SessionInfo, error) {
 	}
 	defer file.Close()
 	stat, _ := file.Stat()
-	scanner := bufio.NewScanner(file)
-	scanner.Buffer(make([]byte, 64*1024), 10*1024*1024)
+	// Use bufio.Reader rather than bufio.Scanner so a session with an entry
+	// larger than Scanner's max token size still lists correctly (see
+	// loadSessionFile).
+	reader := bufio.NewReader(file)
 	var header SessionHeader
 	var preview, name string
+	var lastActivityMs int64
 	first := true
-	for scanner.Scan() {
-		line := scanner.Bytes()
-		if first {
-			first = false
-			if err := json.Unmarshal(line, &header); err != nil {
-				return SessionInfo{}, err
+	for {
+		line, readErr := reader.ReadBytes('\n')
+		line = trimLineEnding(line)
+		if len(line) > 0 || readErr == nil {
+			if first {
+				first = false
+				if err := json.Unmarshal(line, &header); err != nil {
+					return SessionInfo{}, err
+				}
+			} else if entry, ok := parseSessionEntry(line); ok {
+				if entry.Type == "session_info" && entry.Name != "" {
+					name = entry.Name
+				}
+				if entry.Message != nil {
+					role := ai.MessageRole(entry.Message)
+					if (role == "user" || role == "assistant") && entry.Message.Timestamp() > lastActivityMs {
+						lastActivityMs = entry.Message.Timestamp()
+					}
+					if preview == "" && role == "user" {
+						preview = ai.MessageText(entry.Message)
+						if len(preview) > 120 {
+							preview = preview[:120] + "..."
+						}
+					}
+				}
 			}
-			continue
 		}
-		var entry SessionEntry
-		if json.Unmarshal(line, &entry) != nil {
-			continue
-		}
-		if entry.Type == "session_info" && entry.Name != "" {
-			name = entry.Name
-		}
-		if preview == "" && entry.Message != nil && ai.MessageRole(entry.Message) == "user" {
-			preview = ai.MessageText(entry.Message)
-			if len(preview) > 120 {
-				preview = preview[:120] + "..."
+		if readErr != nil {
+			if readErr == io.EOF {
+				break
 			}
+			return SessionInfo{}, readErr
 		}
 	}
 	if stat == nil {
@@ -669,6 +725,12 @@ func readSessionInfo(path string) (SessionInfo, error) {
 	updated := time.Time{}
 	if stat != nil {
 		updated = stat.ModTime()
+	}
+	if headerTime, err := time.Parse(time.RFC3339Nano, header.Timestamp); err == nil {
+		updated = headerTime
+	}
+	if lastActivityMs > 0 {
+		updated = time.UnixMilli(lastActivityMs)
 	}
 	return SessionInfo{ID: header.ID, Path: path, CWD: header.CWD, Name: name, Preview: preview, UpdatedAt: updated}, nil
 }
@@ -684,26 +746,78 @@ func ContinueRecent(cwd, sessionDir string) (*SessionManager, error) {
 	return OpenSession(sessions[0].Path, cwd)
 }
 
-func ResolveSessionPath(arg, cwd, sessionDir string) (string, error) {
+// ResolvedSessionType classifies how a --session/--fork argument was resolved,
+// mirroring the TS ResolvedSession union (main.ts:137-141).
+type ResolvedSessionType string
+
+const (
+	// ResolvedSessionPathType is a direct file path argument.
+	ResolvedSessionPathType ResolvedSessionType = "path"
+	// ResolvedSessionLocal is an ID match within the current project.
+	ResolvedSessionLocal ResolvedSessionType = "local"
+	// ResolvedSessionGlobal is an ID match in a different project (cross-project).
+	ResolvedSessionGlobal ResolvedSessionType = "global"
+	// ResolvedSessionNotFound means no match anywhere.
+	ResolvedSessionNotFound ResolvedSessionType = "not_found"
+)
+
+// ResolvedSession is the typed result of resolving a session argument. CWD is
+// the origin project's cwd, set only for global (cross-project) matches.
+type ResolvedSession struct {
+	Type ResolvedSessionType
+	Path string
+	CWD  string
+	Arg  string
+}
+
+// ResolveSession resolves a --session/--fork argument to a typed result. It
+// reports whether a match is a direct path, a local (current-project) session,
+// a global (cross-project) session, or not found — matching TS resolveSessionPath
+// (main.ts:158-183). Matching prefers an exact ID, then an ID prefix.
+func ResolveSession(arg, cwd, sessionDir string) ResolvedSession {
 	if strings.ContainsAny(arg, `/\`) || strings.HasSuffix(arg, ".jsonl") {
-		if filepath.IsAbs(ExpandTilde(arg)) {
-			return ExpandTilde(arg), nil
+		expanded := ExpandTilde(arg)
+		if filepath.IsAbs(expanded) {
+			return ResolvedSession{Type: ResolvedSessionPathType, Path: expanded, Arg: arg}
 		}
-		return ResolveInCWD(cwd, arg), nil
+		return ResolvedSession{Type: ResolvedSessionPathType, Path: ResolveInCWD(cwd, arg), Arg: arg}
 	}
 	local, _ := ListSessions(cwd, sessionDir)
-	for _, s := range local {
-		if strings.HasPrefix(s.ID, arg) {
-			return s.Path, nil
-		}
+	if match, ok := matchSessionByID(local, arg); ok {
+		return ResolvedSession{Type: ResolvedSessionLocal, Path: match.Path, Arg: arg}
 	}
 	all, _ := ListAllSessions(sessionDir)
-	for _, s := range all {
-		if strings.HasPrefix(s.ID, arg) {
-			return s.Path, nil
+	if match, ok := matchSessionByID(all, arg); ok {
+		return ResolvedSession{Type: ResolvedSessionGlobal, Path: match.Path, CWD: match.CWD, Arg: arg}
+	}
+	return ResolvedSession{Type: ResolvedSessionNotFound, Arg: arg}
+}
+
+// matchSessionByID returns the session whose ID exactly equals arg, falling back
+// to the first session whose ID has arg as a prefix (mirroring TS).
+func matchSessionByID(sessions []SessionInfo, arg string) (SessionInfo, bool) {
+	for _, s := range sessions {
+		if s.ID == arg {
+			return s, true
 		}
 	}
-	return "", fmt.Errorf("no session found matching %q", arg)
+	for _, s := range sessions {
+		if strings.HasPrefix(s.ID, arg) {
+			return s, true
+		}
+	}
+	return SessionInfo{}, false
+}
+
+// ResolveSessionPath resolves a session argument to a file path. It is retained
+// for callers (e.g. --fork) that treat path/local/global matches identically;
+// see ResolveSession for the type-aware variant.
+func ResolveSessionPath(arg, cwd, sessionDir string) (string, error) {
+	resolved := ResolveSession(arg, cwd, sessionDir)
+	if resolved.Type == ResolvedSessionNotFound {
+		return "", fmt.Errorf("no session found matching %q", arg)
+	}
+	return resolved.Path, nil
 }
 
 func writeJSONLine(w io.Writer, value any) error {

@@ -58,7 +58,7 @@ func (r *ModelRegistry) anthropicChat(ctx context.Context, req ChatRequest) (Cha
 	if err := json.Unmarshal(raw, &resp); err != nil {
 		return ChatResponse{}, err
 	}
-	return anthropicChatResponse(aiproviders.ParseAnthropicMessage(&resp), req.Model), nil
+	return anthropicChatResponse(aiproviders.ParseAnthropicMessage(&resp, anthropicIsOAuthToken(key), ToolDefinitions(req.Tools)), req.Model), nil
 }
 
 func (r *ModelRegistry) anthropicChatStream(ctx context.Context, req ChatRequest) *AssistantMessageEventStream {
@@ -84,6 +84,8 @@ func (r *ModelRegistry) runAnthropicChatStream(ctx context.Context, req ChatRequ
 	sdkStream := client.Messages.NewStreaming(ctx, params)
 	defer sdkStream.Close()
 
+	isOAuth := anthropicIsOAuthToken(key)
+	tools := ToolDefinitions(req.Tools)
 	var accumulated anthropic.Message
 	blocks := []ContentBlock{}
 	sawEvent := false
@@ -96,7 +98,7 @@ func (r *ModelRegistry) runAnthropicChatStream(ctx context.Context, req ChatRequ
 		if err := accumulated.Accumulate(event); err != nil {
 			return anthropicStreamError(partial, err, stream)
 		}
-		anthropicApplyStreamEvent(event, &partial, &blocks, stream)
+		anthropicApplyStreamEvent(event, &partial, &blocks, stream, isOAuth, tools)
 	}
 	if err := ctx.Err(); err != nil {
 		return anthropicStreamError(partial, err, stream)
@@ -112,7 +114,7 @@ func (r *ModelRegistry) runAnthropicChatStream(ctx context.Context, req ChatRequ
 		pushAssistantMessage(stream, response.Message)
 		return response.Message, nil
 	}
-	response := anthropicChatResponse(aiproviders.ParseAnthropicMessage(&accumulated), req.Model)
+	response := anthropicChatResponse(aiproviders.ParseAnthropicMessage(&accumulated, isOAuth, tools), req.Model)
 	if response.Message.StopReason == "error" {
 		if response.Message.ErrorMessage == "" {
 			response.Message.ErrorMessage = "Provider returned an error stop reason"
@@ -123,13 +125,14 @@ func (r *ModelRegistry) runAnthropicChatStream(ctx context.Context, req ChatRequ
 	return response.Message, nil
 }
 
-func anthropicApplyStreamEvent(event anthropic.MessageStreamEventUnion, partial *AssistantMessage, blocks *[]ContentBlock, stream *AssistantMessageEventStream) {
+func anthropicApplyStreamEvent(event anthropic.MessageStreamEventUnion, partial *AssistantMessage, blocks *[]ContentBlock, stream *AssistantMessageEventStream, isOAuth bool, tools []map[string]any) {
 	switch event.Type {
 	case "message_start":
+		partial.ResponseID = event.Message.ID
 		partial.Usage = anthropicUsage(aiproviders.AnthropicUsageFromMessageUsage(event.Message.Usage))
 		stream.Push(AssistantMessageEvent{Type: "start", Partial: *partial})
 	case "content_block_start":
-		block := anthropicStartBlock(event.ContentBlock)
+		block := anthropicStartBlock(event.ContentBlock, isOAuth, tools)
 		ensureAnthropicStreamBlock(blocks, int(event.Index), block)
 		partial.Content = *blocks
 		stream.Push(AssistantMessageEvent{Type: anthropicStartEventType(block.Type), ContentIndex: int(event.Index), Partial: *partial})
@@ -164,14 +167,18 @@ func anthropicStreamError(partial AssistantMessage, err error, stream *Assistant
 	return partial, err
 }
 
-func anthropicStartBlock(block anthropic.ContentBlockStartEventContentBlockUnion) ContentBlock {
+func anthropicStartBlock(block anthropic.ContentBlockStartEventContentBlockUnion, isOAuth bool, tools []map[string]any) ContentBlock {
 	switch block.Type {
 	case "thinking":
 		return ContentBlock{Type: "thinking", Thinking: block.Thinking, Signature: block.Signature}
 	case "redacted_thinking":
 		return ContentBlock{Type: "thinking", Thinking: "[Reasoning redacted]", Signature: block.Data, Redacted: true}
 	case "tool_use":
-		return ContentBlock{Type: "toolCall", ID: block.ID, Name: block.Name, Arguments: aiproviders.NormalizeToolArguments(mustJSONRaw(block.Input))}
+		name := block.Name
+		if isOAuth {
+			name = aiproviders.FromClaudeCodeName(name, tools)
+		}
+		return ContentBlock{Type: "toolCall", ID: block.ID, Name: name, Arguments: aiproviders.NormalizeToolArguments(mustJSONRaw(block.Input))}
 	default:
 		return ContentBlock{Type: "text", Text: block.Text}
 	}
@@ -245,6 +252,7 @@ func anthropicChatResponse(parsed aiproviders.AnthropicParsed, model Model) Chat
 	blocks := anthropicContentBlocks(parsed.Blocks)
 	msg := NewAssistantMessageForModel(model, blocks, usageWithCost(model, anthropicUsage(parsed.Usage)), parsed.StopReason)
 	msg.ErrorMessage = parsed.ErrorMessage
+	msg.ResponseID = parsed.ResponseID
 	return ChatResponse{Message: msg, ToolCalls: anthropicToolCalls(parsed.ToolCalls)}
 }
 
@@ -292,13 +300,14 @@ func mustJSONRaw(value any) json.RawMessage {
 	return raw
 }
 
-func anthropicRequestOptions(req ChatRequest) aiproviders.AnthropicRequestOptions {
+func anthropicRequestOptions(req ChatRequest, key string) aiproviders.AnthropicRequestOptions {
 	compat := GetAnthropicMessagesCompat(req.Model)
 	return aiproviders.AnthropicRequestOptions{
 		ModelID:                     req.Model.ID,
 		SystemPrompt:                req.SystemPrompt,
 		Messages:                    anthropicMessages(req.Messages, req.Model),
 		Tools:                       ToolDefinitions(req.Tools),
+		IsOAuth:                     anthropicIsOAuthToken(key),
 		CacheRetention:              req.CacheRetention,
 		MaxTokens:                   req.MaxTokens,
 		MaxOutput:                   req.Model.MaxOutput,
@@ -319,14 +328,19 @@ func anthropicRequestOptions(req ChatRequest) aiproviders.AnthropicRequestOption
 }
 
 func anthropicClient(req ChatRequest, key string) anthropic.Client {
-	return aiproviders.NewAnthropicClientWithAuth(
+	return aiproviders.NewAnthropicClientWithMode(
 		key,
 		aiproviders.AnthropicBaseURL(req.Model.BaseURL),
 		anthropicHeaders(req, key),
 		providerHTTPClient(req),
 		anthropicUsesBearerAuth(req.Model, key),
+		anthropicUsesGatewayAuth(req.Model),
 		providerRequestOptions(req),
 	)
+}
+
+func anthropicUsesGatewayAuth(model Model) bool {
+	return model.Provider == "cloudflare-ai-gateway"
 }
 
 func anthropicHeaders(req ChatRequest, key string) map[string]string {
@@ -392,9 +406,15 @@ func appendAnthropicBetaHeaders(headers map[string]string, features ...string) m
 }
 
 func anthropicMessageParams(req ChatRequest, key string) (anthropic.MessageNewParams, error) {
-	params := aiproviders.AnthropicMessageParams(anthropicRequestOptions(req))
+	opts := anthropicRequestOptions(req, key)
+	params := aiproviders.AnthropicMessageParams(opts)
 	if anthropicIsOAuthToken(key) {
+		// Mirror anthropic.ts:909-923: under OAuth the Claude Code identity block
+		// carries the same cache_control breakpoint as the system prompt block.
 		identity := anthropic.TextBlockParam{Text: "You are Claude Code, Anthropic's official CLI for Claude."}
+		if cacheControl, useCacheControl := aiproviders.AnthropicCacheControlParam(opts.CacheRetention, opts.SupportsLongCacheRetention); useCacheControl {
+			identity.CacheControl = cacheControl
+		}
 		params.System = append([]anthropic.TextBlockParam{identity}, params.System...)
 	}
 	return applyOnPayloadAs[anthropic.MessageNewParams](req, params)

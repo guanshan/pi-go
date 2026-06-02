@@ -150,3 +150,31 @@ dispatch. Still **not** implemented: settings, provider/model registration,
 message renderers, widgets, and a rich `ctx.ui` (the bridge's `ctx.ui` is a
 degraded stub). The recommended out-of-process JSON-RPC transport above is the
 path to closing the remaining gap.
+
+## Capability matrix (script bridge)
+
+What an `.ts`/`.js`/`.mjs` extension can rely on through the current Node bridge
+(`core/extensions/script_runtime.go`). "Fail-fast" entries throw a clear
+`... is unsupported in the Go bridge` error at call time rather than silently
+no-op'ing, so an unsupported upstream extension surfaces a precise message.
+
+| Surface | Status | Notes |
+| --- | --- | --- |
+| `pi.registerTool` | ✅ supported | custom tools, executed back over the bridge |
+| `pi.registerCommand` (+ handler) | ✅ supported | slash command dispatch |
+| `pi.registerFlag` / `pi.getFlag` | ✅ supported | values seeded via `PI_EXTENSION_FLAG_VALUES` |
+| `pi.on(event, …)` / `pi.events.on` | ✅ supported | event hooks (tool call/result, etc.) |
+| `pi.onShutdown` | ✅ supported | |
+| virtual `@earendil-works/pi-ai`, `typebox` | ✅ supported | `Type` / `StringEnum` schema helpers |
+| virtual `@earendil-works/pi-coding-agent` | ✅ supported | `defineTool`, `createEventBus` |
+| virtual `@earendil-works/pi-tui` | 🟡 subset | `Text`, `Container`, `Box`, `Spacer`, `Input`, `SelectList`, `SettingsList`, `Loader`, `CancellableLoader`, `Markdown`, `matchesKey`, `truncateToWidth`, and `Key` (named keys + modifier helpers, e.g. `Key.ctrlAlt('p')`). Layout/widget classes are inert stubs. |
+| `ctx.ui` | 🟡 degraded stub | `notify` → stderr; `select` → first option; `confirm` → false; `hasUI` is false |
+| `ctx.sessionManager` | 🟡 degraded stub | `getBranch()` returns `[]` |
+| `pi.registerProvider` / `unregisterProvider` | ⛔ fail-fast | custom AI providers not bridged |
+| `pi.registerMessageRenderer` | ⛔ fail-fast | message renderers not bridged |
+| `pi.addAutocompleteProvider` | ⛔ fail-fast | autocomplete providers not bridged |
+| `pi.registerShortcut` / `unregisterShortcut` | ⛔ fail-fast | interactive keybindings not bridged |
+| Node `module.registerHooks` | ⚠️ required | the bridge needs a Node runtime that provides `module.registerHooks`; older Node throws at startup |
+
+Closing the 🟡/⛔ rows is the job of the out-of-process JSON-RPC transport
+described above.

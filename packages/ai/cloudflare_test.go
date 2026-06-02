@@ -25,6 +25,10 @@ func TestCloudflareCredentialHelpersAndBaseURL(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "CLOUDFLARE_GATEWAY_ID") {
 		t.Fatalf("missing gateway error=%v", err)
 	}
+	// P2-6: the missing-env message must end with a period to match TS.
+	if !strings.HasSuffix(err.Error(), "is not set.") {
+		t.Fatalf("expected trailing period, error=%q", err.Error())
+	}
 	t.Setenv("CLOUDFLARE_GATEWAY_ID", "gateway")
 	if !HasCloudflareAIGatewayCredentials() {
 		t.Fatal("gateway credentials should pass")

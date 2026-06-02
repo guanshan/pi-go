@@ -433,3 +433,50 @@ func TestAgentSessionAbortRetryStopsBackoff(t *testing.T) {
 		t.Fatalf("requests=%d", requests)
 	}
 }
+
+// TestRetryablePromptErrorClassifiesProviderErrors proves auto-retry only fires
+// for transient provider/network errors and never for provider-limit
+// (quota/billing/usage) errors, matching the TypeScript _isRetryableError /
+// _isNonRetryableProviderLimitError classification in
+// packages/coding-agent/src/core/agent-session.ts.
+func TestRetryablePromptErrorClassifiesProviderErrors(t *testing.T) {
+	errorAssistant := func(msg string) []agentcore.AgentMessage {
+		return []agentcore.AgentMessage{ai.AssistantMessage{
+			Role:         "assistant",
+			StopReason:   "error",
+			ErrorMessage: msg,
+		}}
+	}
+
+	cases := []struct {
+		name        string
+		msg         string
+		wantRetried bool
+	}{
+		{"insufficient_quota", "insufficient_quota", false},
+		{"monthly usage limit", "Monthly usage limit reached", false},
+		{"network connection lost", "Network connection lost.", true},
+		{"overloaded", "overloaded", true},
+		{"http 429", "429 Too Many Requests", true},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			agent := &AgentSession{
+				Model:            ai.Model{ContextWindow: 200000},
+				autoRetryEnabled: true,
+			}
+			got := agent.retryablePromptError(errorAssistant(tc.msg), false)
+			if tc.wantRetried {
+				if got == "" {
+					t.Fatalf("expected retryable error for %q, got empty (not retried)", tc.msg)
+				}
+				if got != tc.msg {
+					t.Fatalf("retry message=%q, want %q", got, tc.msg)
+				}
+			} else if got != "" {
+				t.Fatalf("expected %q to NOT be retried, got %q", tc.msg, got)
+			}
+		})
+	}
+}

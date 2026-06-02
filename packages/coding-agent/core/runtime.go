@@ -323,8 +323,16 @@ func (r *AgentSessionRuntime) Dispose(ctx context.Context) error {
 	r.beforeSessionInvalidate = nil
 	r.mu.Unlock()
 	if session != nil {
+		// Emit shutdown up front (mirroring agent-session-runtime.ts dispose),
+		// then run the full session disposal so a quit/signal aborts the active
+		// agent and any running bash command, not just the extension runtime.
+		// disposeSession(false) avoids re-emitting session_shutdown.
 		session.emitExtensionSessionShutdown(coreext.SessionShutdownQuit, "")
-		session.shutdownExtensionRuntime(ctx)
+		if before != nil {
+			before()
+		}
+		session.disposeSession(false)
+		return nil
 	}
 	if before != nil {
 		before()

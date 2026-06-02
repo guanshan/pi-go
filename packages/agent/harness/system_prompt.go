@@ -10,9 +10,17 @@ import (
 	"github.com/guanshan/pi-go/packages/ai"
 )
 
+// DefaultSystemPrompt is used when no system prompt is configured. It mirrors
+// the TS harness, which defaults to this string in createTurnState.
+const DefaultSystemPrompt = "You are a helpful assistant."
+
 type SystemPromptSource struct {
 	Static  string
 	Builder SystemPromptBuilder
+	// staticSet distinguishes an explicit static prompt (including the empty
+	// string) from a zero-value, unconfigured source. An unconfigured source
+	// resolves to DefaultSystemPrompt.
+	staticSet bool
 }
 
 type SystemPromptBuilder func(ctx context.Context, sc SystemPromptContext) (string, error)
@@ -27,7 +35,7 @@ type SystemPromptContext struct {
 }
 
 func StaticSystemPrompt(value string) SystemPromptSource {
-	return SystemPromptSource{Static: value}
+	return SystemPromptSource{Static: value, staticSet: true}
 }
 
 func DynamicSystemPrompt(builder SystemPromptBuilder) SystemPromptSource {
@@ -37,6 +45,9 @@ func DynamicSystemPrompt(builder SystemPromptBuilder) SystemPromptSource {
 func (s SystemPromptSource) Build(ctx context.Context, sc SystemPromptContext) (string, error) {
 	if s.Builder != nil {
 		return s.Builder(ctx, sc)
+	}
+	if !s.staticSet {
+		return DefaultSystemPrompt, nil
 	}
 	return s.Static, nil
 }

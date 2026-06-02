@@ -3,12 +3,15 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"sort"
 	"strings"
+	"syscall"
 
 	"github.com/guanshan/pi-go/packages/ai"
+	"golang.org/x/text/unicode/norm"
 )
 
 func (EditTool) Name() string { return "edit" }
@@ -42,14 +45,14 @@ func (t EditTool) Execute(ctx context.Context, raw json.RawMessage, _ ToolUpdate
 	if len(edits) == 0 {
 		return toolError("Edit tool input is invalid. edits must contain at least one replacement.")
 	}
-	abs := ResolveInCWD(t.CWD, args.Path)
+	abs := ResolveToolPath(t.CWD, args.Path)
 	return withFileMutationQueue(abs, func() ai.ToolResult {
 		if err := ctx.Err(); err != nil {
 			return toolError(err.Error())
 		}
 		data, err := os.ReadFile(abs)
 		if err != nil {
-			return toolError(fmt.Sprintf("Could not edit file: %s. %s", args.Path, err))
+			return toolError(fmt.Sprintf("Could not edit file: %s. %s.", args.Path, editAccessErrorMessage(err)))
 		}
 		rawContent := string(data)
 		bom, content := stripBOM(rawContent)
@@ -130,13 +133,30 @@ func restoreLineEndings(text, ending string) string {
 	return text
 }
 
+// normalizeForFuzzy mirrors TS normalizeForFuzzyMatch (edit-diff.ts:34-55).
+// Applies progressive transformations in the same order:
+//   - Unicode NFKC normalization (TS .normalize("NFKC"))
+//   - Strip trailing whitespace from each line
+//   - Smart quotes -> ASCII equivalents
+//   - Unicode dashes/hyphens -> ASCII hyphen
+//   - Special Unicode spaces -> regular space
 func normalizeForFuzzy(text string) string {
 	replacements := []struct{ old, new string }{
+		// Smart single quotes -> '
 		{"\u2018", "'"}, {"\u2019", "'"}, {"\u201a", "'"}, {"\u201b", "'"},
+		// Smart double quotes -> "
 		{"\u201c", `"`}, {"\u201d", `"`}, {"\u201e", `"`}, {"\u201f", `"`},
+		// Various dashes/hyphens -> -
 		{"\u2010", "-"}, {"\u2011", "-"}, {"\u2012", "-"}, {"\u2013", "-"}, {"\u2014", "-"}, {"\u2015", "-"}, {"\u2212", "-"},
-		{"\u00a0", " "}, {"\u202f", " "}, {"\u205f", " "}, {"\u3000", " "},
+		// Special spaces -> regular space
+		// U+00A0 NBSP, U+2002-U+200A various spaces, U+202F narrow NBSP,
+		// U+205F medium math space, U+3000 ideographic space
+		{"\u00a0", " "},
+		{"\u2002", " "}, {"\u2003", " "}, {"\u2004", " "}, {"\u2005", " "}, {"\u2006", " "},
+		{"\u2007", " "}, {"\u2008", " "}, {"\u2009", " "}, {"\u200a", " "},
+		{"\u202f", " "}, {"\u205f", " "}, {"\u3000", " "},
 	}
+	text = norm.NFKC.String(text)
 	lines := strings.Split(text, "\n")
 	for i := range lines {
 		lines[i] = strings.TrimRight(lines[i], " \t")
@@ -146,6 +166,67 @@ func normalizeForFuzzy(text string) string {
 		text = strings.ReplaceAll(text, r.old, r.new)
 	}
 	return text
+}
+
+// countFuzzyOccurrences mirrors TS countOccurrences (edit-diff.ts:141-145): it
+// always counts in fuzzy-normalized space, regardless of whether the surrounding
+// match ran against exact or normalized content.
+func countFuzzyOccurrences(content, oldText string) int {
+	return strings.Count(normalizeForFuzzy(content), normalizeForFuzzy(oldText))
+}
+
+// fuzzyFindText mirrors TS fuzzyFindText (edit-diff.ts:96-134): it tries an exact
+// substring match first, then falls back to matching in fuzzy-normalized space.
+// It returns the match index (or -1), the matched length, and whether fuzzy
+// matching was used. Indices/lengths are relative to content when the match is
+// exact and relative to normalizeForFuzzy(content) when fuzzy matching is used.
+func fuzzyFindText(content, oldText string) (index, matchLength int, usedFuzzy bool) {
+	if exact := strings.Index(content, oldText); exact != -1 {
+		return exact, len(oldText), false
+	}
+	fuzzyContent := normalizeForFuzzy(content)
+	fuzzyOldText := normalizeForFuzzy(oldText)
+	fuzzyIndex := strings.Index(fuzzyContent, fuzzyOldText)
+	if fuzzyIndex == -1 {
+		return -1, 0, false
+	}
+	return fuzzyIndex, len(fuzzyOldText), true
+}
+
+// editAccessErrorMessage mirrors TS edit.ts:328-330: when the underlying error
+// carries an OS error code, surface it as "Error code: <CODE>" (Node-style),
+// otherwise fall back to the error string.
+func editAccessErrorMessage(err error) string {
+	var errno syscall.Errno
+	if errors.As(err, &errno) {
+		if code := nodeErrorCode(errno); code != "" {
+			return "Error code: " + code
+		}
+	}
+	return err.Error()
+}
+
+// nodeErrorCode maps the common POSIX errnos Go returns from filesystem calls to
+// the Node.js error-code strings (e.g. ENOENT, EACCES) that the TypeScript edit
+// tool reports, so error wording stays identical across runtimes.
+func nodeErrorCode(errno syscall.Errno) string {
+	switch errno {
+	case syscall.ENOENT:
+		return "ENOENT"
+	case syscall.EACCES:
+		return "EACCES"
+	case syscall.EISDIR:
+		return "EISDIR"
+	case syscall.ENOTDIR:
+		return "ENOTDIR"
+	case syscall.EPERM:
+		return "EPERM"
+	case syscall.ELOOP:
+		return "ELOOP"
+	case syscall.ENAMETOOLONG:
+		return "ENAMETOOLONG"
+	}
+	return ""
 }
 
 func applyEdits(content string, edits []Edit, path string) (string, string, error) {
@@ -158,40 +239,48 @@ func applyEdits(content string, edits []Edit, path string) (string, string, erro
 	normalized := make([]Edit, len(edits))
 	for i, e := range edits {
 		normalized[i] = Edit{OldText: normalizeToLF(e.OldText), NewText: normalizeToLF(e.NewText)}
+	}
+	for i := range normalized {
 		if normalized[i].OldText == "" {
-			return "", "", fmt.Errorf("edits[%d].oldText must not be empty in %s", i, path)
+			if len(normalized) == 1 {
+				return "", "", fmt.Errorf("oldText must not be empty in %s.", path)
+			}
+			return "", "", fmt.Errorf("edits[%d].oldText must not be empty in %s.", i, path)
 		}
 	}
+	// If any edit only matches after fuzzy normalization, switch the whole
+	// base to fuzzy-normalized space (mirrors TS applyEditsToNormalizedContent
+	// using normalizeForFuzzyMatch when initialMatches.some(usedFuzzyMatch)).
 	base := content
 	for _, e := range normalized {
-		if !strings.Contains(base, e.OldText) && strings.Contains(normalizeForFuzzy(base), normalizeForFuzzy(e.OldText)) {
-			base = normalizeForFuzzy(base)
+		if _, _, used := fuzzyFindText(base, e.OldText); used {
+			base = normalizeForFuzzy(content)
 			break
 		}
 	}
 	matches := make([]match, 0, len(normalized))
 	for i, e := range normalized {
-		oldText := e.OldText
-		if base != content {
-			oldText = normalizeForFuzzy(oldText)
-		}
-		count := strings.Count(base, oldText)
-		if count == 0 {
+		idx, matchLen, _ := fuzzyFindText(base, e.OldText)
+		if idx < 0 {
 			if len(normalized) == 1 {
-				return "", "", fmt.Errorf("could not find the exact text in %s. The old text must match exactly including all whitespace and newlines", path)
+				return "", "", fmt.Errorf("Could not find the exact text in %s. The old text must match exactly including all whitespace and newlines.", path)
 			}
-			return "", "", fmt.Errorf("could not find edits[%d] in %s. The oldText must match exactly including all whitespace and newlines", i, path)
+			return "", "", fmt.Errorf("Could not find edits[%d] in %s. The oldText must match exactly including all whitespace and newlines.", i, path)
 		}
+		// Uniqueness is always counted in fuzzy-normalized space (TS countOccurrences).
+		count := countFuzzyOccurrences(base, e.OldText)
 		if count > 1 {
-			return "", "", fmt.Errorf("found %d occurrences of edits[%d] in %s. Each oldText must be unique", count, i, path)
+			if len(normalized) == 1 {
+				return "", "", fmt.Errorf("Found %d occurrences of the text in %s. The text must be unique. Please provide more context to make it unique.", count, path)
+			}
+			return "", "", fmt.Errorf("Found %d occurrences of edits[%d] in %s. Each oldText must be unique. Please provide more context to make it unique.", count, i, path)
 		}
-		idx := strings.Index(base, oldText)
-		matches = append(matches, match{index: idx, end: idx + len(oldText), edit: e, num: i})
+		matches = append(matches, match{index: idx, end: idx + matchLen, edit: e, num: i})
 	}
 	sort.Slice(matches, func(i, j int) bool { return matches[i].index < matches[j].index })
 	for i := 1; i < len(matches); i++ {
 		if matches[i-1].end > matches[i].index {
-			return "", "", fmt.Errorf("edits[%d] and edits[%d] overlap in %s. Merge them into one edit or target disjoint regions", matches[i-1].num, matches[i].num, path)
+			return "", "", fmt.Errorf("edits[%d] and edits[%d] overlap in %s. Merge them into one edit or target disjoint regions.", matches[i-1].num, matches[i].num, path)
 		}
 	}
 	updated := base
@@ -200,7 +289,10 @@ func applyEdits(content string, edits []Edit, path string) (string, string, erro
 		updated = updated[:m.index] + m.edit.NewText + updated[m.end:]
 	}
 	if updated == base {
-		return "", "", fmt.Errorf("no changes made to %s. The replacement produced identical content", path)
+		if len(normalized) == 1 {
+			return "", "", fmt.Errorf("No changes made to %s. The replacement produced identical content. This might indicate an issue with special characters or the text not existing as expected.", path)
+		}
+		return "", "", fmt.Errorf("No changes made to %s. The replacements produced identical content.", path)
 	}
 	return base, updated, nil
 }

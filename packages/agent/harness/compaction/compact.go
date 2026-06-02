@@ -2,6 +2,7 @@ package compaction
 
 import (
 	"context"
+	"math"
 	"strings"
 
 	"github.com/guanshan/pi-go/packages/agent"
@@ -163,23 +164,43 @@ func stringSliceFromAny(value any) []string {
 	}
 }
 
+// Compact generates compaction summary data from prepared session history.
+// Mirrors TS src/harness/compaction/compaction.ts:627-706 (compact).
 func Compact(ctx context.Context, prep *Preparation, model ai.Model, apiKey string, headers map[string]string, customInstructions string, registry *ai.ModelRegistry, thinkingLevel ai.ThinkingLevel) (Result, error) {
 	if prep == nil {
 		return Result{}, &CompactionError{Code: "invalid_preparation", Msg: "compaction preparation is nil"}
 	}
-	llmMessages, err := messagesToLLM(prep.MessagesToSummarize)
-	if err != nil {
-		return Result{}, err
+	if prep.FirstKeptEntryID == "" {
+		return Result{}, &CompactionError{Code: "invalid_session", Msg: "First kept entry has no UUID - session may need migration"}
 	}
-	conversationText := SerializeConversation(llmMessages)
-	summary, err := GenerateSummary(ctx, conversationText, customInstructions, model, apiKey, headers, registry, thinkingLevel)
-	if err != nil {
-		return Result{}, err
+
+	settings := withDefaults(prep.Settings)
+	var summary string
+
+	if prep.IsSplitTurn && len(prep.TurnPrefixMessages) > 0 {
+		// Summarize the history and the turn prefix separately, then join.
+		historySummary := "No prior history."
+		if len(prep.MessagesToSummarize) > 0 {
+			generated, err := GenerateSummary(ctx, prep.MessagesToSummarize, model, settings.ReserveTokens, apiKey, headers, customInstructions, prep.PreviousSummary, registry, thinkingLevel)
+			if err != nil {
+				return Result{}, err
+			}
+			historySummary = generated
+		}
+		turnPrefixSummary, err := generateTurnPrefixSummary(ctx, prep.TurnPrefixMessages, model, settings.ReserveTokens, apiKey, headers, registry, thinkingLevel)
+		if err != nil {
+			return Result{}, err
+		}
+		summary = historySummary + "\n\n---\n\n**Turn Context (split turn):**\n\n" + turnPrefixSummary
+	} else {
+		generated, err := GenerateSummary(ctx, prep.MessagesToSummarize, model, settings.ReserveTokens, apiKey, headers, customInstructions, prep.PreviousSummary, registry, thinkingLevel)
+		if err != nil {
+			return Result{}, err
+		}
+		summary = generated
 	}
-	if prep.PreviousSummary != "" {
-		summary = strings.TrimSpace(prep.PreviousSummary) + "\n\n" + strings.TrimSpace(summary)
-	}
-	if limit := prep.Settings.SummaryMaxChars; limit > 0 && len(summary) > limit {
+
+	if limit := settings.SummaryMaxChars; limit > 0 && len(summary) > limit {
 		summary = summary[:limit] + "\n[summary truncated]"
 	}
 	readFiles, modifiedFiles := ComputeFileLists(prep.FileOps)
@@ -199,13 +220,62 @@ func Compact(ctx context.Context, prep *Preparation, model ai.Model, apiKey stri
 	}, nil
 }
 
-func GenerateSummary(ctx context.Context, conversationText string, customInstructions string, model ai.Model, apiKey string, headers map[string]string, registry *ai.ModelRegistry, thinkingLevel ai.ThinkingLevel) (string, error) {
-	instructions := compactionPrompt
-	if custom := strings.TrimSpace(customInstructions); custom != "" {
-		instructions += "\n\nAdditional instructions:\n" + custom
+// summaryMaxTokens mirrors TS:
+//
+//	Math.min(Math.floor(fraction * reserveTokens), model.maxTokens > 0 ? model.maxTokens : Infinity)
+//
+// model.MaxOutput maps to the TS Model.maxTokens field (see ai.Model marshalling).
+func summaryMaxTokens(fraction float64, reserveTokens int, model ai.Model) int {
+	budget := int(math.Floor(fraction * float64(reserveTokens)))
+	if model.MaxOutput > 0 && model.MaxOutput < budget {
+		return model.MaxOutput
 	}
-	prompt := "<conversation>\n" + conversationText + "\n</conversation>\n\n" + instructions
-	options := ai.SimpleStreamOptions{APIKey: apiKey, Headers: headers, MaxTokens: 2048}
+	return budget
+}
+
+// GenerateSummary generates or updates a conversation summary for compaction.
+// Mirrors TS src/harness/compaction/compaction.ts:456-519 (generateSummary).
+func GenerateSummary(ctx context.Context, messages []agent.AgentMessage, model ai.Model, reserveTokens int, apiKey string, headers map[string]string, customInstructions string, previousSummary string, registry *ai.ModelRegistry, thinkingLevel ai.ThinkingLevel) (string, error) {
+	maxTokens := summaryMaxTokens(0.8, reserveTokens, model)
+
+	basePrompt := summarizationPrompt
+	if previousSummary != "" {
+		basePrompt = updateSummarizationPrompt
+	}
+	if custom := strings.TrimSpace(customInstructions); custom != "" {
+		basePrompt = basePrompt + "\n\nAdditional focus: " + custom
+	}
+
+	llmMessages, err := messagesToLLM(messages)
+	if err != nil {
+		return "", err
+	}
+	conversationText := SerializeConversation(llmMessages)
+	promptText := "<conversation>\n" + conversationText + "\n</conversation>\n\n"
+	if previousSummary != "" {
+		promptText += "<previous-summary>\n" + previousSummary + "\n</previous-summary>\n\n"
+	}
+	promptText += basePrompt
+
+	return runSummarization(ctx, model, maxTokens, promptText, apiKey, headers, registry, thinkingLevel, "Summarization aborted", "Summarization failed: ")
+}
+
+// generateTurnPrefixSummary summarizes the prefix of a split turn.
+// Mirrors TS src/harness/compaction/compaction.ts:707-756 (generateTurnPrefixSummary).
+func generateTurnPrefixSummary(ctx context.Context, messages []agent.AgentMessage, model ai.Model, reserveTokens int, apiKey string, headers map[string]string, registry *ai.ModelRegistry, thinkingLevel ai.ThinkingLevel) (string, error) {
+	maxTokens := summaryMaxTokens(0.5, reserveTokens, model)
+	llmMessages, err := messagesToLLM(messages)
+	if err != nil {
+		return "", err
+	}
+	conversationText := SerializeConversation(llmMessages)
+	promptText := "<conversation>\n" + conversationText + "\n</conversation>\n\n" + turnPrefixSummarizationPrompt
+	return runSummarization(ctx, model, maxTokens, promptText, apiKey, headers, registry, thinkingLevel, "Turn prefix summarization aborted", "Turn prefix summarization failed: ")
+}
+
+// runSummarization issues a summarization completion and maps stop reasons to errors.
+func runSummarization(ctx context.Context, model ai.Model, maxTokens int, promptText string, apiKey string, headers map[string]string, registry *ai.ModelRegistry, thinkingLevel ai.ThinkingLevel, abortedMsg string, failedPrefix string) (string, error) {
+	options := ai.SimpleStreamOptions{APIKey: apiKey, Headers: headers, MaxTokens: maxTokens}
 	if model.Reasoning && thinkingLevel != "" && thinkingLevel != ai.ThinkingOff {
 		options.Reasoning = thinkingLevel
 	}
@@ -215,7 +285,7 @@ func GenerateSummary(ctx context.Context, conversationText string, customInstruc
 	}
 	message, err := complete(ctx, model, ai.Context{
 		SystemPrompt: summarizationSystemPrompt,
-		Messages:     []ai.Message{ai.NewUserMessage(prompt, nil)},
+		Messages:     []ai.Message{ai.NewUserMessage(promptText, nil)},
 	}, options)
 	if err != nil {
 		return "", &CompactionError{Code: "summarization_failed", Msg: "summarization failed", Err: err}
@@ -223,7 +293,7 @@ func GenerateSummary(ctx context.Context, conversationText string, customInstruc
 	if message.StopReason == "aborted" {
 		msg := message.ErrorMessage
 		if msg == "" {
-			msg = "Summarization aborted"
+			msg = abortedMsg
 		}
 		return "", &CompactionError{Code: "aborted", Msg: msg}
 	}
@@ -232,13 +302,114 @@ func GenerateSummary(ctx context.Context, conversationText string, customInstruc
 		if msg == "" {
 			msg = "Unknown error"
 		}
-		return "", &CompactionError{Code: "summarization_failed", Msg: "Summarization failed: " + msg}
+		return "", &CompactionError{Code: "summarization_failed", Msg: failedPrefix + msg}
 	}
-	return strings.TrimSpace(ai.MessageText(message)), nil
+	return summaryTextContent(message), nil
 }
 
-const summarizationSystemPrompt = "You are summarizing previous conversation context for a coding agent."
+// summaryTextContent joins the text blocks of a completion with newlines,
+// mirroring TS `response.content.filter(text).map(text).join("\n")`.
+func summaryTextContent(message ai.AssistantMessage) string {
+	var texts []string
+	for _, block := range message.Content {
+		if block.Type == "text" {
+			texts = append(texts, block.Text)
+		}
+	}
+	return strings.Join(texts, "\n")
+}
 
-const compactionPrompt = `Summarize the conversation above for future context.
+// summarizationSystemPrompt mirrors TS SUMMARIZATION_SYSTEM_PROMPT (compaction.ts:379-381).
+const summarizationSystemPrompt = `You are a context summarization assistant. Your task is to read a conversation between a user and an AI coding assistant, then produce a structured summary following the exact format specified.
 
-Preserve concrete file paths, commands, errors, decisions, constraints, and unfinished work. Keep it concise.`
+Do NOT continue the conversation. Do NOT respond to any questions in the conversation. ONLY output the structured summary.`
+
+// summarizationPrompt mirrors TS SUMMARIZATION_PROMPT (compaction.ts:383-414).
+const summarizationPrompt = `The messages above are a conversation to summarize. Create a structured context checkpoint summary that another LLM will use to continue the work.
+
+Use this EXACT format:
+
+## Goal
+[What is the user trying to accomplish? Can be multiple items if the session covers different tasks.]
+
+## Constraints & Preferences
+- [Any constraints, preferences, or requirements mentioned by user]
+- [Or "(none)" if none were mentioned]
+
+## Progress
+### Done
+- [x] [Completed tasks/changes]
+
+### In Progress
+- [ ] [Current work]
+
+### Blocked
+- [Issues preventing progress, if any]
+
+## Key Decisions
+- **[Decision]**: [Brief rationale]
+
+## Next Steps
+1. [Ordered list of what should happen next]
+
+## Critical Context
+- [Any data, examples, or references needed to continue]
+- [Or "(none)" if not applicable]
+
+Keep each section concise. Preserve exact file paths, function names, and error messages.`
+
+// updateSummarizationPrompt mirrors TS UPDATE_SUMMARIZATION_PROMPT (compaction.ts:416-453).
+const updateSummarizationPrompt = `The messages above are NEW conversation messages to incorporate into the existing summary provided in <previous-summary> tags.
+
+Update the existing structured summary with new information. RULES:
+- PRESERVE all existing information from the previous summary
+- ADD new progress, decisions, and context from the new messages
+- UPDATE the Progress section: move items from "In Progress" to "Done" when completed
+- UPDATE "Next Steps" based on what was accomplished
+- PRESERVE exact file paths, function names, and error messages
+- If something is no longer relevant, you may remove it
+
+Use this EXACT format:
+
+## Goal
+[Preserve existing goals, add new ones if the task expanded]
+
+## Constraints & Preferences
+- [Preserve existing, add new ones discovered]
+
+## Progress
+### Done
+- [x] [Include previously done items AND newly completed items]
+
+### In Progress
+- [ ] [Current work - update based on progress]
+
+### Blocked
+- [Current blockers - remove if resolved]
+
+## Key Decisions
+- **[Decision]**: [Brief rationale] (preserve all previous, add new)
+
+## Next Steps
+1. [Update based on current state]
+
+## Critical Context
+- [Preserve important context, add new if needed]
+
+Keep each section concise. Preserve exact file paths, function names, and error messages.`
+
+// turnPrefixSummarizationPrompt mirrors TS TURN_PREFIX_SUMMARIZATION_PROMPT (compaction.ts:609-622).
+const turnPrefixSummarizationPrompt = `This is the PREFIX of a turn that was too large to keep. The SUFFIX (recent work) is retained.
+
+Summarize the prefix to provide context for the retained suffix:
+
+## Original Request
+[What did the user ask for in this turn?]
+
+## Early Progress
+- [Key decisions and work done in the prefix]
+
+## Context for Suffix
+- [Information needed to understand the retained recent work]
+
+Be concise. Focus on what's needed to understand the kept suffix.`

@@ -90,6 +90,14 @@ func PrepareBranchEntries(entries []session.Entry, tokenBudget int) BranchPrepar
 		ExtractFileOpsFromMessage(message, &fileOps)
 		tokens := estimateMessageTokens(message)
 		if tokenBudget > 0 && totalTokens+tokens > tokenBudget {
+			// Mirror TS branch-summarization.ts:149-156: a compaction or
+			// branch_summary entry that would exceed the budget is still
+			// included when we are below 90% of the budget, so the carried
+			// summary is not dropped.
+			if isCompactionOrBranchSummary(entries[i]) && float64(totalTokens) < float64(tokenBudget)*0.9 {
+				messages = append([]agent.AgentMessage{message}, messages...)
+				totalTokens += tokens
+			}
 			break
 		}
 		messages = append([]agent.AgentMessage{message}, messages...)
@@ -103,10 +111,12 @@ func GenerateBranchSummary(ctx context.Context, entries []session.Entry, options
 	if reserveTokens <= 0 {
 		reserveTokens = DefaultSettings.ReserveTokens
 	}
-	tokenBudget := 0
-	if options.Model.ContextWindow > reserveTokens {
-		tokenBudget = options.Model.ContextWindow - reserveTokens
+	// Mirror TS branch-summarization.ts:206 `const contextWindow = model.contextWindow || 128000`.
+	contextWindow := options.Model.ContextWindow
+	if contextWindow <= 0 {
+		contextWindow = 128000
 	}
+	tokenBudget := contextWindow - reserveTokens
 	prepared := PrepareBranchEntries(entries, tokenBudget)
 	readFiles, modifiedFiles := ComputeFileLists(prepared.FileOps)
 	if len(prepared.Messages) == 0 {
@@ -151,12 +161,22 @@ func GenerateBranchSummary(ctx context.Context, entries []session.Entry, options
 		}
 		return BranchSummary{}, &BranchSummaryError{Code: "summarization_failed", Msg: "Branch summary failed: " + msg}
 	}
-	summary = ai.MessageText(message)
+	// Mirror TS branch-summarization.ts:250-253: join text blocks with "\n".
+	summary = summaryTextContent(message)
 	if strings.TrimSpace(summary) == "" {
 		summary = "No summary generated"
 	}
 	summary = branchSummaryPreamble + strings.TrimSpace(summary) + FormatFileOperations(readFiles, modifiedFiles)
 	return BranchSummary{Summary: summary, ReadFiles: readFiles, ModifiedFiles: modifiedFiles}, nil
+}
+
+func isCompactionOrBranchSummary(entry session.Entry) bool {
+	switch entry.(type) {
+	case session.CompactionEntry, session.BranchSummaryEntry:
+		return true
+	default:
+		return false
+	}
 }
 
 func messageFromEntry(entry session.Entry) (agent.AgentMessage, bool) {
@@ -237,9 +257,35 @@ Summary of that exploration:
 
 `
 
+// branchSummaryPrompt mirrors TS BRANCH_SUMMARY_PROMPT (branch-summarization.ts:171-198).
 const branchSummaryPrompt = `Create a structured summary of this conversation branch for context when returning later.
 
-Preserve exact file paths, function names, errors, and next steps.`
+Use this EXACT format:
+
+## Goal
+[What was the user trying to accomplish in this branch?]
+
+## Constraints & Preferences
+- [Any constraints, preferences, or requirements mentioned]
+- [Or "(none)" if none were mentioned]
+
+## Progress
+### Done
+- [x] [Completed tasks/changes]
+
+### In Progress
+- [ ] [Work that was started but not finished]
+
+### Blocked
+- [Issues preventing progress, if any]
+
+## Key Decisions
+- **[Decision]**: [Brief rationale]
+
+## Next Steps
+1. [What should happen next to continue this work]
+
+Keep each section concise. Preserve exact file paths, function names, and error messages.`
 
 const compactionSummaryPrefix = `The conversation history before this point was compacted into the following summary:
 

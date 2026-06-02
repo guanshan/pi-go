@@ -17,18 +17,24 @@ func TestHandlePackageCommandUsesPackagesSetting(t *testing.T) {
 	}
 	settings := NewSettingsManager(cwd, agentDir)
 
-	handled, err := HandlePackageCommand([]string{"install", packageDir, "--local"}, cwd, agentDir, settings)
+	handled, err := HandlePackageCommand([]string{"install", packageDir, "--local"}, cwd, agentDir, settings, nil)
 	if err != nil || !handled {
 		t.Fatalf("install handled=%v err=%v", handled, err)
 	}
-	if len(settings.Project.Packages) != 1 || settings.Project.Packages[0].Source != packageDir {
-		t.Fatalf("project packages=%#v", settings.Project.Packages)
+	// Local sources are stored relative to the project scope base (<cwd>/.pi),
+	// matching normalizePackageSourceForSettings in package-manager.ts.
+	wantStored, err := filepath.Rel(ProjectPiDir(cwd), packageDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(settings.Project.Packages) != 1 || settings.Project.Packages[0].Source != wantStored {
+		t.Fatalf("project packages=%#v want stored source %q", settings.Project.Packages, wantStored)
 	}
 	if len(settings.Project.InstalledPackages) != 0 {
 		t.Fatalf("legacy installed packages written=%#v", settings.Project.InstalledPackages)
 	}
 
-	handled, err = HandlePackageCommand([]string{"remove", packageDir, "--local"}, cwd, agentDir, settings)
+	handled, err = HandlePackageCommand([]string{"remove", packageDir, "--local"}, cwd, agentDir, settings, nil)
 	if err != nil || !handled {
 		t.Fatalf("remove handled=%v err=%v", handled, err)
 	}
@@ -37,8 +43,80 @@ func TestHandlePackageCommandUsesPackagesSetting(t *testing.T) {
 	}
 }
 
+func TestNormalizePackageSourceForSettings(t *testing.T) {
+	cwd := t.TempDir()
+	agentDir := t.TempDir()
+	pkg := filepath.Join(cwd, "pkgs", "tool")
+
+	globalWant, err := filepath.Rel(agentDir, pkg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	projectWant, err := filepath.Rel(ProjectPiDir(cwd), pkg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tests := []struct {
+		name   string
+		source string
+		local  bool
+		want   string
+	}{
+		{name: "global local relative to agent dir", source: "./pkgs/tool", local: false, want: globalWant},
+		{name: "project local relative to project .pi", source: "./pkgs/tool", local: true, want: projectWant},
+		{name: "absolute global", source: pkg, local: false, want: globalWant},
+		{name: "npm stored verbatim", source: "npm:@scope/pkg@1.0.0", local: false, want: "npm:@scope/pkg@1.0.0"},
+		{name: "git stored verbatim", source: "git:https://example.com/p.git", local: true, want: "git:https://example.com/p.git"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := normalizePackageSourceForSettings(tt.source, cwd, agentDir, tt.local)
+			if got != tt.want {
+				t.Fatalf("normalize(%q)=%q want %q", tt.source, got, tt.want)
+			}
+			// Managed sources keep their managed install path; local sources must
+			// resolve from the stored relative form back to the original dir.
+			if !isManagedPackageSource(tt.source) {
+				if resolved := packageInstallPath(got, tt.local, cwd, agentDir); resolved != pkg {
+					t.Fatalf("install path=%q want %q", resolved, pkg)
+				}
+			}
+		})
+	}
+}
+
+func TestInstallPackageStoresRelativeSourceAndResolvesFromDifferentCwd(t *testing.T) {
+	cwd := t.TempDir()
+	agentDir := t.TempDir()
+	packageDir := filepath.Join(cwd, "local-package")
+	if err := os.MkdirAll(packageDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	settings := NewSettingsManager(cwd, agentDir)
+
+	if err := installPackage(packageDir, false, cwd, agentDir, settings); err != nil {
+		t.Fatal(err)
+	}
+	want, err := filepath.Rel(agentDir, packageDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(settings.Global.Packages) != 1 || settings.Global.Packages[0].Source != want {
+		t.Fatalf("global packages=%#v want stored %q", settings.Global.Packages, want)
+	}
+
+	// Listing the global package from a different cwd must resolve back to the
+	// original directory rather than drifting with the new cwd.
+	otherCwd := t.TempDir()
+	entries := packageEntries(settings, otherCwd, agentDir, false)
+	if len(entries) != 1 || entries[0].Record.Path != packageDir {
+		t.Fatalf("entries from different cwd=%#v want path %q", entries, packageDir)
+	}
+}
+
 func TestHandlePackageCommandDoesNotOwnConfig(t *testing.T) {
-	handled, err := HandlePackageCommand([]string{"config", "--list"}, t.TempDir(), t.TempDir(), nil)
+	handled, err := HandlePackageCommand([]string{"config", "--list"}, t.TempDir(), t.TempDir(), nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -207,7 +285,7 @@ func TestPackageCommandMatchesNPMIdentity(t *testing.T) {
 	if len(settings.Global.InstalledPackages) != 0 {
 		t.Fatalf("legacy packages=%#v", settings.Global.InstalledPackages)
 	}
-	if err := updatePackages(packageUpdateTarget{Kind: "extensions", Source: "npm:missing"}, settings); err == nil {
+	if err := updatePackages(packageUpdateTarget{Kind: "extensions", Source: "npm:missing"}, settings, nil, settings.CWD, settings.AgentDir); err == nil {
 		t.Fatal("expected missing package update error")
 	}
 }

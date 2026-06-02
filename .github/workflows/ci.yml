@@ -46,6 +46,9 @@ jobs:
       - name: Build
         run: go build -v ./...
 
+      - name: Architecture check
+        run: go run ./scripts/check_arch.go
+
       - name: Release hygiene
         if: matrix.os == 'ubuntu-latest'
         run: ./scripts/check_release_hygiene.sh

@@ -19,6 +19,7 @@ func TestVisibleWidth(t *testing.T) {
 		{"a\tb", 1 + 4 + 1},
 		{"\x1b]8;;https://example.com\x1b\\link\x1b]8;;\x1b\\", 4},
 		{"👨‍👩‍👧", 2}, // family ZWJ sequence: single grapheme cluster, width 2
+		{"🇨", 2},     // regional-indicator singleton is rendered as an emoji cell
 		{"é", 1},     // combining acute on e: width 1
 		{"\x07", 0},  // BEL
 	}
@@ -27,6 +28,27 @@ func TestVisibleWidth(t *testing.T) {
 		if got != c.want {
 			t.Errorf("VisibleWidth(%q) = %d, want %d", c.in, got, c.want)
 		}
+	}
+}
+
+func TestRegionalIndicatorAndEmojiWidths(t *testing.T) {
+	for r := rune(0x1F1E6); r <= rune(0x1F1FF); r++ {
+		if got := VisibleWidth(string(r)); got != 2 {
+			t.Fatalf("regional indicator U+%04X width=%d, want 2", r, got)
+		}
+	}
+	for _, sample := range []string{"🇺🇸", "👍", "👍🏻", "✅", "⚡", "⚡️", "👨", "👨‍💻", "🏳️‍🌈"} {
+		if got := VisibleWidth(sample); got != 2 {
+			t.Fatalf("VisibleWidth(%q)=%d, want 2", sample, got)
+		}
+	}
+
+	lines := WrapTextWithANSI("1234567🇨", 8)
+	if len(lines) != 2 {
+		t.Fatalf("wrapped regional indicator lines=%#v", lines)
+	}
+	if VisibleWidth(lines[0]) != 7 || VisibleWidth(lines[1]) != 2 {
+		t.Fatalf("wrapped regional indicator widths=%d/%d lines=%#v", VisibleWidth(lines[0]), VisibleWidth(lines[1]), lines)
 	}
 }
 

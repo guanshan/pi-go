@@ -11,6 +11,72 @@ import (
 	core "github.com/guanshan/pi-go/packages/coding-agent/core"
 )
 
+// TestHandlePackageCommandRemoveDeletesInstalledDir proves the CLI remove path
+// now delegates to DefaultPackageManager, which deletes installed code on disk
+// rather than only editing settings (the P1-3 regression).
+func TestHandlePackageCommandRemoveDeletesInstalledDir(t *testing.T) {
+	cwd := t.TempDir()
+	agentDir := t.TempDir()
+	settings := core.NewSettingsManager(cwd, agentDir)
+	source := "npm:demo"
+	settings.AddPackageSource(source, false)
+	if err := settings.SaveGlobal(); err != nil {
+		t.Fatal(err)
+	}
+	// New TS layout: npm packages live under <agentDir>/npm/node_modules/<name>.
+	installed := filepath.Join(agentDir, "npm", "node_modules", "demo")
+	writeTestFile(t, filepath.Join(installed, "index.js"), "module.exports = {}")
+
+	handled, err := core.HandlePackageCommand([]string{"remove", source}, cwd, agentDir, settings, NewCorePackageManager)
+	if err != nil || !handled {
+		t.Fatalf("remove handled=%v err=%v", handled, err)
+	}
+	if _, statErr := os.Stat(installed); !os.IsNotExist(statErr) {
+		t.Fatalf("installed package dir still present after remove: %v", statErr)
+	}
+	if len(settings.Global.Packages) != 0 {
+		t.Fatalf("source not removed from settings: %#v", settings.Global.Packages)
+	}
+}
+
+// TestInstallPackageDependenciesHonorsNpmCommand verifies the package manager
+// runs the configured npmCommand (e.g. a mise/pnpm/bun wrapper) instead of a
+// hardcoded "npm", and drops npm-specific flags for custom commands.
+func TestInstallPackageDependenciesHonorsNpmCommand(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("uses a POSIX shell script as the fake package manager")
+	}
+	dir := t.TempDir()
+	marker := filepath.Join(dir, "invoked.log")
+	script := filepath.Join(dir, "fakepm.sh")
+	writeTestFile(t, script, "#!/bin/sh\necho \"$@\" >> \""+marker+"\"\n")
+	if err := os.Chmod(script, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	settings := core.NewSettingsManager(dir, dir)
+	settings.Project.NPMCommand = []string{script, "exec", "--", "pnpm"}
+	mgr := NewDefaultPackageManager(dir, dir, settings)
+
+	pkgDir := filepath.Join(dir, "pkg")
+	writeTestFile(t, filepath.Join(pkgDir, "package.json"), `{"dependencies":{"left-pad":"1.0.0"}}`)
+
+	if err := mgr.installPackageDependencies(pkgDir); err != nil {
+		t.Fatal(err)
+	}
+	logged, err := os.ReadFile(marker)
+	if err != nil {
+		t.Fatalf("configured npm command was not invoked: %v", err)
+	}
+	got := string(logged)
+	if !strings.Contains(got, "exec -- pnpm install") {
+		t.Fatalf("expected configured command with bare install, got %q", got)
+	}
+	if strings.Contains(got, "--omit=dev") {
+		t.Fatalf("npm-specific flags leaked into custom command: %q", got)
+	}
+}
+
 func TestDefaultPackageManagerResolveResources(t *testing.T) {
 	cwd := t.TempDir()
 	agentDir := t.TempDir()
@@ -252,26 +318,38 @@ func TestDefaultPackageManagerResolveExtensionSources(t *testing.T) {
 	}
 }
 
-func TestDefaultPackageManagerNpmInstallRunsDependencyInstall(t *testing.T) {
+// TestDefaultPackageManagerNpmInstallUsesRealInstall proves the npm branch runs
+// a real `install <spec> --prefix <npmRoot>` (so transitive deps land in a
+// proper node_modules tree) instead of the old `pack`+`tar` flow, and that the
+// resulting install path follows the TS layout <npmRoot>/node_modules/<name>.
+func TestDefaultPackageManagerNpmInstallUsesRealInstall(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("shell fake npm is POSIX-only")
 	}
 	cwd := t.TempDir()
 	agentDir := t.TempDir()
+	// The fake npm records its argv, rejects `pack`, and emulates a real install:
+	// it materializes <prefix>/node_modules/<name> with a transitive dep marker.
+	argLog := filepath.Join(agentDir, "npm-args.log")
 	installFakeNPM(t, `#!/bin/sh
 set -eu
+echo "$@" >> "`+argLog+`"
 if [ "$1" = "pack" ]; then
-	mkdir -p package
-	cat > package/package.json <<'JSON'
-{"name":"fixture","version":"1.0.0","dependencies":{"dep":"1.0.0"}}
-JSON
-	tar -czf fixture-1.0.0.tgz package
-	rm -rf package
-	exit 0
+	echo "pack must not be used" >&2
+	exit 3
 fi
 if [ "$1" = "install" ]; then
-	mkdir -p node_modules
-	printf installed > node_modules/.installed
+	spec="$2"
+	prefix=""
+	while [ "$#" -gt 0 ]; do
+		if [ "$1" = "--prefix" ]; then
+			prefix="$2"
+		fi
+		shift
+	done
+	name=$(printf '%s' "$spec" | sed 's/@[^@/]*$//')
+	mkdir -p "$prefix/node_modules/$name/node_modules/dep"
+	printf transitive > "$prefix/node_modules/$name/node_modules/dep/.installed"
 	exit 0
 fi
 echo "unexpected npm $*" >&2
@@ -283,40 +361,115 @@ exit 2
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := os.Stat(filepath.Join(record.Path, "node_modules", ".installed")); err != nil {
-		t.Fatalf("dependency install marker missing: %v", err)
+	wantPath := filepath.Join(agentDir, "npm", "node_modules", "fixture")
+	if record.Path != wantPath {
+		t.Fatalf("install path=%q want %q", record.Path, wantPath)
+	}
+	// Transitive dependency installed by the real `npm install` tree.
+	if _, err := os.Stat(filepath.Join(record.Path, "node_modules", "dep", ".installed")); err != nil {
+		t.Fatalf("transitive dependency marker missing: %v", err)
+	}
+	logged, err := os.ReadFile(argLog)
+	if err != nil {
+		t.Fatalf("npm was not invoked: %v", err)
+	}
+	got := string(logged)
+	if strings.Contains(got, "pack") {
+		t.Fatalf("npm pack was used instead of install: %q", got)
+	}
+	wantPrefix := filepath.Join(agentDir, "npm")
+	if !strings.Contains(got, "install fixture@1.0.0 --prefix "+wantPrefix) {
+		t.Fatalf("expected install-style invocation with --prefix, got %q", got)
+	}
+	if !strings.Contains(got, "--legacy-peer-deps") {
+		t.Fatalf("default npm path should pass --legacy-peer-deps, got %q", got)
 	}
 }
 
-func TestDefaultPackageManagerInstallRollbackKeepsExistingPackage(t *testing.T) {
+// TestDefaultPackageManagerNpmScopedInstallPath proves a scoped npm spec
+// (@scope/name) installs to <npmRoot>/node_modules/@scope/name, matching
+// getManagedNpmInstallPath in package-manager.ts.
+func TestDefaultPackageManagerNpmScopedInstallPath(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("shell fake npm is POSIX-only")
 	}
 	cwd := t.TempDir()
 	agentDir := t.TempDir()
-	dest := filepath.Join(agentDir, "packages", sanitizePackageSource("npm:fixture"))
-	writeTestFile(t, filepath.Join(dest, "README.md"), "existing")
 	installFakeNPM(t, `#!/bin/sh
 set -eu
-if [ "$1" = "pack" ]; then
-	mkdir -p package
-	cat > package/package.json <<'JSON'
-{"name":"fixture","version":"1.0.0","dependencies":{"dep":"1.0.0"}}
-JSON
-	tar -czf fixture-1.0.0.tgz package
-	rm -rf package
-	exit 0
-fi
 if [ "$1" = "install" ]; then
-	echo "install failed" >&2
-	exit 9
+	prefix=""
+	while [ "$#" -gt 0 ]; do
+		if [ "$1" = "--prefix" ]; then
+			prefix="$2"
+		fi
+		shift
+	done
+	mkdir -p "$prefix/node_modules/@scope/tool"
+	printf installed > "$prefix/node_modules/@scope/tool/.installed"
+	exit 0
 fi
 echo "unexpected npm $*" >&2
 exit 2
 `)
 
 	manager := NewDefaultPackageManager(cwd, agentDir, nil)
-	if _, err := manager.Install("npm:fixture", false, nil); err == nil {
+	record, err := manager.Install("npm:@scope/tool@2.0.0", false, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantPath := filepath.Join(agentDir, "npm", "node_modules", "@scope", "tool")
+	if record.Path != wantPath {
+		t.Fatalf("scoped install path=%q want %q", record.Path, wantPath)
+	}
+	if _, err := os.Stat(filepath.Join(record.Path, ".installed")); err != nil {
+		t.Fatalf("scoped package marker missing: %v", err)
+	}
+}
+
+// TestDefaultPackageManagerGitInstallRollbackKeepsExistingPackage proves the git
+// branch still stages into a sibling temp dir and atomically swaps, so a failed
+// dependency install leaves a prior checkout intact. The git dest follows the TS
+// layout <agentDir>/git/<host>/<owner>/<repo>.
+func TestDefaultPackageManagerGitInstallRollbackKeepsExistingPackage(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("uses POSIX shell fakes for git/npm")
+	}
+	cwd := t.TempDir()
+	agentDir := t.TempDir()
+	source := "git:github:acme/tool"
+	dest := filepath.Join(agentDir, "git", "github.com", "acme", "tool")
+	writeTestFile(t, filepath.Join(dest, "README.md"), "existing")
+
+	// Fake git clone produces a package.json with deps (forcing a dependency
+	// install); fake npm install then fails, triggering rollback.
+	bin := t.TempDir()
+	gitScript := `#!/bin/sh
+set -eu
+if [ "$1" = "clone" ]; then
+	for target in "$@"; do :; done
+	mkdir -p "$target"
+	cat > "$target/package.json" <<'JSON'
+{"name":"tool","version":"1.0.0","dependencies":{"dep":"1.0.0"}}
+JSON
+	exit 0
+fi
+exit 0
+`
+	if err := os.WriteFile(filepath.Join(bin, "git"), []byte(gitScript), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	npmScript := `#!/bin/sh
+echo "install failed" >&2
+exit 9
+`
+	if err := os.WriteFile(filepath.Join(bin, "npm"), []byte(npmScript), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	manager := NewDefaultPackageManager(cwd, agentDir, nil)
+	if _, err := manager.Install(source, false, nil); err == nil {
 		t.Fatal("expected install error")
 	}
 	data, err := os.ReadFile(filepath.Join(dest, "README.md"))
@@ -342,12 +495,21 @@ func TestDefaultPackageManagerConfiguredPackageHelpers(t *testing.T) {
 	if manager.AddSourceToSettings(localPackage, true) {
 		t.Fatal("duplicate source was added")
 	}
+	// Local sources persist relative to the project scope base (<cwd>/.pi) yet
+	// must still resolve back to the original directory.
+	wantStored, err := filepath.Rel(core.ProjectPiDir(cwd), localPackage)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if got := manager.GetInstalledPath(localPackage, "project"); got != localPackage {
 		t.Fatalf("installed path=%q", got)
 	}
 	configured := manager.ListConfiguredPackages()
-	if len(configured) != 1 || configured[0].Source != localPackage || configured[0].Scope != "project" {
-		t.Fatalf("configured=%#v", configured)
+	if len(configured) != 1 || configured[0].Source != wantStored || configured[0].Scope != "project" {
+		t.Fatalf("configured=%#v want stored source %q", configured, wantStored)
+	}
+	if configured[0].InstalledPath != localPackage {
+		t.Fatalf("installed path drifted: %q want %q", configured[0].InstalledPath, localPackage)
 	}
 	if !manager.RemoveSourceFromSettings(localPackage, true) {
 		t.Fatal("expected source to be removed")

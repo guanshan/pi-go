@@ -171,6 +171,11 @@ func googleApplyStreamResponse(resp *genai.GenerateContentResponse, partial *Ass
 	if resp == nil {
 		return nil
 	}
+	// genai documents GenerateContentResponse.responseId as an output-only field
+	// used to identify each response. Keep the first non-empty one from the stream.
+	if partial.ResponseID == "" && resp.ResponseID != "" {
+		partial.ResponseID = resp.ResponseID
+	}
 	if resp.UsageMetadata != nil {
 		partial.Usage = googleUsage(aiproviders.GoogleUsageFromMetadata(resp.UsageMetadata))
 	}
@@ -245,8 +250,10 @@ func googleEnsureStreamTextBlock(partial *AssistantMessage, blocks *[]ContentBlo
 
 func googleAppendStreamToolCall(part *genai.Part, partial *AssistantMessage, blocks *[]ContentBlock, stream *AssistantMessageEventStream) error {
 	googleEndCurrentStreamBlock(partial, *blocks, stream)
+	// Generate a unique id when none is provided or when the provider reuses one
+	// that already exists among the streamed tool-call blocks.
 	id := part.FunctionCall.ID
-	if id == "" {
+	if id == "" || googleHasToolCallID(*blocks, id) {
 		id = aiproviders.ShortID()
 	}
 	argsMap := part.FunctionCall.Args
@@ -272,6 +279,15 @@ func googleAppendStreamToolCall(part *genai.Part, partial *AssistantMessage, blo
 	call := toolCallFromBlock(block)
 	stream.Push(AssistantMessageEvent{Type: "toolcall_end", ContentIndex: index, ToolCall: &call, Partial: *partial})
 	return nil
+}
+
+func googleHasToolCallID(blocks []ContentBlock, id string) bool {
+	for _, b := range blocks {
+		if b.Type == "toolCall" && b.ID == id {
+			return true
+		}
+	}
+	return false
 }
 
 func googleEndCurrentStreamBlock(partial *AssistantMessage, blocks []ContentBlock, stream *AssistantMessageEventStream) {

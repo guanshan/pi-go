@@ -119,7 +119,7 @@ func (SessionInfoEntry) EntryType() string { return "session_info" }
 
 type LeafEntry struct {
 	BaseEntry
-	TargetID *string `json:"targetId,omitempty"`
+	TargetID *string `json:"targetId"`
 }
 
 func (LeafEntry) EntryType() string { return "leaf" }

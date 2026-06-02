@@ -20,7 +20,10 @@ type LocalExecutionEnv struct {
 	cwd       string
 	shellPath string
 	shellEnv  map[string]string
-	tempDirs  []string
+	// tempMu guards tempDirs because a single env can be shared across the
+	// agent loop's parallel tool executions (see packages/agent/tool_exec.go).
+	tempMu   sync.Mutex
+	tempDirs []string
 }
 
 func NewLocalExecutionEnv(cwd string, shellPath string, shellEnv map[string]string) (*LocalExecutionEnv, error) {
@@ -254,7 +257,9 @@ func (e *LocalExecutionEnv) CreateTempDir(ctx context.Context, prefix string) (s
 	if err != nil {
 		return "", toFileError(err, "")
 	}
+	e.tempMu.Lock()
 	e.tempDirs = append(e.tempDirs, dir)
+	e.tempMu.Unlock()
 	return dir, nil
 }
 
@@ -277,10 +282,37 @@ func (e *LocalExecutionEnv) CreateTempFile(ctx context.Context, prefix string, s
 	return path, nil
 }
 
+// callbackErrorSink records the first callback panic and aborts the running
+// command, mirroring the callback_error path in src/harness/env/nodejs.ts.
+type callbackErrorSink struct {
+	mu     sync.Mutex
+	err    *ExecutionError
+	cancel context.CancelFunc
+}
+
+func (s *callbackErrorSink) capture(err *ExecutionError) {
+	s.mu.Lock()
+	if s.err == nil {
+		s.err = err
+	}
+	cancel := s.cancel
+	s.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+}
+
+func (s *callbackErrorSink) get() *ExecutionError {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.err
+}
+
 type executionStreamWriter struct {
 	mu       sync.Mutex
 	buffer   *bytes.Buffer
 	callback func(string)
+	sink     *callbackErrorSink
 }
 
 func (w *executionStreamWriter) Write(p []byte) (int, error) {
@@ -294,9 +326,27 @@ func (w *executionStreamWriter) Write(p []byte) (int, error) {
 	}
 	w.mu.Unlock()
 	if w.callback != nil {
-		w.callback(text)
+		w.invokeCallback(text)
 	}
 	return len(p), nil
+}
+
+// invokeCallback runs the user callback, converting any panic into a stored
+// callback_error and aborting the child process tree.
+func (w *executionStreamWriter) invokeCallback(text string) {
+	defer func() {
+		if r := recover(); r != nil && w.sink != nil {
+			w.sink.capture(&ExecutionError{Code: ExecErrCallback, Err: panicError(r)})
+		}
+	}()
+	w.callback(text)
+}
+
+func panicError(r any) error {
+	if err, ok := r.(error); ok {
+		return err
+	}
+	return fmt.Errorf("%v", r)
 }
 
 func (e *LocalExecutionEnv) Exec(ctx context.Context, command string, opts ExecOptions) (ExecResult, error) {
@@ -314,11 +364,14 @@ func (e *LocalExecutionEnv) Exec(ctx context.Context, command string, opts ExecO
 	if opts.Cwd != "" {
 		cwd = e.resolve(opts.Cwd)
 	}
-	execCtx := ctx
-	var cancel context.CancelFunc
+	// A cancellable context lets a callback panic abort the child process tree,
+	// in addition to the optional timeout.
+	execCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
 	if opts.Timeout > 0 {
-		execCtx, cancel = context.WithTimeout(ctx, opts.Timeout)
-		defer cancel()
+		var timeoutCancel context.CancelFunc
+		execCtx, timeoutCancel = context.WithTimeout(execCtx, opts.Timeout)
+		defer timeoutCancel()
 	}
 	cmd := exec.CommandContext(execCtx, shell, append(args, command)...)
 	cmd.Dir = cwd
@@ -331,13 +384,20 @@ func (e *LocalExecutionEnv) Exec(ctx context.Context, command string, opts ExecO
 		return nil
 	}
 	cmd.WaitDelay = 2 * time.Second
+	sink := &callbackErrorSink{cancel: cancel}
 	var stdoutBuf, stderrBuf bytes.Buffer
-	cmd.Stdout = &executionStreamWriter{buffer: &stdoutBuf, callback: opts.OnStdout}
-	cmd.Stderr = &executionStreamWriter{buffer: &stderrBuf, callback: opts.OnStderr}
+	cmd.Stdout = &executionStreamWriter{buffer: &stdoutBuf, callback: opts.OnStdout, sink: sink}
+	cmd.Stderr = &executionStreamWriter{buffer: &stderrBuf, callback: opts.OnStderr, sink: sink}
 	if err := cmd.Start(); err != nil {
 		return ExecResult{}, &ExecutionError{Code: ExecErrSpawn, Err: err}
 	}
 	waitErr := cmd.Wait()
+	// A callback panic takes precedence over timeout/abort, matching the TS
+	// close handler order in nodejs.ts.
+	if cbErr := sink.get(); cbErr != nil {
+		killProcessTree(cmd.Process.Pid)
+		return ExecResult{}, cbErr
+	}
 	if execCtx.Err() != nil {
 		killProcessTree(cmd.Process.Pid)
 		if errors.Is(execCtx.Err(), context.DeadlineExceeded) {
@@ -358,13 +418,16 @@ func (e *LocalExecutionEnv) Exec(ctx context.Context, command string, opts ExecO
 }
 
 func (e *LocalExecutionEnv) Cleanup() error {
+	e.tempMu.Lock()
+	dirs := e.tempDirs
+	e.tempDirs = nil
+	e.tempMu.Unlock()
 	var first error
-	for _, dir := range e.tempDirs {
+	for _, dir := range dirs {
 		if err := os.RemoveAll(dir); err != nil && first == nil {
 			first = err
 		}
 	}
-	e.tempDirs = nil
 	if first != nil {
 		return toFileError(first, "")
 	}

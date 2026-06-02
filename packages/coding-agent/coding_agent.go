@@ -63,7 +63,11 @@ func MainWithOptions(ctx context.Context, argv []string, options MainOptions) er
 			return err
 		}
 	}
-	return core.MainWithOptions(ctx, argv, core.MainOptions{ExtensionFactories: wrapExtensionFactories(options.ExtensionFactories)})
+	return core.MainWithOptions(ctx, argv, core.MainOptions{
+		ExtensionFactories:    wrapExtensionFactories(options.ExtensionFactories),
+		PackageManagerFactory: NewCorePackageManager,
+		Shutdown:              InstallSignalShutdown,
+	})
 }
 
 func SetBuildInfo(version, commit, date string) {
@@ -112,9 +116,19 @@ func wantsVersion(argv []string) bool {
 	return false
 }
 
+// skipsMigrations reports whether startup migrations should be skipped for the
+// given argv. Only paths that never build the agent runtime skip migrations:
+// --help / --version, session export, and pure package-management/config
+// commands. The default interactive run (no args) MUST run migrations, matching
+// src/main.ts where runMigrations executes before the interactive path and only
+// the early process.exit branches (version/export) and package/config command
+// handlers bypass it.
 func skipsMigrations(argv []string) bool {
-	if wantsHelp(argv) || len(argv) == 0 {
+	if wantsHelp(argv) || wantsExport(argv) {
 		return true
+	}
+	if len(argv) == 0 {
+		return false
 	}
 	switch argv[0] {
 	case "install", "remove", "uninstall", "update", "list", "config":
@@ -122,6 +136,18 @@ func skipsMigrations(argv []string) bool {
 	default:
 		return false
 	}
+}
+
+// wantsExport reports whether argv selects the session-export path, which
+// exits before the runtime is built. Matches cli.ParseArgs / src/cli/args.ts:
+// --export only triggers export when followed by a value.
+func wantsExport(argv []string) bool {
+	for i, arg := range argv {
+		if arg == "--export" && i+1 < len(argv) {
+			return true
+		}
+	}
+	return false
 }
 
 func wantsHelp(argv []string) bool {

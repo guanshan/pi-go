@@ -32,6 +32,35 @@ type entryRecord struct {
 	Raw              json.RawMessage `json:"-"`
 }
 
+// MarshalJSON serializes an entry record. Two shared, omitempty fields must be
+// re-added for specific entry types because the TypeScript parser/reader require
+// them present even when empty:
+//   - Leaf entries must always carry an explicit targetId (null for a root leaf
+//     or string otherwise) because the TypeScript parser rejects a leaf whose
+//     targetId field is missing (jsonl-storage.ts:103-105).
+//   - active_tools_change entries must always carry activeToolNames as an array,
+//     because TS always writes activeToolNames: [...names] (session.ts:169) and
+//     the reader does [...entry.activeToolNames] (session.ts:36), which throws on
+//     an undefined (omitted) field. SetActiveTools(ctx, nil) is a reachable path
+//     that produces an empty slice that omitempty would otherwise drop.
+//
+// In both cases the field is appended before the closing brace, preserving valid
+// JSON and the existing field order.
+func (r entryRecord) MarshalJSON() ([]byte, error) {
+	type alias entryRecord
+	data, err := json.Marshal(alias(r))
+	if err != nil {
+		return nil, err
+	}
+	if r.Type == "leaf" && r.TargetID == nil && len(data) >= 2 && data[len(data)-1] == '}' {
+		return append(data[:len(data)-1], []byte(`,"targetId":null}`)...), nil
+	}
+	if r.Type == "active_tools_change" && len(r.ActiveToolNames) == 0 && len(data) >= 2 && data[len(data)-1] == '}' {
+		return append(data[:len(data)-1], []byte(`,"activeToolNames":[]}`)...), nil
+	}
+	return data, nil
+}
+
 func (r *entryRecord) UnmarshalJSON(data []byte) error {
 	fields := map[string]json.RawMessage{}
 	if err := json.Unmarshal(data, &fields); err != nil {

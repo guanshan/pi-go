@@ -94,9 +94,26 @@ func (a *AgentSession) Reload(ctx context.Context) error {
 }
 
 func (a *AgentSession) Dispose() {
-	_ = a.abortActiveAgent(context.Background(), false)
+	a.disposeSession(true)
+}
+
+// disposeSession aborts any in-flight work (retry, compaction, branch summary,
+// bash, active agent) and tears down the extension runtime. It mirrors the
+// abort sequence in agent-session.ts dispose(). When emitShutdown is true it
+// emits the session_shutdown(quit) event itself; the runtime disposal path
+// emits that event up front and passes false to avoid a double emit.
+func (a *AgentSession) disposeSession(emitShutdown bool) {
+	if a == nil {
+		return
+	}
+	a.AbortRetry()
+	a.AbortCompaction()
+	a.AbortBranchSummary()
 	a.AbortBash()
-	a.emitExtensionSessionShutdown(coreext.SessionShutdownQuit, "")
+	_ = a.abortActiveAgent(context.Background(), false)
+	if emitShutdown {
+		a.emitExtensionSessionShutdown(coreext.SessionShutdownQuit, "")
+	}
 	a.mu.Lock()
 	runtime := a.extensionRuntime
 	errorStop := a.extensionErrorStop

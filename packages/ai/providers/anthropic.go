@@ -15,11 +15,25 @@ func NewAnthropicClient(key, baseURL string, headers map[string]string, httpClie
 }
 
 func NewAnthropicClientWithAuth(key, baseURL string, headers map[string]string, httpClient *http.Client, bearerAuth bool, requestOptions ...RequestOptions) anthropic.Client {
+	return NewAnthropicClientWithMode(key, baseURL, headers, httpClient, bearerAuth, false, requestOptions...)
+}
+
+// NewAnthropicClientWithMode builds an Anthropic client. When gatewayAuth is
+// true the request routes through Cloudflare AI Gateway: the token is sent as
+// the cf-aig-authorization header and the SDK does not set x-api-key /
+// Authorization. A caller-supplied upstream Authorization header (BYOK) in
+// headers is preserved.
+func NewAnthropicClientWithMode(key, baseURL string, headers map[string]string, httpClient *http.Client, bearerAuth, gatewayAuth bool, requestOptions ...RequestOptions) anthropic.Client {
 	options := firstRequestOptions(requestOptions)
 	opts := []anthropicoption.RequestOption{
 		anthropicoption.WithRequestTimeout(RequestTimeout(options)),
 	}
-	if bearerAuth {
+	if gatewayAuth {
+		// Do not let the SDK contribute x-api-key / Authorization from the
+		// environment; the gateway authenticates via cf-aig-authorization.
+		opts = append(opts, anthropicoption.WithoutEnvironmentDefaults())
+		opts = append(opts, anthropicoption.WithHeader("cf-aig-authorization", "Bearer "+key))
+	} else if bearerAuth {
 		opts = append(opts, anthropicoption.WithAuthToken(key))
 	} else {
 		opts = append(opts, anthropicoption.WithAPIKey(key))
@@ -48,6 +62,60 @@ func NewAnthropicClientWithAuth(key, baseURL string, headers map[string]string, 
 		}))
 	}
 	return anthropic.NewClient(opts...)
+}
+
+// claudeCodeTools is the canonical casing of Claude Code 2.x tool names.
+// Source: https://cchistory.mariozechner.at/data/prompts-2.1.11.md
+var claudeCodeTools = []string{
+	"Read",
+	"Write",
+	"Edit",
+	"Bash",
+	"Grep",
+	"Glob",
+	"AskUserQuestion",
+	"EnterPlanMode",
+	"ExitPlanMode",
+	"KillShell",
+	"NotebookEdit",
+	"Skill",
+	"Task",
+	"TaskOutput",
+	"TodoWrite",
+	"WebFetch",
+	"WebSearch",
+}
+
+var ccToolLookup = func() map[string]string {
+	m := make(map[string]string, len(claudeCodeTools))
+	for _, name := range claudeCodeTools {
+		m[strings.ToLower(name)] = name
+	}
+	return m
+}()
+
+// ToClaudeCodeName maps a tool name to Claude Code canonical casing if it
+// matches (case-insensitive), otherwise returns the name unchanged.
+func ToClaudeCodeName(name string) string {
+	if canonical, ok := ccToolLookup[strings.ToLower(name)]; ok {
+		return canonical
+	}
+	return name
+}
+
+// FromClaudeCodeName maps an inbound tool name back to the original tool name
+// from the request tool list (case-insensitive), otherwise returns it unchanged.
+func FromClaudeCodeName(name string, tools []map[string]any) string {
+	if len(tools) == 0 {
+		return name
+	}
+	lower := strings.ToLower(name)
+	for _, tool := range tools {
+		if toolName, _ := tool["name"].(string); strings.ToLower(toolName) == lower {
+			return toolName
+		}
+	}
+	return name
 }
 
 func AnthropicCacheControlParam(retention string, supportsLong bool) (anthropic.CacheControlEphemeralParam, bool) {
@@ -89,6 +157,7 @@ type AnthropicRequestOptions struct {
 	SupportsCacheControlOnTools bool
 	ForceAdaptiveThinking       bool
 	AllowEmptySignature         bool
+	IsOAuth                     bool
 }
 
 type AnthropicMessage struct {
@@ -118,6 +187,7 @@ type AnthropicParsed struct {
 	Usage        AnthropicUsageCounts
 	StopReason   string
 	ErrorMessage string
+	ResponseID   string
 }
 
 type AnthropicToolCall struct {
@@ -143,7 +213,7 @@ func AnthropicMessageParams(options AnthropicRequestOptions) anthropic.MessageNe
 	params := anthropic.MessageNewParams{
 		Model:     options.ModelID,
 		MaxTokens: int64(maxTokens),
-		Messages:  AnthropicMessages(options.Messages, cacheControl, useCacheControl, options.AllowEmptySignature),
+		Messages:  AnthropicMessages(options.Messages, cacheControl, useCacheControl, options.AllowEmptySignature, options.IsOAuth),
 	}
 	if strings.TrimSpace(options.SystemPrompt) != "" {
 		block := anthropic.TextBlockParam{Text: options.SystemPrompt}
@@ -153,7 +223,7 @@ func AnthropicMessageParams(options AnthropicRequestOptions) anthropic.MessageNe
 		params.System = []anthropic.TextBlockParam{block}
 	}
 	if len(options.Tools) > 0 {
-		params.Tools = AnthropicTools(options.Tools, cacheControl, useCacheControl && options.SupportsCacheControlOnTools, options.SupportsEagerToolStreaming)
+		params.Tools = AnthropicTools(options.Tools, cacheControl, useCacheControl && options.SupportsCacheControlOnTools, options.SupportsEagerToolStreaming, options.IsOAuth)
 	}
 	if choice, ok := AnthropicToolChoice(options.ToolChoice); ok {
 		params.ToolChoice = choice
@@ -232,7 +302,7 @@ func AnthropicToolChoice(choice any) (anthropic.ToolChoiceUnionParam, bool) {
 	return anthropic.ToolChoiceUnionParam{}, false
 }
 
-func ParseAnthropicMessage(resp *anthropic.Message) AnthropicParsed {
+func ParseAnthropicMessage(resp *anthropic.Message, isOAuth bool, tools []map[string]any) AnthropicParsed {
 	if resp == nil {
 		return AnthropicParsed{StopReason: "stop"}
 	}
@@ -251,9 +321,13 @@ func ParseAnthropicMessage(resp *anthropic.Message) AnthropicParsed {
 			if id == "" {
 				id = ShortID()
 			}
+			name := c.Name
+			if isOAuth {
+				name = FromClaudeCodeName(name, tools)
+			}
 			args := NormalizeToolArguments(c.Input)
-			blocks = append(blocks, AnthropicBlock{Type: "toolCall", ID: id, Name: c.Name, Arguments: args})
-			calls = append(calls, AnthropicToolCall{ID: id, Name: c.Name, Arguments: args})
+			blocks = append(blocks, AnthropicBlock{Type: "toolCall", ID: id, Name: name, Arguments: args})
+			calls = append(calls, AnthropicToolCall{ID: id, Name: name, Arguments: args})
 		}
 	}
 	stop, errorMessage := AnthropicStopReason(string(resp.StopReason), len(calls) > 0)
@@ -263,6 +337,7 @@ func ParseAnthropicMessage(resp *anthropic.Message) AnthropicParsed {
 		Usage:        AnthropicUsageFromMessageUsage(resp.Usage),
 		StopReason:   stop,
 		ErrorMessage: errorMessage,
+		ResponseID:   resp.ID,
 	}
 }
 
@@ -286,7 +361,7 @@ func AnthropicUsageFromDeltaUsage(usage anthropic.MessageDeltaUsage) AnthropicUs
 	}
 }
 
-func AnthropicMessages(messages []AnthropicMessage, cacheControl anthropic.CacheControlEphemeralParam, useCacheControl bool, allowEmptySignature bool) []anthropic.MessageParam {
+func AnthropicMessages(messages []AnthropicMessage, cacheControl anthropic.CacheControlEphemeralParam, useCacheControl bool, allowEmptySignature bool, isOAuth bool) []anthropic.MessageParam {
 	out := []anthropic.MessageParam{}
 	for i := 0; i < len(messages); i++ {
 		msg := messages[i]
@@ -328,7 +403,11 @@ func AnthropicMessages(messages []AnthropicMessage, cacheControl anthropic.Cache
 					if input == nil {
 						input = map[string]any{}
 					}
-					blocks = append(blocks, anthropic.NewToolUseBlock(b.ID, input, b.Name))
+					name := b.Name
+					if isOAuth {
+						name = ToClaudeCodeName(name)
+					}
+					blocks = append(blocks, anthropic.NewToolUseBlock(b.ID, input, name))
 				}
 			}
 			if text != "" {
@@ -402,10 +481,13 @@ func AnthropicContentBlocks(blocks []AnthropicBlock) []anthropic.ContentBlockPar
 	return out
 }
 
-func AnthropicTools(defs []map[string]any, cacheControl anthropic.CacheControlEphemeralParam, useCacheControl bool, supportsEagerToolStreaming bool) []anthropic.ToolUnionParam {
+func AnthropicTools(defs []map[string]any, cacheControl anthropic.CacheControlEphemeralParam, useCacheControl bool, supportsEagerToolStreaming bool, isOAuth bool) []anthropic.ToolUnionParam {
 	out := make([]anthropic.ToolUnionParam, 0, len(defs))
 	for _, d := range defs {
 		name, _ := d["name"].(string)
+		if isOAuth {
+			name = ToClaudeCodeName(name)
+		}
 		schema := anthropicparam.Override[anthropic.ToolInputSchemaParam](d["parameters"])
 		tool := anthropic.ToolUnionParamOfTool(schema, name)
 		if description, _ := d["description"].(string); description != "" {

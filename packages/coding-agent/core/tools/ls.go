@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 
@@ -31,10 +32,22 @@ func (t LsTool) Execute(ctx context.Context, raw json.RawMessage, _ ToolUpdate) 
 	if limit <= 0 {
 		limit = DefaultLsLimit
 	}
-	dir := ResolveInCWD(t.CWD, firstNonEmpty(args.Path, "."))
+	dir := ResolveToolPath(t.CWD, firstNonEmpty(args.Path, "."))
+	// Mirror TS ls.ts:127-147: distinguish "not found", "not a directory",
+	// and "cannot read directory" so the model sees consistent wording.
+	info, err := os.Stat(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return toolError(fmt.Sprintf("Path not found: %s", dir))
+		}
+		return toolError(err.Error())
+	}
+	if !info.IsDir() {
+		return toolError(fmt.Sprintf("Not a directory: %s", dir))
+	}
 	entries, err := os.ReadDir(dir)
 	if err != nil {
-		return toolError(err.Error())
+		return toolError(fmt.Sprintf("Cannot read directory: %s", err.Error()))
 	}
 	sort.Slice(entries, func(i, j int) bool { return strings.ToLower(entries[i].Name()) < strings.ToLower(entries[j].Name()) })
 	out := []string{}
@@ -45,7 +58,14 @@ func (t LsTool) Execute(ctx context.Context, raw json.RawMessage, _ ToolUpdate) 
 			break
 		}
 		name := entry.Name()
-		if entry.IsDir() {
+		// Follow symlinks when deciding the trailing slash, matching TS which
+		// stats the full path (ls.ts:159-166) rather than using the dirent type;
+		// fall back to the dirent type for broken links.
+		isDir := entry.IsDir()
+		if info, statErr := os.Stat(filepath.Join(dir, entry.Name())); statErr == nil {
+			isDir = info.IsDir()
+		}
+		if isDir {
 			name += "/"
 		}
 		out = append(out, name)

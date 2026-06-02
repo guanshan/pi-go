@@ -1,13 +1,17 @@
 package tools
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strings"
 
 	"github.com/guanshan/pi-go/packages/agent/gitignore"
@@ -46,61 +50,55 @@ func (t GrepTool) Execute(ctx context.Context, raw json.RawMessage, _ ToolUpdate
 	if limit <= 0 {
 		limit = DefaultGrepLimit
 	}
-	root := ResolveInCWD(t.CWD, firstNonEmpty(args.Path, "."))
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	root := ResolveToolPath(t.CWD, firstNonEmpty(args.Path, "."))
 	info, err := os.Stat(root)
 	if err != nil {
 		return toolError(fmt.Sprintf("Path not found: %s", root))
 	}
-	pattern := args.Pattern
-	if args.Literal {
-		pattern = regexp.QuoteMeta(pattern)
+	query := grepQuery{
+		pattern:    args.Pattern,
+		glob:       args.Glob,
+		ignoreCase: args.IgnoreCase,
+		literal:    args.Literal,
+		context:    args.Context,
+		limit:      limit,
 	}
-	if args.IgnoreCase {
-		pattern = "(?i)" + pattern
-	}
-	re, err := regexp.Compile(pattern)
-	if err != nil {
-		return toolError(err.Error())
-	}
-	var results []string
-	matchLimit := false
-	searchFile := func(path string) error {
-		if len(results) >= limit {
-			matchLimit = true
-			return filepath.SkipAll
+
+	var (
+		results        []string
+		matchLimit     bool
+		linesTruncated bool
+	)
+	// Prefer ripgrep (the engine the TypeScript grep tool shells out to) so
+	// look-around/backreference patterns behave identically. Fall back to Go's
+	// RE2 engine only when no rg binary is found.
+	if rgPath, ok := ripgrepFinder(t.BinDir); ok {
+		res, ml, lt, rerr := searchRipgrep(ctx, rgPath, root, info.IsDir(), query)
+		if rerr != nil {
+			return toolError(rerr.Error())
 		}
-		if args.Glob != "" && !globMatch(args.Glob, path, root) {
-			return nil
-		}
-		data, err := os.ReadFile(path)
-		if err != nil || bytes.IndexByte(data, 0) >= 0 {
-			return nil
-		}
-		lines := strings.Split(string(data), "\n")
-		for i, line := range lines {
-			if !re.MatchString(line) {
-				continue
-			}
-			start := max(0, i-args.Context)
-			end := min(len(lines)-1, i+args.Context)
-			for n := start; n <= end; n++ {
-				prefix := formatRel(path, root, info.IsDir())
-				text := truncateLine(lines[n], GrepMaxLineLength)
-				results = append(results, fmt.Sprintf("%s:%d:%s", prefix, n+1, text))
-			}
-			if len(results) >= limit {
-				matchLimit = true
-				return filepath.SkipAll
-			}
-		}
-		return nil
-	}
-	if !info.IsDir() {
-		_ = searchFile(root)
+		results, matchLimit, linesTruncated = res, ml, lt
 	} else {
-		_ = walkFiltered(root, func(path string, _ os.DirEntry) error {
-			return searchFile(path)
-		})
+		pattern := args.Pattern
+		if args.Literal {
+			pattern = regexp.QuoteMeta(pattern)
+		}
+		if args.IgnoreCase {
+			pattern = "(?i)" + pattern
+		}
+		// Without ripgrep we use Go's regexp package (RE2). RE2 and ripgrep's
+		// default Rust regex engine have the same feature set here (neither supports
+		// look-around or backreferences), but their accept/reject edges and ignore
+		// semantics differ subtly. Surface the engine in compile errors so a pattern
+		// that behaves differently than the TypeScript CLI is explainable.
+		re, cerr := regexp.Compile(pattern)
+		if cerr != nil {
+			return toolError(fmt.Sprintf("%s\n(ripgrep was not found, so the built-in RE2 engine was used; install ripgrep to match the TypeScript CLI's regex engine)", cerr.Error()))
+		}
+		results, matchLimit, linesTruncated = searchRE2(re, root, info.IsDir(), query)
 	}
 	if len(results) == 0 {
 		return ai.ToolResult{Content: ai.TextBlocks("No matches found")}
@@ -112,16 +110,250 @@ func (t GrepTool) Execute(ctx context.Context, raw json.RawMessage, _ ToolUpdate
 	notices := []string{}
 	if matchLimit {
 		details["matchLimitReached"] = limit
-		notices = append(notices, fmt.Sprintf("%d matches limit", limit))
+		notices = append(notices, fmt.Sprintf("%d matches limit reached. Use limit=%d for more, or refine pattern", limit, limit*2))
 	}
 	if trunc.Truncated {
 		details["truncation"] = trunc
-		notices = append(notices, fmt.Sprintf("%s limit", FormatSize(DefaultMaxBytes)))
+		notices = append(notices, fmt.Sprintf("%s limit reached", FormatSize(DefaultMaxBytes)))
+	}
+	if linesTruncated {
+		details["linesTruncated"] = true
+		notices = append(notices, fmt.Sprintf("Some lines truncated to %d chars. Use read tool to see full lines", GrepMaxLineLength))
 	}
 	if len(notices) > 0 {
-		text += "\n\n[Truncated: " + strings.Join(notices, ", ") + "]"
+		text += "\n\n[" + strings.Join(notices, ". ") + "]"
 	}
 	return ai.ToolResult{Content: ai.TextBlocks(text), Details: detailsOrNil(details)}
+}
+
+// grepQuery carries the resolved grep arguments shared by the ripgrep and RE2
+// search paths.
+type grepQuery struct {
+	pattern    string
+	glob       string
+	ignoreCase bool
+	literal    bool
+	context    int
+	limit      int
+}
+
+// ripgrepFinder resolves the rg binary; it is a package var so tests can force
+// the RE2 fallback path.
+var ripgrepFinder = findRipgrep
+
+// findRipgrep locates the rg binary, preferring the agent bin dir (where it may
+// be vendored) and falling back to PATH. It returns ("", false) when rg is
+// unavailable, which routes the grep tool to its RE2 fallback.
+func findRipgrep(binDir string) (string, bool) {
+	name := "rg"
+	if runtime.GOOS == "windows" {
+		name = "rg.exe"
+	}
+	if binDir != "" {
+		candidate := filepath.Join(binDir, name)
+		if info, err := os.Stat(candidate); err == nil && !info.IsDir() {
+			return candidate, true
+		}
+	}
+	if path, err := exec.LookPath(name); err == nil && path != "" {
+		return path, true
+	}
+	return "", false
+}
+
+// rgEvent is the subset of ripgrep's --json event stream we consume.
+type rgEvent struct {
+	Type string `json:"type"`
+	Data struct {
+		Path struct {
+			Text string `json:"text"`
+		} `json:"path"`
+		Lines struct {
+			Text string `json:"text"`
+		} `json:"lines"`
+		LineNumber int `json:"line_number"`
+	} `json:"data"`
+}
+
+// searchRipgrep runs ripgrep with the same flags as the TypeScript grep tool
+// (grep.ts ~215) and formats its matches identically. .git is always excluded so
+// git internals never surface, matching the RE2 fallback (walkFiltered). The
+// match-line/context-line formatting mirrors searchRE2.
+func searchRipgrep(ctx context.Context, rgPath, root string, rootIsDir bool, q grepQuery) (results []string, matchLimit, linesTruncated bool, err error) {
+	rgArgs := []string{"--json", "--line-number", "--color=never", "--hidden", "--glob", "!.git"}
+	if q.ignoreCase {
+		rgArgs = append(rgArgs, "--ignore-case")
+	}
+	if q.literal {
+		rgArgs = append(rgArgs, "--fixed-strings")
+	}
+	if q.glob != "" {
+		rgArgs = append(rgArgs, "--glob", q.glob)
+	}
+	rgArgs = append(rgArgs, "--", q.pattern, root)
+
+	cmd := exec.CommandContext(ctx, rgPath, rgArgs...)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	stdout, perr := cmd.StdoutPipe()
+	if perr != nil {
+		return nil, false, false, perr
+	}
+	if serr := cmd.Start(); serr != nil {
+		return nil, false, false, serr
+	}
+
+	type rgMatch struct {
+		path string
+		line int
+		text string
+	}
+	var matches []rgMatch
+	killedDueToLimit := false
+	reader := bufio.NewReader(stdout)
+	for {
+		line, rerr := reader.ReadBytes('\n')
+		// Keep draining after the limit is hit so the killed process's pipe
+		// closes cleanly; only stop collecting matches.
+		if len(line) > 0 && !matchLimit {
+			var ev rgEvent
+			if json.Unmarshal(bytes.TrimSpace(line), &ev) == nil && ev.Type == "match" {
+				if ev.Data.Path.Text != "" && ev.Data.LineNumber > 0 {
+					matches = append(matches, rgMatch{path: ev.Data.Path.Text, line: ev.Data.LineNumber, text: ev.Data.Lines.Text})
+				}
+				if len(matches) >= q.limit {
+					matchLimit = true
+					killedDueToLimit = true
+					_ = cmd.Process.Kill()
+				}
+			}
+		}
+		if rerr != nil {
+			break
+		}
+	}
+	werr := cmd.Wait()
+	if ctx.Err() != nil {
+		return nil, false, false, ctx.Err()
+	}
+	if !killedDueToLimit && werr != nil {
+		var exitErr *exec.ExitError
+		if errors.As(werr, &exitErr) {
+			// ripgrep exits 1 when there are simply no matches; that is not an error.
+			if exitErr.ExitCode() != 1 {
+				msg := strings.TrimSpace(stderr.String())
+				if msg == "" {
+					msg = fmt.Sprintf("ripgrep exited with code %d", exitErr.ExitCode())
+				}
+				return nil, false, false, errors.New(msg)
+			}
+		} else {
+			return nil, false, false, werr
+		}
+	}
+
+	fileLines := map[string][]string{}
+	getLines := func(path string) []string {
+		if cached, ok := fileLines[path]; ok {
+			return cached
+		}
+		var lines []string
+		if data, e := os.ReadFile(path); e == nil {
+			normalized := strings.ReplaceAll(string(data), "\r\n", "\n")
+			normalized = strings.ReplaceAll(normalized, "\r", "\n")
+			lines = strings.Split(normalized, "\n")
+		}
+		fileLines[path] = lines
+		return lines
+	}
+	for _, m := range matches {
+		prefix := formatRel(m.path, root, rootIsDir)
+		if q.context <= 0 {
+			text := strings.ReplaceAll(m.text, "\r\n", "\n")
+			text = strings.ReplaceAll(text, "\r", "")
+			text = strings.TrimSuffix(text, "\n")
+			truncated, was := truncateLine(text, GrepMaxLineLength)
+			if was {
+				linesTruncated = true
+			}
+			results = append(results, fmt.Sprintf("%s:%d: %s", prefix, m.line, truncated))
+			continue
+		}
+		lines := getLines(m.path)
+		if len(lines) == 0 {
+			results = append(results, fmt.Sprintf("%s:%d: (unable to read file)", prefix, m.line))
+			continue
+		}
+		start := max(1, m.line-q.context)
+		end := min(len(lines), m.line+q.context)
+		for cur := start; cur <= end; cur++ {
+			lineText := strings.ReplaceAll(lines[cur-1], "\r", "")
+			truncated, was := truncateLine(lineText, GrepMaxLineLength)
+			if was {
+				linesTruncated = true
+			}
+			// MATCH lines use "path:N: text" (colon + space); CONTEXT lines use
+			// "path-N- text" (dash separators), mirroring ripgrep's grep output.
+			if cur == m.line {
+				results = append(results, fmt.Sprintf("%s:%d: %s", prefix, cur, truncated))
+			} else {
+				results = append(results, fmt.Sprintf("%s-%d- %s", prefix, cur, truncated))
+			}
+		}
+	}
+	return results, matchLimit, linesTruncated, nil
+}
+
+// searchRE2 is the ripgrep-free fallback: it walks the tree honoring
+// .gitignore/.ignore (and skipping .git) and matches each line with Go's RE2
+// engine, producing output byte-identical to the ripgrep path.
+func searchRE2(re *regexp.Regexp, root string, rootIsDir bool, q grepQuery) (results []string, matchLimit, linesTruncated bool) {
+	searchFile := func(path string) error {
+		if len(results) >= q.limit {
+			matchLimit = true
+			return filepath.SkipAll
+		}
+		if q.glob != "" && !globMatch(q.glob, path, root) {
+			return nil
+		}
+		data, err := os.ReadFile(path)
+		if err != nil || bytes.IndexByte(data, 0) >= 0 {
+			return nil
+		}
+		lines := strings.Split(string(data), "\n")
+		for i, line := range lines {
+			if !re.MatchString(line) {
+				continue
+			}
+			start := max(0, i-q.context)
+			end := min(len(lines)-1, i+q.context)
+			for n := start; n <= end; n++ {
+				prefix := formatRel(path, root, rootIsDir)
+				text, wasTruncated := truncateLine(lines[n], GrepMaxLineLength)
+				if wasTruncated {
+					linesTruncated = true
+				}
+				if n == i {
+					results = append(results, fmt.Sprintf("%s:%d: %s", prefix, n+1, text))
+				} else {
+					results = append(results, fmt.Sprintf("%s-%d- %s", prefix, n+1, text))
+				}
+			}
+			if len(results) >= q.limit {
+				matchLimit = true
+				return filepath.SkipAll
+			}
+		}
+		return nil
+	}
+	if !rootIsDir {
+		_ = searchFile(root)
+	} else {
+		_ = walkFiltered(root, false, func(path string, _ os.DirEntry) error {
+			return searchFile(path)
+		})
+	}
+	return results, matchLimit, linesTruncated
 }
 
 // searchIgnoreFileNames are the ignore files honored when walking a directory,
@@ -133,7 +365,11 @@ var searchIgnoreFileNames = []string{".gitignore", ".ignore"}
 // each directory's ignore files as it descends), mirroring the rg/fd semantics
 // the TypeScript grep/find tools rely on. Hidden files are included; only ignore
 // rules (and .git) prune the tree. fn may return filepath.SkipAll/SkipDir.
-func walkFiltered(root string, fn func(path string, d os.DirEntry) error) error {
+//
+// When includeDirs is true, fn is also invoked for each directory that is not
+// pruned (root itself is never reported). fd lists directories by default, so
+// the find tool sets this; grep (ripgrep, file contents only) leaves it false.
+func walkFiltered(root string, includeDirs bool, fn func(path string, d os.DirEntry) error) error {
 	matcher := gitignore.New()
 	loadDirIgnores := func(dir, rel string) {
 		prefix := ""
@@ -176,6 +412,9 @@ func walkFiltered(root string, fn func(path string, d os.DirEntry) error) error 
 			// A directory's own ignore files apply to its contents, so load them
 			// after deciding whether the directory itself is pruned.
 			loadDirIgnores(path, rel)
+			if includeDirs && path != root {
+				return fn(path, d)
+			}
 			return nil
 		}
 		if rel != "" && matcher.Ignores(rel) {
@@ -236,10 +475,13 @@ func formatRel(path, root string, rootIsDir bool) string {
 	return filepath.Base(path)
 }
 
-func truncateLine(line string, maxChars int) string {
+// truncateLine truncates a single line to maxChars runes, appending the
+// "... [truncated]" suffix (matching truncate.ts truncateLine) and reporting
+// whether truncation happened so callers can surface a notice.
+func truncateLine(line string, maxChars int) (string, bool) {
 	r := []rune(line)
 	if len(r) <= maxChars {
-		return line
+		return line, false
 	}
-	return string(r[:maxChars]) + "..."
+	return string(r[:maxChars]) + "... [truncated]", true
 }

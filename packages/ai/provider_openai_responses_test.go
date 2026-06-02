@@ -207,6 +207,42 @@ func TestAzureOpenAIResponsesPayload(t *testing.T) {
 	}
 }
 
+// P2-5: Azure Responses sends prompt_cache_key whenever a sessionId is present,
+// even when cacheRetention=="none" (azure-openai-responses.ts:258 has no
+// cacheRetention gate, unlike openai-responses.ts:237).
+func TestAzureOpenAIResponsesSendsPromptCacheKeyWithoutRetentionGate(t *testing.T) {
+	t.Setenv("AZURE_OPENAI_API_VERSION", "2025-04-01-preview")
+	t.Setenv("AZURE_OPENAI_DEPLOYMENT_NAME_MAP", "gpt-test=deployment-test")
+	var captured map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&captured); err != nil {
+			t.Fatal(err)
+		}
+		_, _ = w.Write([]byte(`{"status":"completed","output":[{"type":"message","id":"msg_a","content":[{"type":"output_text","text":"azure"}]}]}`))
+	}))
+	defer server.Close()
+
+	registry := NewModelRegistry(t.TempDir(), NewAuthStorage(t.TempDir()))
+	registry.Auth.SetRuntime("azure-openai-responses", "azure-key")
+	if _, err := registry.StreamlessChat(context.Background(), ChatRequest{
+		Model: Model{
+			Provider: "azure-openai-responses",
+			ID:       "gpt-test",
+			API:      "azure-openai-responses",
+			BaseURL:  server.URL,
+			Input:    []string{"text"},
+		},
+		CacheRetention: "none",
+		SessionID:      "azure-session-1",
+		Messages:       []Message{NewUserMessage("hi", nil)},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if got := captured["prompt_cache_key"]; got != "azure-session-1" {
+		t.Fatalf("expected prompt_cache_key even with cacheRetention=none, got %#v", got)
+	}
+}
+
 func TestOpenAIResponsesReasoningOffServiceTierResponseMetadataAndForeignIDs(t *testing.T) {
 	var captured map[string]any
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -626,6 +662,26 @@ func TestOpenAICodexResponsesStreamEmitsDeltas(t *testing.T) {
 	}
 	if len(message.Diagnostics) != 1 || message.Diagnostics[0].Type != "provider_transport_fallback" || message.Diagnostics[0].Details["fallbackTransport"] != "sse" {
 		t.Fatalf("diagnostics=%#v", message.Diagnostics)
+	}
+}
+
+func TestValidateOpenAICodexResponsesTransport(t *testing.T) {
+	codex := Model{API: "openai-codex-responses"}
+	for _, accepted := range []string{"", "auto", "sse", "websocket", "websocket-cached"} {
+		if err := validateOpenAICodexResponsesTransport(ChatRequest{Model: codex, Transport: accepted}); err != nil {
+			t.Fatalf("transport %q should be accepted: %v", accepted, err)
+		}
+	}
+	err := validateOpenAICodexResponsesTransport(ChatRequest{Model: codex, Transport: "grpc"})
+	if err == nil {
+		t.Fatal("unsupported transport should be rejected")
+	}
+	if !strings.Contains(err.Error(), "unsupported openai-codex-responses transport") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	// Transport is only validated for the codex API; other APIs ignore it.
+	if err := validateOpenAICodexResponsesTransport(ChatRequest{Model: Model{API: "openai-responses"}, Transport: "grpc"}); err != nil {
+		t.Fatalf("non-codex transport should be ignored: %v", err)
 	}
 }
 

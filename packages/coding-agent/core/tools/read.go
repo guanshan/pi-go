@@ -60,6 +60,7 @@ func (t ReadTool) Execute(ctx context.Context, raw json.RawMessage, _ ToolUpdate
 	}
 	text := string(data)
 	lines := strings.Split(text, "\n")
+	totalFileLines := len(lines)
 	if args.Offset > 0 {
 		start := args.Offset - 1
 		if start >= len(lines) {
@@ -85,14 +86,22 @@ func (t ReadTool) Execute(ctx context.Context, raw json.RawMessage, _ ToolUpdate
 		if offset <= 0 {
 			offset = 1
 		}
-		text = fmt.Sprintf("[Line %d exceeds %s limit. Use bash: sed -n '%dp' %s | head -c %d]", offset, FormatSize(DefaultMaxBytes), offset, args.Path, DefaultMaxBytes)
+		// Mirror TS read.ts:303-304: report the offending line's byte size.
+		firstLineSize := FormatSize(len(lines[0]))
+		text = fmt.Sprintf("[Line %d is %s, exceeds %s limit. Use bash: sed -n '%dp' %s | head -c %d]", offset, firstLineSize, FormatSize(DefaultMaxBytes), offset, args.Path, DefaultMaxBytes)
 	} else if trunc.Truncated {
 		start := args.Offset
 		if start <= 0 {
 			start = 1
 		}
 		end := start + trunc.OutputLines - 1
-		text = trunc.Content + fmt.Sprintf("\n\n[Showing lines %d-%d. Use offset=%d to continue.]", start, end, end+1)
+		// Mirror TS read.ts:311-315: include "of TOTAL" and, for byte
+		// truncation, the byte-limit suffix.
+		if trunc.TruncatedBy == "bytes" {
+			text = trunc.Content + fmt.Sprintf("\n\n[Showing lines %d-%d of %d (%s limit). Use offset=%d to continue.]", start, end, totalFileLines, FormatSize(DefaultMaxBytes), end+1)
+		} else {
+			text = trunc.Content + fmt.Sprintf("\n\n[Showing lines %d-%d of %d. Use offset=%d to continue.]", start, end, totalFileLines, end+1)
+		}
 	} else {
 		text = trunc.Content
 	}

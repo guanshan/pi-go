@@ -54,6 +54,19 @@ func SelectSession(r io.Reader, w io.Writer, sessions []SessionChoice) (string, 
 	return sessions[index-1].Path, nil
 }
 
+// Confirm prints "<message> [y/N] " to w and reads a yes/no answer from r,
+// returning true only for "y"/"yes" (case-insensitive). Mirrors promptConfirm in
+// main.ts. EOF (no input) counts as "no".
+func Confirm(r io.Reader, w io.Writer, message string) (bool, error) {
+	fmt.Fprintf(w, "%s [y/N] ", message)
+	line, err := bufio.NewReader(r).ReadString('\n')
+	if err != nil && !errors.Is(err, io.EOF) {
+		return false, err
+	}
+	answer := strings.ToLower(strings.TrimSpace(line))
+	return answer == "y" || answer == "yes", nil
+}
+
 func firstNonEmpty(values ...string) string {
 	for _, value := range values {
 		if strings.TrimSpace(value) != "" {

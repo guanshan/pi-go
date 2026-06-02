@@ -7,6 +7,7 @@ import (
 	"reflect"
 	"sort"
 	"sync"
+	"time"
 
 	"github.com/guanshan/pi-go/packages/agent"
 	harnessenv "github.com/guanshan/pi-go/packages/agent/harness/env"
@@ -18,6 +19,7 @@ import (
 type AgentHarness struct {
 	mu                    sync.Mutex
 	phase                 Phase
+	runGeneration         uint64
 	runCancel             context.CancelFunc
 	runDone               chan struct{}
 	pendingWrites         []pendingSessionWrite
@@ -157,6 +159,7 @@ func (h *AgentHarness) Prompt(ctx context.Context, text string, opts PromptOptio
 	if err != nil {
 		return ai.AssistantMessage{}, err
 	}
+	gen := h.currentRunGeneration()
 	defer func() {
 		if flushErr := h.flushPendingSessionWrites(ctx); flushErr != nil && err == nil {
 			err = flushErr
@@ -168,6 +171,14 @@ func (h *AgentHarness) Prompt(ctx context.Context, text string, opts PromptOptio
 	if err != nil {
 		return ai.AssistantMessage{}, err
 	}
+	return h.runTurn(ctx, gen, state, text, opts)
+}
+
+// runTurn drives the agent loop for an already-acquired run using the supplied
+// turn state. Callers must have entered the run via beginRun and be responsible
+// for flushing pending writes and releasing the run. gen identifies the run so
+// the abort handle is only published while this run is the active one.
+func (h *AgentHarness) runTurn(ctx context.Context, gen uint64, state turnState, text string, opts PromptOptions) (final ai.AssistantMessage, err error) {
 	startResult, err := h.emitBeforeAgentStart(ctx, BeforeAgentStartEvent{
 		Prompt:       text,
 		Images:       append([]ai.ContentBlock(nil), opts.Images...),
@@ -202,16 +213,9 @@ func (h *AgentHarness) Prompt(ctx context.Context, text string, opts PromptOptio
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	h.mu.Lock()
-	h.runCancel = cancel
-	h.mu.Unlock()
+	h.setRunCancel(gen, cancel)
 
-	loopCfg := h.loopConfig(getState, setState)
-	_, err = agent.RunAgentLoop(runCtx, promptMessages, agent.AgentContext{
-		SystemPrompt: state.systemPrompt,
-		Messages:     state.messages,
-		Tools:        state.tools,
-	}, loopCfg, func(ctx context.Context, ev agent.AgentEvent) error {
+	sink := func(ctx context.Context, ev agent.AgentEvent) error {
 		if end, ok := ev.(agent.AgentEndEvent); ok {
 			for i := len(end.Messages) - 1; i >= 0; i-- {
 				if assistant, ok := ai.AsAssistantMessage(end.Messages[i]); ok {
@@ -221,14 +225,88 @@ func (h *AgentHarness) Prompt(ctx context.Context, text string, opts PromptOptio
 			}
 		}
 		return h.handleAgentEvent(ctx, ev)
-	}, h.streamForTurn(getState))
+	}
+	loopCfg := h.loopConfig(getState, setState)
+	_, err = agent.RunAgentLoop(runCtx, promptMessages, agent.AgentContext{
+		SystemPrompt: state.systemPrompt,
+		Messages:     state.messages,
+		Tools:        state.tools,
+	}, loopCfg, sink, h.streamForTurn(getState))
 	if err != nil {
-		return final, err
+		// Mirror TS executeTurn's try/catch: when the agent loop (or a sink
+		// write such as session.appendMessage) fails mid-run, synthesize a
+		// failure assistant message and emit the message_start/message_end/
+		// turn_end/agent_end termination sequence so subscribers always see a
+		// clean run end (and phase is reset via the agent_end path). If failure
+		// reporting itself fails, surface an aggregate error.
+		// (TS: src/harness/agent-harness.ts:585-611,539-551.)
+		aborted := runCtx.Err() != nil
+		failureMessages, failureErr := h.emitRunFailure(ctx, sink, getState().model, err, aborted)
+		if failureErr != nil {
+			return final, &agent.AgentError{
+				Code: agent.AgentErrUnknown,
+				Msg:  "Agent run failed and failure reporting failed",
+				Err:  errors.Join(err, failureErr),
+			}
+		}
+		for i := len(failureMessages) - 1; i >= 0; i-- {
+			if assistant, ok := ai.AsAssistantMessage(failureMessages[i]); ok {
+				return assistant, nil
+			}
+		}
+		return final, nil
 	}
 	if final.Role == "" {
 		return final, fmt.Errorf("agent did not produce an assistant message")
 	}
 	return final, nil
+}
+
+// emitRunFailure synthesizes a failure assistant message and drives it through
+// handleAgentEvent as message_start, message_end, turn_end, and agent_end so
+// subscribers always observe a clean run termination even when the agent loop
+// or a session write failed mid-run. It mirrors TS AgentHarness.emitRunFailure
+// (src/harness/agent-harness.ts:539-551).
+func (h *AgentHarness) emitRunFailure(ctx context.Context, sink agent.AgentEventSink, model ai.Model, runErr error, aborted bool) ([]agent.AgentMessage, error) {
+	failureMessage := createFailureMessage(model, runErr, aborted)
+	events := []agent.AgentEvent{
+		agent.MessageStartEvent{Message: failureMessage},
+		agent.MessageEndEvent{Message: failureMessage},
+		agent.TurnEndEvent{Message: failureMessage, ToolResults: nil},
+		agent.AgentEndEvent{Messages: []agent.AgentMessage{failureMessage}},
+	}
+	for _, ev := range events {
+		if err := sink(ctx, ev); err != nil {
+			return nil, err
+		}
+	}
+	return []agent.AgentMessage{failureMessage}, nil
+}
+
+// createFailureMessage builds the synthesized failure assistant message emitted
+// when a run fails. It mirrors TS createFailureMessage
+// (src/harness/agent-harness.ts:49-68): an empty text block, the run's
+// stopReason ("aborted" or "error"), zeroed usage, and the error text.
+func createFailureMessage(model ai.Model, runErr error, aborted bool) ai.AssistantMessage {
+	stopReason := "error"
+	if aborted {
+		stopReason = "aborted"
+	}
+	errorMessage := ""
+	if runErr != nil {
+		errorMessage = runErr.Error()
+	}
+	return ai.AssistantMessage{
+		Role:         "assistant",
+		Content:      []ai.ContentBlock{{Type: "text", Text: ""}},
+		API:          model.API,
+		Provider:     model.Provider,
+		Model:        model.ID,
+		StopReason:   stopReason,
+		ErrorMessage: errorMessage,
+		Usage:        ai.Usage{},
+		TimestampMs:  time.Now().UnixMilli(),
+	}
 }
 
 func (h *AgentHarness) AppendMessage(ctx context.Context, msg agent.AgentMessage) error {
@@ -311,16 +389,17 @@ func (h *AgentHarness) SetModel(ctx context.Context, model ai.Model) error {
 	}
 	h.mu.Lock()
 	previous := h.model
-	h.model = model
 	h.mu.Unlock()
-	if previous.Provider == model.Provider && previous.ID == model.ID {
-		return nil
-	}
-	if err := h.emitModelSelect(ctx, ModelSelectEvent{Model: model, PreviousModel: previous, Source: ModelSelectSourceSet}); err != nil {
+	// Persist (or queue) the change before advancing the in-memory model so a
+	// write failure leaves the previous model in place and a later re-set still
+	// attempts the write.
+	if _, err := h.applyOrQueueSessionWrite(ctx, pendingModelChangeWrite{Provider: model.Provider, ModelID: model.ID}); err != nil {
 		return err
 	}
-	_, err := h.applyOrQueueSessionWrite(ctx, pendingModelChangeWrite{Provider: model.Provider, ModelID: model.ID})
-	return err
+	h.mu.Lock()
+	h.model = model
+	h.mu.Unlock()
+	return h.emitModelSelect(ctx, ModelSelectEvent{Model: model, PreviousModel: previous, Source: ModelSelectSourceSet})
 }
 
 func (h *AgentHarness) GetThinkingLevel() ai.ThinkingLevel {
@@ -335,16 +414,16 @@ func (h *AgentHarness) SetThinkingLevel(ctx context.Context, level ai.ThinkingLe
 	}
 	h.mu.Lock()
 	previous := h.thinkingLevel
-	h.thinkingLevel = level
 	h.mu.Unlock()
-	if previous == level {
-		return nil
-	}
-	if err := h.emitThinkingLevelSelect(ctx, ThinkingLevelSelectEvent{Level: level, PreviousLevel: previous}); err != nil {
+	// Persist (or queue) before committing the in-memory level so a write
+	// failure leaves the previous level in place and a later re-set retries.
+	if _, err := h.applyOrQueueSessionWrite(ctx, pendingThinkingLevelChangeWrite{ThinkingLevel: string(level)}); err != nil {
 		return err
 	}
-	_, err := h.applyOrQueueSessionWrite(ctx, pendingThinkingLevelChangeWrite{ThinkingLevel: string(level)})
-	return err
+	h.mu.Lock()
+	h.thinkingLevel = level
+	h.mu.Unlock()
+	return h.emitThinkingLevelSelect(ctx, ThinkingLevelSelectEvent{Level: level, PreviousLevel: previous})
 }
 
 func (h *AgentHarness) GetResources() Resources {
@@ -412,14 +491,18 @@ func (h *AgentHarness) SetTools(ctx context.Context, tools []agent.AgentTool, ac
 	h.mu.Lock()
 	previousToolNames := append([]string(nil), h.toolOrder...)
 	previousActiveToolNames := h.activeToolNamesSnapshotLocked()
+	h.mu.Unlock()
+	// Persist (or queue) before committing the new tools so a write failure
+	// leaves the previous tools in place.
+	if _, err := h.applyOrQueueSessionWrite(ctx, pendingActiveToolsChangeWrite{ActiveToolNames: nextActive}); err != nil {
+		return err
+	}
+	h.mu.Lock()
 	h.tools = nextTools
 	h.toolOrder = nextOrder
 	h.activeToolNames = append([]string(nil), nextActive...)
 	h.activeToolNamesSet = true
 	h.mu.Unlock()
-	if _, err := h.applyOrQueueSessionWrite(ctx, pendingActiveToolsChangeWrite{ActiveToolNames: nextActive}); err != nil {
-		return err
-	}
 	return h.emitToolsUpdate(ctx, ToolsUpdateEvent{
 		ToolNames:               nextOrder,
 		PreviousToolNames:       previousToolNames,
@@ -441,13 +524,17 @@ func (h *AgentHarness) SetActiveTools(ctx context.Context, names []string) error
 	previousToolNames := append([]string(nil), h.toolOrder...)
 	previousActiveToolNames := h.activeToolNamesSnapshotLocked()
 	nextActive := append([]string(nil), names...)
-	h.activeToolNames = nextActive
-	h.activeToolNamesSet = true
 	toolNames := append([]string(nil), h.toolOrder...)
 	h.mu.Unlock()
+	// Persist (or queue) before committing the new active tools so a write
+	// failure leaves the previous active tools in place.
 	if _, err := h.applyOrQueueSessionWrite(ctx, pendingActiveToolsChangeWrite{ActiveToolNames: nextActive}); err != nil {
 		return err
 	}
+	h.mu.Lock()
+	h.activeToolNames = append([]string(nil), nextActive...)
+	h.activeToolNamesSet = true
+	h.mu.Unlock()
 	return h.emitToolsUpdate(ctx, ToolsUpdateEvent{
 		ToolNames:               toolNames,
 		PreviousToolNames:       previousToolNames,
@@ -555,19 +642,48 @@ func (h *AgentHarness) beginRun(ctx context.Context, phase Phase) (func(), error
 		return nil, &agent.AgentError{Code: agent.AgentErrBusy, Msg: "harness is busy"}
 	}
 	done := make(chan struct{})
+	h.runGeneration++
+	gen := h.runGeneration
 	h.phase = phase
+	h.runCancel = nil
 	h.runDone = done
 	h.mu.Unlock()
 	return func() {
 		h.mu.Lock()
-		h.phase = PhaseIdle
-		h.runCancel = nil
-		if h.runDone == done {
-			h.runDone = nil
+		// Only clear the live run state if this run still owns it. A run started
+		// from an agent_end/settled listener bumps the generation, so an older
+		// run's release must not stomp on the newer run's phase or abort handle.
+		if h.runGeneration == gen {
+			h.phase = PhaseIdle
+			h.runCancel = nil
+			if h.runDone == done {
+				h.runDone = nil
+			}
 		}
 		h.mu.Unlock()
+		// Always release waiters blocked on this run's completion.
 		close(done)
 	}, nil
+}
+
+// currentRunGeneration returns the generation of the run currently held by the
+// caller. It must be called by the goroutine that just acquired the run via
+// beginRun, before any reentrant run can take over.
+func (h *AgentHarness) currentRunGeneration() uint64 {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.runGeneration
+}
+
+// setRunCancel records the cancel func for the run identified by gen. It is a
+// no-op once a newer run has taken over (a higher generation), so a stale run
+// cannot clobber the active run's abort handle.
+func (h *AgentHarness) setRunCancel(gen uint64, cancel context.CancelFunc) {
+	h.mu.Lock()
+	if h.runGeneration == gen {
+		h.runCancel = cancel
+	}
+	h.mu.Unlock()
 }
 
 func (h *AgentHarness) createTurnState(ctx context.Context) (turnState, error) {
@@ -821,19 +937,27 @@ func (h *AgentHarness) applyOrQueueSessionWrite(ctx context.Context, write pendi
 }
 
 func (h *AgentHarness) flushPendingSessionWrites(ctx context.Context) error {
-	h.mu.Lock()
-	writes := append([]pendingSessionWrite(nil), h.pendingWrites...)
-	h.pendingWrites = nil
-	h.mu.Unlock()
-	for _, write := range writes {
-		if write == nil {
-			continue
+	// Items are only ever appended at the tail, so the head stays stable while
+	// apply runs without the lock. Apply the head, then pop it only after it
+	// succeeds; on failure the head and every later write remain queued in
+	// their original order so a subsequent flush can retry them.
+	for {
+		h.mu.Lock()
+		if len(h.pendingWrites) == 0 {
+			h.mu.Unlock()
+			return nil
 		}
-		if _, err := write.apply(ctx, h.sess); err != nil {
-			return err
+		write := h.pendingWrites[0]
+		h.mu.Unlock()
+		if write != nil {
+			if _, err := write.apply(ctx, h.sess); err != nil {
+				return err
+			}
 		}
+		h.mu.Lock()
+		h.pendingWrites = h.pendingWrites[1:]
+		h.mu.Unlock()
 	}
-	return nil
 }
 
 func (h *AgentHarness) pendingSessionWriteCount() int {

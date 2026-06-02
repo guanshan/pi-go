@@ -72,6 +72,10 @@ type CreateAgentSessionFromServicesOptions struct {
 	Tools          []string
 	ExcludeTools   []string
 	NoTools        NoToolsMode
+	// CustomTools are caller-supplied tools merged on top of the builtin and
+	// extension tool sets, mirroring the TS createAgentSession `customTools`
+	// option. They share the Tools allowlist / ExcludeTools / NoTools handling.
+	CustomTools ToolSet
 }
 
 func CreateAgentSessionServices(ctx context.Context, options CreateAgentSessionServicesOptions) (*AgentSessionServices, error) {
@@ -147,7 +151,7 @@ func CreateAgentSessionFromServices(ctx context.Context, options CreateAgentSess
 			thinking = services.SettingsManager.DefaultThinkingLevel()
 		}
 	}
-	tools := toolSetFromServiceOptions(services.Cwd, services.SettingsManager, options.NoTools, options.Tools, options.ExcludeTools, services.ExtensionRuntime)
+	tools := toolSetFromServiceOptions(services.Cwd, services.SettingsManager, options.NoTools, options.Tools, options.ExcludeTools, services.ExtensionRuntime, options.CustomTools)
 	systemPrompt := services.ResourceLoader.BuildSystemPrompt(cli.Args{}, AllToolDescriptions(tools))
 	agentSession := NewAgentSession(session, services.SettingsManager, services.ModelRegistry, services.ResourceLoader, model, thinking, tools, systemPrompt)
 	agentSession.extensionRuntime = services.ExtensionRuntime
@@ -156,6 +160,14 @@ func CreateAgentSessionFromServices(ctx context.Context, options CreateAgentSess
 		Session:              agentSession,
 		ModelFallbackMessage: modelFallbackMessage,
 	}, nil
+}
+
+// formatNoModelsAvailableMessage is the guidance shown when no model can be
+// resolved (no API keys configured, no models.json, etc.). It mirrors TS
+// formatNoModelsAvailableMessage / getProviderLoginHelp in
+// core/auth-guidance.ts, adapted to the Go port (which has no docs path).
+func formatNoModelsAvailableMessage() string {
+	return "No models available. Use /login to log into a provider via OAuth or API key, or configure API keys or models.json and try again."
 }
 
 func resolveServicePaths(cwd, agentDir string) (string, string, error) {
@@ -246,7 +258,7 @@ func diagnosticType(value string) DiagnosticType {
 	}
 }
 
-func toolSetFromServiceOptions(cwd string, settings *SettingsManager, noTools NoToolsMode, names, excludeNames []string, runtime *coreext.Runner) ToolSet {
+func toolSetFromServiceOptions(cwd string, settings *SettingsManager, noTools NoToolsMode, names, excludeNames []string, runtime *coreext.Runner, custom ToolSet) ToolSet {
 	if noTools == NoToolsAll {
 		return ToolSet{}
 	}
@@ -262,6 +274,9 @@ func toolSetFromServiceOptions(cwd string, settings *SettingsManager, noTools No
 			combined[name] = tool
 		}
 		for name, tool := range extensions {
+			combined[name] = tool
+		}
+		for name, tool := range custom {
 			combined[name] = tool
 		}
 		selected := ToolSet{}
@@ -287,6 +302,12 @@ func toolSetFromServiceOptions(cwd string, settings *SettingsManager, noTools No
 		}
 	}
 	for name, tool := range extensions {
+		if excluded[name] {
+			continue
+		}
+		selected[name] = tool
+	}
+	for name, tool := range custom {
 		if excluded[name] {
 			continue
 		}

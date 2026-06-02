@@ -175,6 +175,33 @@ func TestBashToolKillsProcessGroupOnAbort(t *testing.T) {
 	t.Fatalf("background child %d survived abort; process group was not killed", pid)
 }
 
+func TestBashToolKeepsDetachedProcessGroupTrackedAfterShellExit(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("process-group liveness probe is Linux-specific")
+	}
+	KillTrackedDetachedChildren()
+	t.Cleanup(KillTrackedDetachedChildren)
+
+	tool := BashTool{CWD: t.TempDir()}
+	result := tool.Execute(context.Background(), raw(map[string]any{
+		"command": "sleep 30 >/dev/null 2>&1 &",
+	}), nil)
+	if result.IsError {
+		t.Fatalf("unexpected error: %s", toolText(result.Content))
+	}
+
+	pids := detachedTrackedPIDs()
+	if len(pids) == 0 {
+		t.Fatal("detached background process group was not tracked after shell exit")
+	}
+	for _, pid := range pids {
+		if processGroupStillAlive(pid) {
+			return
+		}
+	}
+	t.Fatalf("tracked pids are not alive process groups: %#v", pids)
+}
+
 func TestBashToolTruncationWritesFullOutput(t *testing.T) {
 	tool := BashTool{CWD: t.TempDir()}
 	totalLines := DefaultMaxLines + 500

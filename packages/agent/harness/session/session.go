@@ -2,6 +2,7 @@ package session
 
 import (
 	"context"
+	"strings"
 
 	"github.com/guanshan/pi-go/packages/agent"
 )
@@ -58,13 +59,13 @@ func (s *Session) Label(ctx context.Context, id string) (string, bool) {
 }
 
 func (s *Session) Name(ctx context.Context) (string, error) {
-	branch, err := s.Branch(ctx, nil)
+	entries, err := s.storage.FindEntries(ctx, "session_info")
 	if err != nil {
 		return "", err
 	}
-	for i := len(branch) - 1; i >= 0; i-- {
-		if info, ok := branch[i].(SessionInfoEntry); ok {
-			return info.Name, nil
+	for i := len(entries) - 1; i >= 0; i-- {
+		if info, ok := entries[i].(SessionInfoEntry); ok {
+			return strings.TrimSpace(info.Name), nil
 		}
 	}
 	return "", nil
@@ -129,7 +130,7 @@ func (s *Session) AppendLabel(ctx context.Context, targetID string, label string
 }
 
 func (s *Session) AppendSessionName(ctx context.Context, name string) (string, error) {
-	return appendAndLeaf(ctx, s.storage, SessionInfoEntry{Name: name})
+	return appendAndLeaf(ctx, s.storage, SessionInfoEntry{Name: strings.TrimSpace(name)})
 }
 
 type BranchMove struct {

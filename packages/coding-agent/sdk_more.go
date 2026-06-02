@@ -3,12 +3,10 @@ package codingagent
 import (
 	"context"
 	"fmt"
-	"os"
 	"path/filepath"
 	"strings"
 
 	"github.com/guanshan/pi-go/packages/ai"
-	"github.com/guanshan/pi-go/packages/coding-agent/cli"
 	core "github.com/guanshan/pi-go/packages/coding-agent/core"
 	coreext "github.com/guanshan/pi-go/packages/coding-agent/core/extensions"
 )
@@ -107,84 +105,83 @@ func DefineTool(name, description string, parameters map[string]any, execute fun
 }
 
 type CreateAgentSessionOptions struct {
+	// Context cancels resource/extension loading during session construction.
+	// When nil, context.Background() is used.
+	Context        context.Context
 	CWD            string
 	AgentDir       string
 	SessionManager *core.SessionManager
 	Settings       *core.SettingsManager
 	Registry       *ai.ModelRegistry
+	AuthStorage    *ai.AuthStorage
 	Model          ai.Model
 	ThinkingLevel  ai.ThinkingLevel
-	Tools          core.ToolSet
-	NoTools        bool
+	ScopedModels   []core.ScopedModel
+	// CustomTools are caller-supplied tools merged on top of the builtin and
+	// extension tool sets, mirroring the TS createAgentSession `customTools`
+	// option.
+	CustomTools  core.ToolSet
+	Tools        []string
+	ExcludeTools []string
+	NoTools      bool
+	// ResourceLoaderOptions controls context files, extensions, skills, prompt
+	// templates and themes. The zero value loads resources just like the TS
+	// DefaultResourceLoader; set the No* fields to opt out.
+	ResourceLoaderOptions core.DefaultResourceLoaderOptions
+	ResourceLoader        *core.ResourceLoader
 }
 
 type CreateAgentSessionResult struct {
-	Session *core.AgentSession
+	Session              *core.AgentSession
+	ModelFallbackMessage string
+	Diagnostics          []core.Diagnostic
 }
 
+// CreateAgentSession is a thin facade over the core SDK. It loads resources and
+// extensions (unless opted out via ResourceLoaderOptions), merges any
+// CustomTools through the same tool-assembly path as builtin/extension tools,
+// and surfaces the model fallback message and diagnostics produced by the core
+// session services, matching the shape of the TS createAgentSession().
 func CreateAgentSession(options CreateAgentSessionOptions) (*CreateAgentSessionResult, error) {
-	if options.Tools == nil {
-		result, err := core.CreateAgentSession(context.Background(), core.CreateAgentSessionOptions{
-			Cwd:             options.CWD,
-			AgentDir:        options.AgentDir,
-			SessionManager:  options.SessionManager,
-			SettingsManager: options.Settings,
-			ModelRegistry:   options.Registry,
-			Model:           options.Model,
-			ThinkingLevel:   options.ThinkingLevel,
-			NoTools: func() core.NoToolsMode {
-				if options.NoTools {
-					return core.NoToolsAll
-				}
-				return core.NoToolsNone
-			}(),
-			ResourceLoaderOptions: core.DefaultResourceLoaderOptions{
-				NoContextFiles:    true,
-				NoExtensions:      true,
-				NoSkills:          true,
-				NoPromptTemplates: true,
-				NoThemes:          true,
-			},
-		})
-		if err != nil {
-			return nil, err
-		}
-		return &CreateAgentSessionResult{Session: result.Session}, nil
+	ctx := options.Context
+	if ctx == nil {
+		ctx = context.Background()
 	}
-	cwd := options.CWD
-	if cwd == "" {
-		var err error
-		cwd, err = os.Getwd()
-		if err != nil {
-			return nil, err
-		}
+	services, err := core.CreateAgentSessionServices(ctx, core.CreateAgentSessionServicesOptions{
+		Cwd:                   options.CWD,
+		AgentDir:              options.AgentDir,
+		AuthStorage:           options.AuthStorage,
+		SettingsManager:       options.Settings,
+		ModelRegistry:         options.Registry,
+		ResourceLoaderOptions: options.ResourceLoaderOptions,
+	})
+	if err != nil {
+		return nil, err
 	}
-	agentDir := options.AgentDir
-	if agentDir == "" {
-		agentDir = core.AgentDir()
+	if options.ResourceLoader != nil {
+		services.ResourceLoader = *options.ResourceLoader
 	}
-	settings := options.Settings
-	if settings == nil {
-		settings = core.NewSettingsManager(cwd, agentDir)
+	noTools := core.NoToolsNone
+	if options.NoTools {
+		noTools = core.NoToolsAll
 	}
-	session := options.SessionManager
-	if session == nil {
-		session = core.InMemorySession(cwd)
+	result, err := core.CreateAgentSessionFromServices(ctx, core.CreateAgentSessionFromServicesOptions{
+		Services:       services,
+		SessionManager: options.SessionManager,
+		Model:          options.Model,
+		ThinkingLevel:  options.ThinkingLevel,
+		ScopedModels:   options.ScopedModels,
+		Tools:          options.Tools,
+		ExcludeTools:   options.ExcludeTools,
+		CustomTools:    options.CustomTools,
+		NoTools:        noTools,
+	})
+	if err != nil {
+		return nil, err
 	}
-	registry := options.Registry
-	if registry == nil {
-		registry = ai.NewModelRegistry(agentDir, ai.NewAuthStorage(agentDir))
-	}
-	model := options.Model
-	if model.Provider == "" {
-		model, _, _ = registry.Match("faux", "faux")
-	}
-	tools := options.Tools
-	if tools == nil && !options.NoTools {
-		tools = core.FilterTools(core.BuiltinTools(cwd, settings), cli.Args{})
-	}
-	resources := core.LoadResources(cwd, agentDir, cli.Args{NoContextFiles: true, NoSkills: true, NoPromptTemplates: true, NoThemes: true, NoExtensions: true}, settings)
-	systemPrompt := resources.BuildSystemPrompt(cli.Args{}, core.AllToolDescriptions(tools))
-	agent := core.NewAgentSession(session, settings, registry, resources, model, options.ThinkingLevel, tools, systemPrompt)
-	return &CreateAgentSessionResult{Session: agent}, nil
+	return &CreateAgentSessionResult{
+		Session:              result.Session,
+		ModelFallbackMessage: result.ModelFallbackMessage,
+		Diagnostics:          services.Diagnostics,
+	}, nil
 }

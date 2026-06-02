@@ -246,7 +246,11 @@ func applyScriptEventResult(event string, payload any, result json.RawMessage) {
 		return
 	}
 	switch normalizeEventKey(event) {
-	case "session_before_switch", "session_before_fork", "session_before_compact", "session_before_tree":
+	// session_before_* hooks carry their decision (cancel/result) back in the
+	// payload; tool_call/tool_result carry the handler's block/mutation/override so
+	// the BeforeToolCall/AfterToolCall hooks can apply them to the execution chain.
+	case "session_before_switch", "session_before_fork", "session_before_compact", "session_before_tree",
+		"tool_call", "tool_result":
 	default:
 		return
 	}
@@ -436,7 +440,17 @@ const virtualModules = new Map([
 		"export class Loader {}",
 		"export class CancellableLoader {}",
 		"export class Markdown { constructor(markdown = \"\") { this.markdown = markdown; } render() { return String(this.markdown).split(\"\\n\"); } }",
-		"export default { matchesKey, truncateToWidth, Text, Container, Box, Spacer, Input, SelectList, SettingsList, Loader, CancellableLoader, Markdown };",
+		// Key mirrors @earendil-works/pi-tui's Key: named key constants plus modifier
+		// helpers (e.g. Key.ctrlAlt('p') -> 'ctrl+alt+p'). The backtick key uses the
+		// \\u0060 escape because the surrounding bridge is a Go raw string literal.
+		"export const Key = (() => {",
+		"  const k = { escape: \"escape\", esc: \"esc\", enter: \"enter\", return: \"return\", tab: \"tab\", space: \"space\", backspace: \"backspace\", delete: \"delete\", insert: \"insert\", clear: \"clear\", home: \"home\", end: \"end\", pageUp: \"pageUp\", pageDown: \"pageDown\", up: \"up\", down: \"down\", left: \"left\", right: \"right\", f1: \"f1\", f2: \"f2\", f3: \"f3\", f4: \"f4\", f5: \"f5\", f6: \"f6\", f7: \"f7\", f8: \"f8\", f9: \"f9\", f10: \"f10\", f11: \"f11\", f12: \"f12\" };",
+		"  Object.assign(k, { backtick: \"\\u0060\", hyphen: \"-\", equals: \"=\", leftbracket: \"[\", rightbracket: \"]\", backslash: \"\\\\\", semicolon: \";\", quote: \"'\", comma: \",\", period: \".\", slash: \"/\", exclamation: \"!\", at: \"@\", hash: \"#\", dollar: \"$\", percent: \"%\", caret: \"^\", ampersand: \"&\", asterisk: \"*\", leftparen: \"(\", rightparen: \")\", underscore: \"_\", plus: \"+\", pipe: \"|\", tilde: \"~\", leftbrace: \"{\", rightbrace: \"}\", colon: \":\", lessthan: \"<\", greaterthan: \">\", question: \"?\" });",
+		"  const mods = { ctrl: \"ctrl\", shift: \"shift\", alt: \"alt\", super: \"super\", ctrlShift: \"ctrl+shift\", shiftCtrl: \"shift+ctrl\", ctrlAlt: \"ctrl+alt\", altCtrl: \"alt+ctrl\", shiftAlt: \"shift+alt\", altShift: \"alt+shift\", ctrlSuper: \"ctrl+super\", superCtrl: \"super+ctrl\", shiftSuper: \"shift+super\", superShift: \"super+shift\", altSuper: \"alt+super\", superAlt: \"super+alt\", ctrlShiftAlt: \"ctrl+shift+alt\", ctrlShiftSuper: \"ctrl+shift+super\" };",
+		"  for (const name of Object.keys(mods)) { const prefix = mods[name]; k[name] = (key) => prefix + \"+\" + key; }",
+		"  return k;",
+		"})();",
+		"export default { matchesKey, truncateToWidth, Text, Container, Box, Spacer, Input, SelectList, SettingsList, Loader, CancellableLoader, Markdown, Key };",
 	].join("\n")],
 ]);
 
@@ -517,6 +531,24 @@ const api = {
 	},
 	onShutdown(handler) {
 		if (typeof handler === "function") shutdownHandlers.push(handler);
+	},
+	registerProvider() {
+		throw new Error("pi.registerProvider is unsupported in the Go bridge");
+	},
+	unregisterProvider() {
+		throw new Error("pi.unregisterProvider is unsupported in the Go bridge");
+	},
+	registerMessageRenderer() {
+		throw new Error("pi.registerMessageRenderer is unsupported in the Go bridge");
+	},
+	addAutocompleteProvider() {
+		throw new Error("pi.addAutocompleteProvider is unsupported in the Go bridge");
+	},
+	registerShortcut() {
+		throw new Error("pi.registerShortcut is unsupported in the Go bridge (interactive keybindings are not bridged)");
+	},
+	unregisterShortcut() {
+		throw new Error("pi.unregisterShortcut is unsupported in the Go bridge (interactive keybindings are not bridged)");
 	},
 	events: {
 		on(event, handler) { return api.on(event, handler); },

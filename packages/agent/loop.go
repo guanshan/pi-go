@@ -78,7 +78,7 @@ func RunAgentLoopContinue(ctx context.Context, initial AgentContext, cfg AgentLo
 }
 
 func AgentLoop(ctx context.Context, prompts []AgentMessage, initial AgentContext, cfg AgentLoopConfig, streamFn StreamFn) *EventStream[AgentEvent, []AgentMessage] {
-	stream := NewEventStream[AgentEvent, []AgentMessage](loopEventBuffer(cfg))
+	stream := NewEventStreamWithContext[AgentEvent, []AgentMessage](ctx, loopEventBuffer(cfg))
 	go func() {
 		messages, _ := RunAgentLoop(ctx, prompts, initial, cfg, func(ctx context.Context, ev AgentEvent) error {
 			stream.Push(ev)
@@ -90,7 +90,7 @@ func AgentLoop(ctx context.Context, prompts []AgentMessage, initial AgentContext
 }
 
 func AgentLoopContinue(ctx context.Context, initial AgentContext, cfg AgentLoopConfig, streamFn StreamFn) *EventStream[AgentEvent, []AgentMessage] {
-	stream := NewEventStream[AgentEvent, []AgentMessage](loopEventBuffer(cfg))
+	stream := NewEventStreamWithContext[AgentEvent, []AgentMessage](ctx, loopEventBuffer(cfg))
 	go func() {
 		messages, _ := RunAgentLoopContinue(ctx, initial, cfg, func(ctx context.Context, ev AgentEvent) error {
 			stream.Push(ev)

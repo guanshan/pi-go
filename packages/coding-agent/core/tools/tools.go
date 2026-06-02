@@ -10,10 +10,10 @@ import (
 func BuiltinTools(cwd string, options BuiltinToolOptions) ToolSet {
 	return ToolSet{
 		"read":  ReadTool{CWD: cwd, AutoResize: options.AutoResize},
-		"bash":  BashTool{CWD: cwd, ShellPath: options.ShellPath, CommandPrefix: options.CommandPrefix},
+		"bash":  BashTool{CWD: cwd, ShellPath: options.ShellPath, CommandPrefix: options.CommandPrefix, BinDir: options.BinDir},
 		"edit":  EditTool{CWD: cwd},
 		"write": WriteTool{CWD: cwd},
-		"grep":  GrepTool{CWD: cwd},
+		"grep":  GrepTool{CWD: cwd, BinDir: options.BinDir},
 		"find":  FindTool{CWD: cwd},
 		"ls":    LsTool{CWD: cwd},
 	}

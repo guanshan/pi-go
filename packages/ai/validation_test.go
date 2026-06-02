@@ -52,6 +52,10 @@ func TestValidateToolCallErrors(t *testing.T) {
 		t.Fatal("expected validation error")
 	}
 	message := err.Error()
+	// P2-4: the prefix must be capitalized to match TS (validation.ts:321).
+	if !strings.HasPrefix(message, `Validation failed for tool "strict"`) {
+		t.Fatalf("expected capitalized prefix, message=%s", message)
+	}
 	if !strings.Contains(message, "path: Expected required property") || !strings.Contains(message, "other: Unexpected property") {
 		t.Fatalf("message=%s", message)
 	}

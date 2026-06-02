@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"os/exec"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -56,6 +55,9 @@ func (t BashTool) Execute(ctx context.Context, raw json.RawMessage, onUpdate Too
 	defer cancelExec()
 	cmd := ShellCommandContext(execCtx, shellConfig, command)
 	cmd.Dir = t.CWD
+	// Prepend the agent bin directory to PATH so migrated/installed tools (fd,
+	// rg, package CLIs) resolve, mirroring getShellEnv() in src/core/tools/bash.ts.
+	cmd.Env = ShellEnv(t.BinDir)
 	configureProcessGroup(cmd)
 	cmd.Cancel = func() error {
 		killProcessGroup(cmd)
@@ -116,6 +118,13 @@ func (t BashTool) Execute(ctx context.Context, raw json.RawMessage, onUpdate Too
 	if err := cmd.Start(); err != nil {
 		return toolError(fmt.Sprintf("Failed to start command: %v", err))
 	}
+	// Track the process group so it can be reaped on agent shutdown if a
+	// normally completed shell leaves background descendants behind.
+	trackedPID := 0
+	if cmd.Process != nil {
+		trackedPID = cmd.Process.Pid
+		TrackDetachedChildPID(trackedPID)
+	}
 
 	// Watch for context cancellation (abort) and timeout; kill the whole group.
 	done := make(chan struct{})
@@ -140,6 +149,9 @@ func (t BashTool) Execute(ctx context.Context, raw json.RawMessage, onUpdate Too
 	}()
 	runErr := cmd.Wait()
 	close(done)
+	if trackedPID > 0 && !processGroupStillAlive(trackedPID) {
+		UntrackDetachedChildPID(trackedPID)
+	}
 	if timer != nil {
 		timer.Stop()
 	}
@@ -195,10 +207,12 @@ func (w *streamingWriter) Write(p []byte) (int, error) {
 }
 
 func appendStatus(text, status string) string {
-	if strings.TrimSpace(text) == "" {
+	// Mirror bash.ts:370 `${text ? `${text}\n\n` : ""}${status}`: keep the output
+	// verbatim (no trailing-newline trim) and only prepend it when non-empty.
+	if text == "" {
 		return status
 	}
-	return strings.TrimRight(text, "\n") + "\n\n" + status
+	return text + "\n\n" + status
 }
 
 func detailsOrNil(m map[string]any) any {

@@ -103,6 +103,30 @@ type configuredPackageEntry struct {
 	filtered bool
 }
 
+// corePackageManagerAdapter adapts *DefaultPackageManager to the
+// core.PackageManager interface used by the CLI package-command dispatcher,
+// bridging the variadic-options signatures to the simpler local-bool form core
+// expects.
+type corePackageManagerAdapter struct{ m *DefaultPackageManager }
+
+func (a corePackageManagerAdapter) InstallAndPersist(source string, local bool) error {
+	return a.m.InstallAndPersist(source, PackageManagerOperationOptions{Local: local})
+}
+
+func (a corePackageManagerAdapter) RemoveAndPersist(source string, local bool) (bool, error) {
+	return a.m.RemoveAndPersist(source, PackageManagerOperationOptions{Local: local})
+}
+
+func (a corePackageManagerAdapter) Update(source string) error {
+	return a.m.Update(source, nil)
+}
+
+// NewCorePackageManager is a core.PackageManagerFactory that routes CLI package
+// commands through the full DefaultPackageManager.
+func NewCorePackageManager(cwd, agentDir string, settings *core.SettingsManager) core.PackageManager {
+	return corePackageManagerAdapter{m: NewDefaultPackageManager(cwd, agentDir, settings)}
+}
+
 func NewDefaultPackageManager(cwd, agentDir string, settings *core.SettingsManager) *DefaultPackageManager {
 	if cwd == "" {
 		cwd, _ = os.Getwd()
@@ -146,19 +170,22 @@ func parseSourceRef(name string) (base string, ref string, pinned bool) {
 func (m *DefaultPackageManager) Install(source string, local bool, progress ProgressCallback) (core.PackageRecord, error) {
 	progress = m.progressCallback(progress)
 	parsed := ParsePackageSource(source)
-	root := filepath.Join(m.AgentDir, "packages")
-	if local {
-		root = filepath.Join(core.ProjectPiDir(m.CWD), "packages")
-	}
-	if err := os.MkdirAll(root, 0o755); err != nil {
-		return core.PackageRecord{}, err
-	}
-	dest := filepath.Join(root, sanitizePackageSource(source))
-	emitProgress(progress, "start", "installing "+source, dest)
-	installPath := dest
+	var installPath string
 	switch parsed.Kind {
 	case "git":
-		staged, err := os.MkdirTemp(root, ".install-"+sanitizePackageSource(source)+"-*")
+		gitSource, ok := ParseGitURL(source)
+		if !ok {
+			return core.PackageRecord{}, fmt.Errorf("unsupported git source: %s", source)
+		}
+		dest := m.gitInstallPath(gitSource, local)
+		emitProgress(progress, "start", "installing "+source, dest)
+		// Clone into a sibling staging dir then atomically swap, so a failed
+		// dependency install does not corrupt an existing checkout.
+		gitRoot := filepath.Dir(dest)
+		if err := os.MkdirAll(gitRoot, 0o755); err != nil {
+			return core.PackageRecord{}, err
+		}
+		staged, err := os.MkdirTemp(gitRoot, ".install-*")
 		if err != nil {
 			return core.PackageRecord{}, err
 		}
@@ -167,7 +194,7 @@ func (m *DefaultPackageManager) Install(source string, local bool, progress Prog
 		if parsed.Ref == "" {
 			args = append(args, "--depth", "1")
 		}
-		args = append(args, parsed.Name, staged)
+		args = append(args, gitSource.Repo, staged)
 		if err := runPM("", "git", args...); err != nil {
 			return core.PackageRecord{}, err
 		}
@@ -176,43 +203,36 @@ func (m *DefaultPackageManager) Install(source string, local bool, progress Prog
 				return core.PackageRecord{}, err
 			}
 		}
-		if err := installPackageDependencies(staged); err != nil {
+		if err := m.installPackageDependencies(staged); err != nil {
 			return core.PackageRecord{}, err
 		}
 		if err := replaceInstalledPackage(dest, staged); err != nil {
 			return core.PackageRecord{}, err
 		}
+		installPath = dest
 	case "npm":
-		staged, err := os.MkdirTemp(root, ".install-"+sanitizePackageSource(source)+"-*")
-		if err != nil {
+		// Install into the shared npm root so npm produces a full node_modules tree
+		// with transitive deps. Mirrors installNpm -> getNpmInstallArgs in
+		// package-manager.ts (~1730): `npm install <spec> --prefix <root>`.
+		npmRoot := m.npmInstallRoot(local)
+		if err := os.MkdirAll(npmRoot, 0o755); err != nil {
 			return core.PackageRecord{}, err
 		}
-		defer os.RemoveAll(staged)
-		pkg := parsed.Name
+		// Keep the shared node_modules tree out of cloud-sync clients (Dropbox,
+		// iCloud), mirroring ensureNpmProject -> markPathIgnoredByCloudSync in
+		// package-manager.ts (~1865).
+		MarkPathIgnoredByCloudSync(npmRoot)
+		spec := parsed.Name
 		if parsed.Ref != "" {
-			pkg += "@" + parsed.Ref
+			spec += "@" + parsed.Ref
 		}
-		if err := runPM(staged, "npm", "pack", pkg); err != nil {
+		if err := m.runNpm("", m.npmInstallArgs(spec, npmRoot)...); err != nil {
 			return core.PackageRecord{}, err
 		}
-		matches, _ := filepath.Glob(filepath.Join(staged, "*.tgz"))
-		if len(matches) == 0 {
-			return core.PackageRecord{}, fmt.Errorf("npm pack produced no tarball for %s", pkg)
-		}
-		if err := runPM(staged, "tar", "-xzf", matches[0], "--strip-components=1"); err != nil {
-			return core.PackageRecord{}, err
-		}
-		for _, match := range matches {
-			_ = os.Remove(match)
-		}
-		if err := installPackageDependencies(staged); err != nil {
-			return core.PackageRecord{}, err
-		}
-		if err := replaceInstalledPackage(dest, staged); err != nil {
-			return core.PackageRecord{}, err
-		}
+		installPath = filepath.Join(npmRoot, "node_modules", filepath.FromSlash(parsed.Name))
 	case "path":
 		path := core.ResolveInCWD(m.CWD, parsed.Name)
+		emitProgress(progress, "start", "installing "+source, path)
 		info, err := os.Stat(path)
 		if err != nil || !info.IsDir() {
 			return core.PackageRecord{}, fmt.Errorf("package path not found: %s", parsed.Name)
@@ -226,6 +246,17 @@ func (m *DefaultPackageManager) Install(source string, local bool, progress Prog
 	return record, nil
 }
 
+// npmInstallArgs builds the `install <spec> --prefix <root>` invocation. Mirrors
+// getNpmInstallArgs in package-manager.ts (~1707): the default npm path adds
+// --legacy-peer-deps; a custom command (pnpm/bun/mise-wrapped) gets a bare
+// install so it does not reject npm-specific flags.
+func (m *DefaultPackageManager) npmInstallArgs(spec, installRoot string) []string {
+	if m.hasCustomNpmCommand() {
+		return []string{"install", spec, "--prefix", installRoot}
+	}
+	return []string{"install", spec, "--prefix", installRoot, "--legacy-peer-deps"}
+}
+
 func (m *DefaultPackageManager) InstallAndPersist(source string, options ...PackageManagerOperationOptions) error {
 	local := false
 	if len(options) > 0 {
@@ -234,7 +265,9 @@ func (m *DefaultPackageManager) InstallAndPersist(source string, options ...Pack
 	if _, err := m.Install(source, local, nil); err != nil {
 		return err
 	}
-	m.Settings.AddPackageSource(source, local)
+	// AddSourceToSettings stores local sources relative to the scope base dir,
+	// matching installAndPersist -> addSourceToSettings in package-manager.ts.
+	m.AddSourceToSettings(source, local)
 	if local {
 		return m.Settings.SaveProject()
 	}
@@ -247,11 +280,31 @@ func (m *DefaultPackageManager) Remove(source string, local bool) error {
 		return nil
 	}
 	path := m.predictedInstalledPath(source, local)
-	root := m.packageRoot(local)
-	if !isWithinDir(root, path) {
+	if !m.isWithinManagedRoot(path, local) {
 		return fmt.Errorf("refusing to remove package outside package root: %s", path)
 	}
 	return os.RemoveAll(path)
+}
+
+// isWithinManagedRoot guards Remove against deleting outside a managed install
+// root. The path may live under the npm root, the git root, or the legacy
+// packages root depending on how it was installed/resolved.
+func (m *DefaultPackageManager) isWithinManagedRoot(path string, local bool) bool {
+	base := m.AgentDir
+	if local {
+		base = core.ProjectPiDir(m.CWD)
+	}
+	roots := []string{
+		filepath.Join(base, "npm", "node_modules"),
+		filepath.Join(base, "git"),
+		m.legacyPackageRoot(local),
+	}
+	for _, root := range roots {
+		if isWithinDir(root, path) {
+			return true
+		}
+	}
+	return false
 }
 
 func (m *DefaultPackageManager) RemoveAndPersist(source string, options ...PackageManagerOperationOptions) (bool, error) {
@@ -290,7 +343,7 @@ func (m *DefaultPackageManager) Update(source string, progress ProgressCallback)
 			if err := runPM(record.Path, "git", "pull", "--ff-only"); err != nil {
 				return err
 			}
-			if err := installPackageDependencies(record.Path); err != nil {
+			if err := m.installPackageDependencies(record.Path); err != nil {
 				return err
 			}
 			emitProgress(progress, "done", "updated "+record.Source, record.Path)
@@ -322,21 +375,52 @@ func (m *DefaultPackageManager) AddSourceToSettings(source string, local bool) b
 	if source == "" {
 		return false
 	}
+	// Local sources are persisted relative to the scope base dir so list/update
+	// from a different cwd resolve back to the same directory; managed sources are
+	// stored verbatim. Mirrors normalizePackageSourceForSettings in
+	// package-manager.ts.
+	normalized := m.normalizeSourceForSettings(source, local)
 	target := &m.Settings.Global.Packages
 	if local {
 		target = &m.Settings.Project.Packages
 	}
 	for i, record := range *target {
 		if m.packageSourcesMatch(record.Source, source, local) {
-			if record.Source == source {
+			if record.Source == normalized {
 				return false
 			}
-			(*target)[i].Source = source
+			(*target)[i].Source = normalized
 			return true
 		}
 	}
-	*target = append(*target, core.PackageSetting{Source: source})
+	*target = append(*target, core.PackageSetting{Source: normalized})
 	return true
+}
+
+func (m *DefaultPackageManager) normalizeSourceForSettings(source string, local bool) string {
+	parsed := ParsePackageSource(source)
+	if parsed.Kind != "path" {
+		return source
+	}
+	resolved := core.ResolveInCWD(m.CWD, parsed.Name)
+	rel, err := filepath.Rel(m.scopeBaseDir(local), resolved)
+	if err != nil {
+		return source
+	}
+	if rel == "" {
+		return "."
+	}
+	return rel
+}
+
+// scopeBaseDir returns the directory local package source paths are stored
+// relative to: project scope -> <cwd>/.pi, user scope -> agentDir. Mirrors
+// getBaseDirForScope() in package-manager.ts.
+func (m *DefaultPackageManager) scopeBaseDir(local bool) string {
+	if local {
+		return core.ProjectPiDir(m.CWD)
+	}
+	return m.AgentDir
 }
 
 func (m *DefaultPackageManager) RemoveSourceFromSettings(source string, local bool) bool {
@@ -372,17 +456,76 @@ func (m *DefaultPackageManager) progressCallback(progress ProgressCallback) Prog
 
 func (m *DefaultPackageManager) predictedInstalledPath(source string, local bool) string {
 	parsed := ParsePackageSource(source)
-	if parsed.Kind == "path" {
-		return core.ResolveInCWD(m.CWD, parsed.Name)
+	switch parsed.Kind {
+	case "path":
+		// Stored local sources are relative to the scope base dir, so resolve from
+		// there to avoid drift when listing/updating from a different cwd. Mirrors
+		// resolvePathFromBase(parsed.path, getBaseDirForScope(scope)).
+		return core.ResolveInCWD(m.scopeBaseDir(local), parsed.Name)
+	case "npm":
+		// npm packages live in a shared node_modules tree, keyed by package name
+		// (scoped names keep their @scope/ segment). Mirrors getManagedNpmInstallPath
+		// in package-manager.ts (~1924).
+		path := filepath.Join(m.npmInstallRoot(local), "node_modules", filepath.FromSlash(parsed.Name))
+		if !local && !fileExistsLocal(path) {
+			if legacy := m.legacyPackagePath(source, local); legacy != "" {
+				return legacy
+			}
+		}
+		return path
+	case "git":
+		// git packages are stored under git/<host>/<owner>/<repo>. Mirrors
+		// getGitInstallPath in package-manager.ts (~1951).
+		if gitSource, ok := ParseGitURL(source); ok {
+			path := m.gitInstallPath(gitSource, local)
+			if !fileExistsLocal(path) {
+				if legacy := m.legacyPackagePath(source, local); legacy != "" {
+					return legacy
+				}
+			}
+			return path
+		}
 	}
-	return filepath.Join(m.packageRoot(local), sanitizePackageSource(source))
+	// Unparseable git/other: fall back to the legacy sanitized layout.
+	return filepath.Join(m.legacyPackageRoot(local), sanitizePackageSource(source))
 }
 
-func (m *DefaultPackageManager) packageRoot(local bool) string {
+// npmInstallRoot returns the shared npm root: <ProjectPiDir>/npm (project) or
+// <agentDir>/npm (user). Mirrors getNpmInstallRoot in package-manager.ts (~1884).
+func (m *DefaultPackageManager) npmInstallRoot(local bool) string {
+	if local {
+		return filepath.Join(core.ProjectPiDir(m.CWD), "npm")
+	}
+	return filepath.Join(m.AgentDir, "npm")
+}
+
+// gitInstallPath returns <base>/git/<host>/<owner>/<repo>; base is <ProjectPiDir>
+// (project) or <agentDir> (user). Mirrors getGitInstallPath in
+// package-manager.ts (~1951). gitSource.Path is the "owner/repo" segment.
+func (m *DefaultPackageManager) gitInstallPath(gitSource GitSource, local bool) string {
+	base := m.AgentDir
+	if local {
+		base = core.ProjectPiDir(m.CWD)
+	}
+	return filepath.Join(base, "git", gitSource.Host, filepath.FromSlash(gitSource.Path))
+}
+
+// legacyPackageRoot is the pre-TS-layout Go install root (<base>/packages).
+func (m *DefaultPackageManager) legacyPackageRoot(local bool) string {
 	if local {
 		return filepath.Join(core.ProjectPiDir(m.CWD), "packages")
 	}
 	return filepath.Join(m.AgentDir, "packages")
+}
+
+// legacyPackagePath probes the older Go install location so packages installed
+// by a previous build still resolve when the new-layout path is absent.
+func (m *DefaultPackageManager) legacyPackagePath(source string, local bool) string {
+	legacy := filepath.Join(m.legacyPackageRoot(local), sanitizePackageSource(source))
+	if fileExistsLocal(legacy) {
+		return legacy
+	}
+	return ""
 }
 
 func replaceInstalledPackage(dest, staged string) error {
@@ -417,12 +560,42 @@ func replaceInstalledPackage(dest, staged string) error {
 	return nil
 }
 
-func installPackageDependencies(dir string) error {
+// npmCommand returns the configured package-manager command and its leading
+// args (e.g. ["mise", "exec", "--", "npm"] -> "mise", ["exec","--","npm"]),
+// falling back to plain "npm". Mirrors getNpmCommand() in
+// src/core/package-manager.ts.
+func (m *DefaultPackageManager) npmCommand() (string, []string) {
+	if m.Settings != nil {
+		if configured := m.Settings.NPMCommand(); len(configured) > 0 && configured[0] != "" {
+			return configured[0], append([]string(nil), configured[1:]...)
+		}
+	}
+	return "npm", nil
+}
+
+func (m *DefaultPackageManager) hasCustomNpmCommand() bool {
+	return m.Settings != nil && len(m.Settings.NPMCommand()) > 0 && m.Settings.NPMCommand()[0] != ""
+}
+
+// runNpm runs the configured package manager with the given subcommand args,
+// honoring any prefix such as "mise exec -- npm".
+func (m *DefaultPackageManager) runNpm(dir string, args ...string) error {
+	command, prefix := m.npmCommand()
+	return runPM(dir, command, append(prefix, args...)...)
+}
+
+func (m *DefaultPackageManager) installPackageDependencies(dir string) error {
 	needsInstall, err := packageNeedsInstall(dir)
 	if err != nil || !needsInstall {
 		return err
 	}
-	return runPM(dir, "npm", "install", "--omit=dev", "--ignore-scripts", "--no-audit", "--no-fund")
+	// A custom package manager (pnpm/bun/mise-wrapped) rejects npm-specific
+	// flags, so pass a bare "install" — matching getGitDependencyInstallArgs in
+	// src/core/package-manager.ts. Only the default npm path gets npm flags.
+	if m.hasCustomNpmCommand() {
+		return m.runNpm(dir, "install")
+	}
+	return m.runNpm(dir, "install", "--omit=dev", "--ignore-scripts", "--no-audit", "--no-fund")
 }
 
 func packageNeedsInstall(dir string) (bool, error) {

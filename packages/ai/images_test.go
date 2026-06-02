@@ -193,6 +193,66 @@ func TestImageRegistryConcurrentAccess(t *testing.T) {
 	wg.Wait()
 }
 
+// TestGenerateImagesReleasesCombinedContext verifies the child context built
+// from the parent ctx and options.Signal is cancelled when GenerateImages
+// returns, so long-lived processes don't accumulate context/AfterFunc refs.
+func TestGenerateImagesReleasesCombinedContext(t *testing.T) {
+	provider := &ctxCapturingImagesProvider{}
+	RegisterImagesProvider("ctx-images", provider, "ctx-images-test")
+	defer UnregisterImagesProviders("ctx-images-test")
+	model := ImagesModel{Provider: "ctx-provider", ID: "ctx-model", API: "ctx-images"}
+
+	signal, cancelSignal := context.WithCancel(context.Background())
+	defer cancelSignal()
+	if _, err := GenerateImages(context.Background(), model, ImagesContext{Prompt: "hi"}, ImagesOptions{APIKey: "key", Signal: signal}); err != nil {
+		t.Fatal(err)
+	}
+	// The parent was never cancelled, so only the deferred cancel can have
+	// completed the captured child context.
+	if provider.ctx == nil {
+		t.Fatal("provider did not receive a context")
+	}
+	if provider.ctx.Err() == nil {
+		t.Fatal("combined context should be cancelled after GenerateImages returns")
+	}
+}
+
+// TestGenerateImagesSignalCancelsRequest verifies a cancelled options.Signal
+// cancels the derived request context even while the provider runs.
+func TestGenerateImagesSignalCancelsRequest(t *testing.T) {
+	provider := &ctxCapturingImagesProvider{block: true, started: make(chan struct{})}
+	RegisterImagesProvider("ctx-images", provider, "ctx-images-test")
+	defer UnregisterImagesProviders("ctx-images-test")
+	model := ImagesModel{Provider: "ctx-provider", ID: "ctx-model", API: "ctx-images"}
+
+	signal, cancelSignal := context.WithCancel(context.Background())
+	go func() {
+		<-provider.started
+		cancelSignal()
+	}()
+	if _, err := GenerateImages(context.Background(), model, ImagesContext{Prompt: "hi"}, ImagesOptions{APIKey: "key", Signal: signal}); err != nil {
+		t.Fatal(err)
+	}
+	if provider.ctx.Err() == nil {
+		t.Fatal("cancelled signal should cancel the derived request context")
+	}
+}
+
+type ctxCapturingImagesProvider struct {
+	ctx     context.Context
+	block   bool
+	started chan struct{}
+}
+
+func (p *ctxCapturingImagesProvider) Generate(ctx context.Context, model ImagesModel, _ ImagesContext, _ ImagesOptions) (AssistantImages, error) {
+	p.ctx = ctx
+	if p.block {
+		close(p.started)
+		<-ctx.Done()
+	}
+	return AssistantImages{API: model.API, Provider: model.Provider, Model: model.ID, StopReason: "stop"}, nil
+}
+
 type recordingImagesProvider struct{}
 
 func (recordingImagesProvider) Generate(_ context.Context, model ImagesModel, _ ImagesContext, options ImagesOptions) (AssistantImages, error) {

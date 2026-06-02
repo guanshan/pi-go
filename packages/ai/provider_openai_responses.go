@@ -39,7 +39,8 @@ func (r *ModelRegistry) openAIResponsesChat(ctx context.Context, req ChatRequest
 		applyOpenAICodexSSEFallbackDiagnostic(&response.Message, req)
 		return response, nil
 	}
-	raw, err := aiproviders.DoOpenAISDKJSONWithClient(ctx, url, key, headers, body, req.Model.API == "openai-responses", providerHTTPClient(req), providerRequestOptions(req))
+	bearerAuth := req.Model.API == "openai-responses" && req.Model.Provider != "cloudflare-ai-gateway"
+	raw, err := aiproviders.DoOpenAISDKJSONWithClient(ctx, url, key, headers, body, bearerAuth, providerHTTPClient(req), providerRequestOptions(req))
 	if err != nil {
 		return ChatResponse{}, err
 	}

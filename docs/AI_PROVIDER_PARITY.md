@@ -22,13 +22,23 @@ Responses transport: `websocket` and `websocket-cached` are accepted by pi-go
 but fall back to SSE with a `provider_transport_fallback` diagnostic; this is
 usable compatibility, not native WebSocket/cached transport parity.
 
-Next provider parity work should convert upstream TypeScript fixtures into Go
-golden tests for:
+Full request wire-shape goldens now exist for both major providers:
+`TestOpenAIChatPayloadGolden` (`openai_chat_payload.golden.json`) and
+`TestAnthropicMessagesPayloadGolden` (`anthropic_messages_payload.golden.json`),
+covering system blocks, multi-turn tool_use/tool_result content, tools,
+tool_choice, and cache_control. The Codex transport contract is covered by
+`TestValidateOpenAICodexResponsesTransport` (accept/reject) plus the SSE
+fallback diagnostic tests. Regenerate the payload goldens with `UPDATE_GOLDEN=1
+go test ./packages/ai/...`.
+
+Remaining provider parity work should convert more upstream TypeScript fixtures
+into Go golden tests for:
 
 - stream event ordering and partial JSON cleanup
-- tool call/result IDs and tool-result image routing
-- reasoning/thinking/cache-control fields
+- tool-result image routing for the OpenAI providers
+- reasoning/thinking wire-shape goldens (currently assertion-tested, not golden)
 - OAuth and API-key/env resolution edge cases
 - context overflow and retry classification
 - model catalog metadata such as context windows, cost, cache, and thinking
   support
+- native Codex WebSocket/cached transport (still SSE-only; highest-risk gap)

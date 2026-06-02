@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
 
 	"github.com/guanshan/pi-go/packages/ai"
@@ -36,16 +35,24 @@ func (t FindTool) Execute(ctx context.Context, raw json.RawMessage, _ ToolUpdate
 	if limit <= 0 {
 		limit = DefaultFindLimit
 	}
-	root := ResolveInCWD(t.CWD, firstNonEmpty(args.Path, "."))
+	root := ResolveToolPath(t.CWD, firstNonEmpty(args.Path, "."))
 	if _, err := os.Stat(root); err != nil {
 		return toolError(fmt.Sprintf("Path not found: %s", root))
 	}
 	var results []string
 	limitReached := false
-	_ = walkFiltered(root, func(path string, _ os.DirEntry) error {
+	// fd lists directories by default and emits results in traversal order (no
+	// sort). walkFiltered with includeDirs reports directories too; a matched
+	// directory keeps the trailing "/" fd would emit. WalkDir's lexical
+	// traversal stands in for fd's traversal order, so we do not re-sort.
+	_ = walkFiltered(root, true, func(path string, d os.DirEntry) error {
 		if globMatch(args.Pattern, path, root) {
 			rel, _ := filepath.Rel(root, path)
-			results = append(results, filepath.ToSlash(rel))
+			out := filepath.ToSlash(rel)
+			if d.IsDir() {
+				out += "/"
+			}
+			results = append(results, out)
 			if len(results) >= limit {
 				limitReached = true
 				return filepath.SkipAll
@@ -53,7 +60,6 @@ func (t FindTool) Execute(ctx context.Context, raw json.RawMessage, _ ToolUpdate
 		}
 		return nil
 	})
-	sort.Strings(results)
 	if len(results) == 0 {
 		return ai.ToolResult{Content: ai.TextBlocks("No files found matching pattern")}
 	}
@@ -64,7 +70,7 @@ func (t FindTool) Execute(ctx context.Context, raw json.RawMessage, _ ToolUpdate
 	notices := []string{}
 	if limitReached {
 		details["resultLimitReached"] = limit
-		notices = append(notices, fmt.Sprintf("%d results limit reached", limit))
+		notices = append(notices, fmt.Sprintf("%d results limit reached. Use limit=%d for more, or refine pattern", limit, limit*2))
 	}
 	if trunc.Truncated {
 		details["truncation"] = trunc

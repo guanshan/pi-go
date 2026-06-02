@@ -49,3 +49,26 @@ live in the upstream `TUI`/renderer layer:
 See [`packages/tui/README.md`](../packages/tui/README.md) for the
 component-by-component decision record (what was kept, replaced, or removed),
 and [`ARCHITECTURE.md`](./ARCHITECTURE.md) for the overall package layout.
+
+## Current interactive parity status
+
+The Bubble Tea shell works, but several interactions are still text fallbacks
+rather than the navigable overlays/dropdowns of the TypeScript TUI. This is the
+honest current state (parity review P1-3), pending the generic
+selector/dialog/overlay state machine the section above calls for:
+
+| Interaction | Current Go behavior | TS target |
+| --- | --- | --- |
+| `/model`, `/scoped-models` | prints a list | navigable selector |
+| `/settings` | dumps JSON | editable settings list |
+| `/resume` | numbered list prompt | navigable session picker |
+| `/tree`, `/fork` | text tree / argument flow | interactive tree navigation |
+| `/login` | line-based prompt | OAuth selector overlay |
+| `pi config` | numeric line selection | navigable settings list |
+| autocomplete | slash / model / prompt / skill prefix match | + path, `@`-refs, extension providers, navigable dropdown |
+| keybindings | a few hardcoded keys (Esc/Ctrl+C, double-Esc) | `KeybindingsManager` + user `keybindings.json` |
+| extension `ctx.ui` | degraded stub (see [EXTENSIONS_DESIGN.md](EXTENSIONS_DESIGN.md)) | full overlay-backed UI |
+
+Escape now cancels a running slash/bash command (not just an agent turn) — see
+`interactiveModel.handleEscape` — but the rest of the overlay/selector work
+remains a dedicated effort.

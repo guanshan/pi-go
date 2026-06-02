@@ -2,6 +2,7 @@ package tui
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/binary"
 	"fmt"
@@ -10,9 +11,11 @@ import (
 	"image/jpeg"
 	"image/png"
 	"os"
+	"os/exec"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 type ImageProtocol string
@@ -117,13 +120,24 @@ func DetectCapabilities() TerminalCapabilities {
 }
 
 func DetectCapabilitiesFromEnv(env map[string]string) TerminalCapabilities {
+	return DetectCapabilitiesFromEnvWithTmuxProbe(env, probeTmuxHyperlinks)
+}
+
+func DetectCapabilitiesFromEnvWithTmuxProbe(env map[string]string, tmuxForwardsHyperlinks func() bool) TerminalCapabilities {
 	termProgram := strings.ToLower(env["TERM_PROGRAM"])
 	terminalEmulator := strings.ToLower(env["TERMINAL_EMULATOR"])
 	term := strings.ToLower(env["TERM"])
 	colorTerm := strings.ToLower(env["COLORTERM"])
 	hasTrueColorHint := colorTerm == "truecolor" || colorTerm == "24bit"
-	inMultiplexer := env["TMUX"] != "" || strings.HasPrefix(term, "tmux") || strings.HasPrefix(term, "screen")
-	if inMultiplexer {
+	inTmux := env["TMUX"] != "" || strings.HasPrefix(term, "tmux")
+	if inTmux {
+		hyperlinks := false
+		if tmuxForwardsHyperlinks != nil {
+			hyperlinks = tmuxForwardsHyperlinks()
+		}
+		return normalizeCapabilities(TerminalCapabilities{TrueColor: hasTrueColorHint, Hyperlinks: hyperlinks})
+	}
+	if strings.HasPrefix(term, "screen") {
 		return normalizeCapabilities(TerminalCapabilities{TrueColor: hasTrueColorHint, Hyperlinks: false})
 	}
 	if env["KITTY_WINDOW_ID"] != "" || termProgram == "kitty" {
@@ -159,6 +173,21 @@ func DetectCapabilitiesFromEnv(env map[string]string) TerminalCapabilities {
 		return normalizeCapabilities(TerminalCapabilities{TrueColor: true, Hyperlinks: true})
 	}
 	return normalizeCapabilities(TerminalCapabilities{TrueColor: hasTrueColorHint, Hyperlinks: false})
+}
+
+func probeTmuxHyperlinks() bool {
+	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "tmux", "display-message", "-p", "#{client_termfeatures}").Output()
+	if err != nil {
+		return false
+	}
+	for _, feature := range strings.Split(string(out), ",") {
+		if strings.TrimSpace(feature) == "hyperlinks" {
+			return true
+		}
+	}
+	return false
 }
 
 func normalizeCapabilities(c TerminalCapabilities) TerminalCapabilities {
@@ -345,7 +374,30 @@ func EncodeKitty(data []byte, options ImageRenderOptions) string {
 	if id > 0 {
 		params = append(params, fmt.Sprintf("i=%d", id))
 	}
-	return fmt.Sprintf("\x1b_G%s;%s\x1b\\", strings.Join(params, ","), base64.StdEncoding.EncodeToString(data))
+	base64Data := base64.StdEncoding.EncodeToString(data)
+	const chunkSize = 4096
+	if len(base64Data) <= chunkSize {
+		return fmt.Sprintf("\x1b_G%s;%s\x1b\\", strings.Join(params, ","), base64Data)
+	}
+	var b strings.Builder
+	for offset, first := 0, true; offset < len(base64Data); first = false {
+		end := offset + chunkSize
+		if end > len(base64Data) {
+			end = len(base64Data)
+		}
+		chunk := base64Data[offset:end]
+		last := end == len(base64Data)
+		switch {
+		case first:
+			b.WriteString(fmt.Sprintf("\x1b_G%s,m=1;%s\x1b\\", strings.Join(params, ","), chunk))
+		case last:
+			b.WriteString(fmt.Sprintf("\x1b_Gm=0;%s\x1b\\", chunk))
+		default:
+			b.WriteString(fmt.Sprintf("\x1b_Gm=1;%s\x1b\\", chunk))
+		}
+		offset = end
+	}
+	return b.String()
 }
 
 func EncodeITerm2(data []byte, name string) string {

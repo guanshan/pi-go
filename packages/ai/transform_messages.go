@@ -150,14 +150,24 @@ func transformAssistantMessage(message AssistantMessage, model Model, normalizeT
 	return message
 }
 
+// assistantMatchesModel reports whether a historical assistant message was
+// produced by exactly the model we are now sending to. This mirrors the TS
+// strict three-field identity check in transform-messages.ts:92-95
+// (provider === model.provider && api === model.api && model === model.id).
+//
+// The comparison is intentionally strict: an empty API or an API that merely
+// equals the provider name does NOT count as the same model. Treating those as
+// the same model would replay encrypted reasoning / provider signatures
+// (OpenAI encrypted reasoning, Anthropic thinking signatures, thoughtSignature)
+// to a provider that never produced them, triggering API errors such as
+// OpenAI "reasoning without following item" or Anthropic invalid signature.
+// Persisted assistant messages always carry a non-empty api (it is a required
+// field upstream and is set by NewAssistantMessage), so there is no legitimate
+// empty-API source that needs a loose escape hatch here.
 func assistantMatchesModel(message AssistantMessage, model Model) bool {
-	if message.Provider != model.Provider || message.Model != model.ID {
-		return false
-	}
-	if message.API == "" || message.API == model.API || message.API == model.Provider {
-		return true
-	}
-	return false
+	return message.Provider == model.Provider &&
+		message.API == model.API &&
+		message.Model == model.ID
 }
 
 func assistantToolCalls(message AssistantMessage) []ToolCall {

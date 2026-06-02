@@ -33,3 +33,23 @@ func killProcessGroup(cmd *exec.Cmd) {
 		_ = cmd.Process.Kill()
 	}
 }
+
+// killProcessTreeByPID SIGKILLs the process group led by pid (negative pid),
+// falling back to the single process. Used to reap tracked detached children on
+// shutdown when only the pid is known. Mirrors killProcessTree in shell.ts.
+func killProcessTreeByPID(pid int) {
+	if pid <= 0 {
+		return
+	}
+	if err := syscall.Kill(-pid, syscall.SIGKILL); err != nil {
+		_ = syscall.Kill(pid, syscall.SIGKILL)
+	}
+}
+
+func processGroupStillAlive(pid int) bool {
+	if pid <= 0 {
+		return false
+	}
+	err := syscall.Kill(-pid, 0)
+	return err == nil || err == syscall.EPERM
+}

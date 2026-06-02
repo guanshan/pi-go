@@ -447,10 +447,13 @@ func ProviderEnvKeys(provider string) []string {
 
 func writeJSON(path string, value any) error {
 	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	// Auth state holds OAuth/API-key credentials, so the containing directory
+	// must not be world-traversable (mode 0o700, as in src/core/auth-storage.ts).
+	if err := ensurePrivateDir(dir); err != nil {
 		return err
 	}
-	data, err := json.MarshalIndent(value, "", "\t")
+	// TS writes auth.json with 2-space indent (auth-storage.ts:219,290,447).
+	data, err := json.MarshalIndent(value, "", "  ")
 	if err != nil {
 		return err
 	}
@@ -479,4 +482,11 @@ func writeJSON(path string, value any) error {
 		return err
 	}
 	return os.Rename(tmpName, path)
+}
+
+func ensurePrivateDir(dir string) error {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	return os.Chmod(dir, 0o700)
 }

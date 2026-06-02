@@ -92,6 +92,9 @@ func VisibleWidth(s string) int {
 // clusterWidth returns the cell width of a single grapheme cluster. Control
 // characters (other than tab, handled by callers) contribute 0.
 func clusterWidth(cluster string) int {
+	if isRegionalIndicatorCluster(cluster) {
+		return 2
+	}
 	w := uniseg.StringWidth(cluster)
 	if w > 0 {
 		return w
@@ -103,6 +106,18 @@ func clusterWidth(cluster string) int {
 		}
 	}
 	return w
+}
+
+func isRegionalIndicatorCluster(cluster string) bool {
+	if cluster == "" {
+		return false
+	}
+	for _, r := range cluster {
+		if r < 0x1F1E6 || r > 0x1F1FF {
+			return false
+		}
+	}
+	return true
 }
 
 // TruncateToWidth truncates s to the given visible width, appending suffix

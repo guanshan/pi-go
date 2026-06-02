@@ -40,6 +40,8 @@ type AgentSession struct {
 	branchSummaryCancel            context.CancelFunc
 	retryCancel                    context.CancelFunc
 	extensionRuntime               *coreext.Runner
+	mutatedToolArgs                map[string]json.RawMessage
+	mutatedToolInputs              map[string]any
 	disposed                       bool
 	scopedModels                   []ScopedModel
 	nextSessionListenerID          uint64
@@ -126,13 +128,18 @@ func (a *AgentSession) newLoopAgent(sink ai.EventSink, maxLoopHit *bool, persist
 			SystemPrompt:  a.SystemPrompt,
 			Model:         a.Model,
 			ThinkingLevel: a.ThinkingLevel,
-			Tools:         agentTools(a.Tools),
+			Tools:         agentTools(a, a.Tools),
 			Messages:      sessionCtx.Messages,
 		},
 		Registry:      a.Registry,
 		SteeringMode:  queueMode(a.steeringMode),
 		FollowUpMode:  queueMode(a.followUpMode),
 		ToolExecution: agentcore.ToolExecutionSequential,
+		// Run the extension runner's tool_call/tool_result handlers as part of the
+		// execution chain so security extensions (permission-gate, protected-paths)
+		// can block, mutate, or override tool calls instead of merely observing them.
+		BeforeToolCall: a.beforeExtensionToolCall,
+		AfterToolCall:  a.afterExtensionToolCall,
 		ShouldStopAfterTurn: func(ctx context.Context, turn agentcore.ShouldStopAfterTurnContext) (bool, error) {
 			turnCount++
 			if turnCount >= DefaultAgentMaxLoop && len(turn.ToolResults) > 0 {
@@ -141,6 +148,20 @@ func (a *AgentSession) newLoopAgent(sink ai.EventSink, maxLoopHit *bool, persist
 			}
 			return false, nil
 		},
+	}
+	// Mirror sdk.ts:383,391-393: wire the session id, transport, thinking
+	// budgets, and provider retry-delay cap into the agent so the prompt-cache
+	// key, session-affinity headers, transport selection, custom thinking
+	// budget_tokens, and the provider retry-delay ceiling actually take effect.
+	// SessionID is read here (per newLoopAgent construction, i.e. each run) so it
+	// reflects the current session after /new, /fork, or session switches.
+	if a.Session != nil {
+		opts.SessionID = a.Session.SessionID()
+	}
+	if a.Settings != nil {
+		opts.Transport = a.Settings.Transport()
+		opts.ThinkingBudgets = a.Settings.ThinkingBudgets()
+		opts.MaxRetryDelayMs = a.Settings.ProviderRetryMaxDelayMS()
 	}
 	if a.Settings != nil && a.Settings.BlockImages() {
 		streamFn := agentcore.DefaultStreamFn(a.Registry)
@@ -229,7 +250,7 @@ func agentEvent(event agentcore.AgentEvent) ai.Event {
 	return out
 }
 
-func agentTools(tools ToolSet) []agentcore.AgentTool {
+func agentTools(session *AgentSession, tools ToolSet) []agentcore.AgentTool {
 	names := make([]string, 0, len(tools))
 	for name := range tools {
 		names = append(names, name)
@@ -237,13 +258,14 @@ func agentTools(tools ToolSet) []agentcore.AgentTool {
 	sort.Strings(names)
 	out := make([]agentcore.AgentTool, 0, len(names))
 	for _, name := range names {
-		out = append(out, agentToolAdapter{tool: tools[name]})
+		out = append(out, agentToolAdapter{session: session, tool: tools[name]})
 	}
 	return out
 }
 
 type agentToolAdapter struct {
-	tool catools.RuntimeTool
+	session *AgentSession
+	tool    catools.RuntimeTool
 }
 
 func (t agentToolAdapter) Name() string { return t.tool.Name() }
@@ -278,6 +300,12 @@ func (t agentToolAdapter) Execute(ctx context.Context, raw json.RawMessage, onUp
 			err = nil
 		}
 	}()
+	// Substitute any arguments a tool_call extension handler mutated in place. The
+	// framework froze the raw bytes before the BeforeToolCall hook ran, so the
+	// patched input is applied here at execution time.
+	if t.session != nil {
+		raw = t.session.consumeMutatedToolArgs(raw)
+	}
 	toolResult := t.tool.Execute(ctx, raw, update)
 	return agentcore.AgentToolResult{Content: toolResult.Content, Details: toolResult.Details, IsError: toolResult.IsError}, nil
 }
@@ -479,8 +507,32 @@ func (a *AgentSession) SetSessionName(name string) error {
 	return nil
 }
 
+// Compact manually compacts the session context.
+//
+// Deprecated: prefer CompactWithContext so the caller can cancel the manual
+// compaction with its own request context. Compact delegates to
+// CompactWithContext(context.Background(), ...).
 func (a *AgentSession) Compact(customInstructions string, sink ai.EventSink) (map[string]any, error) {
-	return a.compact(context.Background(), CompactionManual, customInstructions, sink)
+	return a.CompactWithContext(context.Background(), customInstructions, sink)
+}
+
+// CompactWithContext manually compacts the session context. It first aborts any
+// active agent operation so the compaction is the sole writer to the session,
+// mirroring AgentSession.compact in agent-session.ts (which calls
+// _disconnectFromAgent()/abort() before starting its own abort controller).
+// The provided ctx cancels the manual compaction, including the
+// session_before_compact extension hook and the provider compact request.
+func (a *AgentSession) CompactWithContext(ctx context.Context, customInstructions string, sink ai.EventSink) (map[string]any, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	// Abort the active agent run (and wait for it to go idle) before taking
+	// over the session, so a streaming prompt cannot interleave session
+	// entries with the compaction.
+	if err := a.Abort(ctx); err != nil {
+		return nil, err
+	}
+	return a.compact(ctx, CompactionManual, customInstructions, sink)
 }
 
 func ClampThinking(model ai.Model, level ai.ThinkingLevel) ai.ThinkingLevel {

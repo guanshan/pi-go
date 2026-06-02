@@ -46,22 +46,26 @@ type ImagesOptions struct {
 	Metadata        map[string]any                                       `json:"metadata,omitempty"`
 }
 
-func (options ImagesOptions) Context(ctx context.Context) context.Context {
+// Context derives the request context from the parent ctx and the optional
+// options.Signal. The returned CancelFunc must be called by the caller (it is
+// never nil) to release the child context, the deadline timer, and any
+// context.AfterFunc registration created while combining the two sources.
+func (options ImagesOptions) Context(ctx context.Context) (context.Context, context.CancelFunc) {
 	if ctx != nil {
 		return combineContexts(ctx, options.Signal)
 	}
 	if options.Signal != nil {
-		return options.Signal
+		return options.Signal, func() {}
 	}
-	return context.Background()
+	return context.Background(), func() {}
 }
 
-func combineContexts(parent, signal context.Context) context.Context {
+func combineContexts(parent, signal context.Context) (context.Context, context.CancelFunc) {
 	if parent == nil {
 		parent = context.Background()
 	}
 	if signal == nil {
-		return parent
+		return parent, func() {}
 	}
 	var (
 		ctx    context.Context
@@ -76,11 +80,13 @@ func combineContexts(parent, signal context.Context) context.Context {
 		ctx, cancel = context.WithCancel(parent)
 	}
 	stopSignal := context.AfterFunc(signal, cancel)
-	context.AfterFunc(ctx, func() {
+	// Returned to the caller so a successful request can release the child
+	// context and unregister the signal watcher instead of leaking them until
+	// the parent is cancelled.
+	return ctx, func() {
 		stopSignal()
 		cancel()
-	})
-	return ctx
+	}
 }
 
 type GeneratedImage struct {
@@ -234,7 +240,8 @@ func GetImageProviders() []string {
 }
 
 func GenerateImages(ctx context.Context, model ImagesModel, imageContext ImagesContext, options ImagesOptions) (AssistantImages, error) {
-	ctx = options.Context(ctx)
+	ctx, cancel := options.Context(ctx)
+	defer cancel()
 	provider := GetImagesProvider(model.API)
 	if provider == nil {
 		return AssistantImages{}, fmt.Errorf("no images provider registered for api %q", model.API)

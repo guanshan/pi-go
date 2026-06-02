@@ -254,18 +254,40 @@ func NormalizeIDPart(part string) string {
 	return strings.TrimRight(b.String(), "_")
 }
 
-func ResponsesTextMessageID(signature string, index int) string {
-	if signature != "" {
+// ResponsesTextMessageID resolves the id for an assistant text item. When the
+// text block carries a v1 signature its id is used as-is, falling back to a
+// short hash when it exceeds OpenAI's 64-character limit (a hash, not a
+// truncation, so distinct ids cannot collide). Without a usable signature id, a
+// per-message/per-text-block fallback id is generated so multiple text blocks
+// in one turn stay unique. Mirrors openai-responses-shared.ts.
+func ResponsesTextMessageID(signature string, messageIndex, textBlockIndex int) string {
+	id := responsesTextSignatureID(signature)
+	if id == "" {
+		if textBlockIndex == 0 {
+			return fmt.Sprintf("msg_pi_%d", messageIndex)
+		}
+		return fmt.Sprintf("msg_pi_%d_%d", messageIndex, textBlockIndex)
+	}
+	if len([]rune(id)) > 64 {
+		return "msg_" + MistralShortHash(id)
+	}
+	return id
+}
+
+func responsesTextSignatureID(signature string) string {
+	if signature == "" {
+		return ""
+	}
+	if strings.HasPrefix(signature, "{") {
 		var parsed struct {
 			Version int    `json:"v"`
 			ID      string `json:"id"`
 		}
 		if json.Unmarshal([]byte(signature), &parsed) == nil && parsed.Version == 1 && parsed.ID != "" {
-			return NormalizeIDPart(parsed.ID)
+			return parsed.ID
 		}
-		return NormalizeIDPart(signature)
 	}
-	return fmt.Sprintf("msg_%d", index)
+	return signature
 }
 
 func ResponsesToolCallIDParts(id string) (string, string) {

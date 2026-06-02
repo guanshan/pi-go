@@ -9,11 +9,13 @@ import (
 	"os"
 	"sort"
 	"strings"
+	"time"
 
 	"charm.land/bubbles/v2/textarea"
 	"charm.land/bubbles/v2/viewport"
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
+	agentcore "github.com/guanshan/pi-go/packages/agent"
 	"github.com/guanshan/pi-go/packages/ai"
 	catools "github.com/guanshan/pi-go/packages/coding-agent/core/tools"
 	"github.com/guanshan/pi-go/packages/tui"
@@ -54,21 +56,77 @@ type interactiveCommandDoneMsg struct {
 	Quit   bool
 }
 
+type interactiveQueueDoneMsg struct {
+	Err error
+}
+
+type interactiveAbortDoneMsg struct {
+	Err error
+}
+
+type interactiveSessionEventMsg struct {
+	Event SessionEvent
+}
+
+type interactiveBusyKind string
+
+const (
+	interactiveBusyNone    interactiveBusyKind = ""
+	interactiveBusyAgent   interactiveBusyKind = "agent"
+	interactiveBusyCommand interactiveBusyKind = "command"
+)
+
+type interactiveQueuedInput struct {
+	Text   string
+	Images []ai.ContentBlock
+}
+
 type interactiveModel struct {
-	ctx           context.Context
-	runtime       *AgentSessionRuntime
-	post          func(tea.Msg)
-	input         textarea.Model
-	viewport      viewport.Model
-	messages      []interactiveMessage
-	busy          bool
-	width         int
-	height        int
-	assistantSlot int
-	autoScroll    bool
-	initial       string
-	initialImages []ai.ContentBlock
-	initialQueue  []string
+	ctx                context.Context
+	runtime            *AgentSessionRuntime
+	post               func(tea.Msg)
+	input              textarea.Model
+	viewport           viewport.Model
+	messages           []interactiveMessage
+	busy               bool
+	busyKind           interactiveBusyKind
+	width              int
+	height             int
+	assistantSlot      int
+	autoScroll         bool
+	initial            string
+	initialImages      []ai.ContentBlock
+	initialQueue       []string
+	localQueue         []interactiveQueuedInput
+	queuedSteering     []string
+	queuedFollowUp     []string
+	lastCtrlC          time.Time
+	lastEscape         time.Time
+	statusMessage      string
+	toolSlots          map[string]int
+	sessionUnsubscribe func()
+	commandCancel      context.CancelFunc
+}
+
+// beginCommand derives a per-command child context from m.ctx and records its
+// cancel func so Escape can interrupt a running slash/bash command. The returned
+// context is captured by the command goroutine; m.commandCancel is only touched
+// from the Bubble Tea update loop.
+func (m *interactiveModel) beginCommand() context.Context {
+	m.clearCommandCancel()
+	ctx, cancel := context.WithCancel(m.ctx)
+	m.commandCancel = cancel
+	return ctx
+}
+
+// clearCommandCancel cancels and forgets any pending per-command context. Calling
+// cancel after the command already finished is a no-op that just releases the
+// context's resources.
+func (m *interactiveModel) clearCommandCancel() {
+	if m.commandCancel != nil {
+		m.commandCancel()
+		m.commandCancel = nil
+	}
 }
 
 var (
@@ -183,6 +241,17 @@ func newInteractiveModel(ctx context.Context, runtime *AgentSessionRuntime, init
 		initial:       initial,
 		initialImages: append([]ai.ContentBlock(nil), images...),
 		initialQueue:  append([]string(nil), remaining...),
+		toolSlots:     map[string]int{},
+	}
+	model.bindSession(agent)
+	if runtime != nil {
+		runtime.SetBeforeSessionInvalidate(func() {
+			model.unbindSession()
+		})
+		runtime.SetRebindSession(func(agent *AgentSession) error {
+			model.bindSession(agent)
+			return nil
+		})
 	}
 	model.messages = append(model.messages, interactiveMessage{
 		Role: interactiveRoleSystem,
@@ -201,10 +270,12 @@ func (m *interactiveModel) Init() tea.Cmd {
 		}
 		m.appendMessage(interactiveRoleUser, text)
 		m.busy = true
+		m.busyKind = interactiveBusyAgent
 		cmds = append(cmds, m.runAgentPrompt(m.initial, m.initialImages))
 	} else if next, ok := m.popInitialQueue(); ok {
 		m.appendMessage(interactiveRoleUser, next)
 		m.busy = true
+		m.busyKind = interactiveBusyAgent
 		cmds = append(cmds, m.runAgentPrompt(next, nil))
 	}
 	m.refreshViewport()
@@ -217,7 +288,17 @@ func (m *interactiveModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.KeyPressMsg:
 		switch msg.String() {
 		case "ctrl+c":
-			return m, tea.Quit
+			cmd = m.handleCtrlC()
+			m.refreshViewport()
+			return m, cmd
+		case "ctrl+d":
+			if strings.TrimSpace(m.input.Value()) == "" {
+				return m, tea.Quit
+			}
+		case "esc":
+			cmd = m.handleEscape()
+			m.refreshViewport()
+			return m, cmd
 		case "pgup":
 			m.autoScroll = false
 			m.viewport.PageUp()
@@ -239,8 +320,12 @@ func (m *interactiveModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.input.InsertString("\n")
 			m.refreshViewport()
 			return m, nil
+		case "alt+enter":
+			cmd = m.submitInputWithBehavior(StreamingFollowUp)
+			m.refreshViewport()
+			return m, cmd
 		case "enter":
-			cmd = m.submitInput()
+			cmd = m.submitInputWithBehavior("")
 			m.refreshViewport()
 			return m, cmd
 		}
@@ -253,9 +338,30 @@ func (m *interactiveModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.applyAgentEvent(msg.Event)
 		m.refreshViewport()
 		return m, nil
+	case interactiveSessionEventMsg:
+		m.applySessionEvent(msg.Event)
+		m.refreshViewport()
+		return m, nil
+	case interactiveQueueDoneMsg:
+		if msg.Err != nil {
+			m.appendMessage(interactiveRoleError, msg.Err.Error())
+		}
+		m.refreshViewport()
+		return m, nil
+	case interactiveAbortDoneMsg:
+		if msg.Err != nil {
+			m.appendMessage(interactiveRoleError, msg.Err.Error())
+		} else {
+			m.setStatus("Abort requested.")
+		}
+		m.refreshViewport()
+		return m, nil
 	case interactivePromptDoneMsg:
 		m.busy = false
+		m.busyKind = interactiveBusyNone
 		m.assistantSlot = -1
+		m.queuedSteering = nil
+		m.queuedFollowUp = nil
 		if msg.Err != nil {
 			m.appendMessage(interactiveRoleError, msg.Err.Error())
 		}
@@ -263,14 +369,21 @@ func (m *interactiveModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if next, ok := m.popInitialQueue(); ok {
 				m.appendMessage(interactiveRoleUser, next)
 				m.busy = true
+				m.busyKind = interactiveBusyAgent
 				m.refreshViewport()
 				return m, m.runAgentPrompt(next, nil)
 			}
+		}
+		if cmd, ok := m.popLocalQueuedCommand(); ok {
+			m.refreshViewport()
+			return m, cmd
 		}
 		m.refreshViewport()
 		return m, nil
 	case interactiveCommandDoneMsg:
 		m.busy = false
+		m.busyKind = interactiveBusyNone
+		m.clearCommandCancel()
 		if strings.TrimSpace(msg.Stdout) != "" {
 			m.appendMessage(interactiveRoleSystem, strings.TrimSpace(msg.Stdout))
 		}
@@ -283,6 +396,9 @@ func (m *interactiveModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.refreshViewport()
 		if msg.Quit {
 			return m, tea.Quit
+		}
+		if cmd, ok := m.popLocalQueuedCommand(); ok {
+			return m, cmd
 		}
 		return m, nil
 	}
@@ -314,10 +430,17 @@ func (m *interactiveModel) View() tea.View {
 		parts = append(parts, suggestions)
 	}
 	parts = append(parts, input, footer)
-	return tea.NewView(strings.Join(parts, "\n"))
+	view := tea.NewView(strings.Join(parts, "\n"))
+	view.KeyboardEnhancements.ReportEventTypes = true
+	view.KeyboardEnhancements.ReportAlternateKeys = true
+	return view
 }
 
 func (m *interactiveModel) submitInput() tea.Cmd {
+	return m.submitInputWithBehavior("")
+}
+
+func (m *interactiveModel) submitInputWithBehavior(behavior StreamingBehavior) tea.Cmd {
 	raw := m.input.Value()
 	text := strings.TrimSpace(raw)
 	if text == "" {
@@ -325,19 +448,65 @@ func (m *interactiveModel) submitInput() tea.Cmd {
 	}
 	m.input.Reset()
 	m.autoScroll = true
-	m.appendMessage(interactiveRoleUser, text)
 	if m.busy {
-		m.appendMessage(interactiveRoleSystem, "A turn is still running. Wait for it to finish, then send the next message.")
-		return nil
+		return m.queueBusyInput(text, behavior)
 	}
+	m.appendMessage(interactiveRoleUser, text)
 	m.busy = true
 	switch {
 	case strings.HasPrefix(text, "/"):
-		return m.runSlashCommand(text)
+		m.busyKind = interactiveBusyCommand
+		return m.runSlashCommand(m.beginCommand(), text)
 	case strings.HasPrefix(text, "!"):
-		return m.runBashCommand(text)
+		m.busyKind = interactiveBusyCommand
+		return m.runBashCommand(m.beginCommand(), text)
 	default:
+		m.busyKind = interactiveBusyAgent
 		return m.runAgentPrompt(text, nil)
+	}
+}
+
+func (m *interactiveModel) queueBusyInput(text string, behavior StreamingBehavior) tea.Cmd {
+	m.appendMessage(interactiveRoleUser, text)
+	if strings.HasPrefix(text, "/") || strings.HasPrefix(text, "!") || m.busyKind != interactiveBusyAgent {
+		m.localQueue = append(m.localQueue, interactiveQueuedInput{Text: text})
+		m.setStatus("Queued until the current command finishes.")
+		return nil
+	}
+	if behavior == "" {
+		behavior = StreamingSteer
+	}
+	switch behavior {
+	case StreamingFollowUp:
+		m.queuedFollowUp = append(m.queuedFollowUp, text)
+		m.setStatus("Queued as follow-up.")
+	default:
+		behavior = StreamingSteer
+		m.queuedSteering = append(m.queuedSteering, text)
+		m.setStatus("Sent as steering input.")
+	}
+	return m.runQueuePrompt(text, nil, behavior)
+}
+
+func (m *interactiveModel) popLocalQueuedCommand() (tea.Cmd, bool) {
+	if len(m.localQueue) == 0 {
+		return nil, false
+	}
+	next := m.localQueue[0]
+	copy(m.localQueue, m.localQueue[1:])
+	m.localQueue[len(m.localQueue)-1] = interactiveQueuedInput{}
+	m.localQueue = m.localQueue[:len(m.localQueue)-1]
+	m.busy = true
+	switch {
+	case strings.HasPrefix(next.Text, "/"):
+		m.busyKind = interactiveBusyCommand
+		return m.runSlashCommand(m.beginCommand(), next.Text), true
+	case strings.HasPrefix(next.Text, "!"):
+		m.busyKind = interactiveBusyCommand
+		return m.runBashCommand(m.beginCommand(), next.Text), true
+	default:
+		m.busyKind = interactiveBusyAgent
+		return m.runAgentPrompt(next.Text, next.Images), true
 	}
 }
 
@@ -347,7 +516,7 @@ func (m *interactiveModel) runAgentPrompt(text string, images []ai.ContentBlock)
 		if err != nil {
 			return interactivePromptDoneMsg{Err: err}
 		}
-		err = agent.Prompt(m.ctx, text, images, func(event ai.Event) {
+		err = agent.Send(m.ctx, text, images, "", nil, func(event ai.Event) {
 			if m.post != nil {
 				m.post(interactiveAgentEventMsg{Event: event})
 			}
@@ -356,11 +525,37 @@ func (m *interactiveModel) runAgentPrompt(text string, images []ai.ContentBlock)
 	}
 }
 
-func (m *interactiveModel) runSlashCommand(line string) tea.Cmd {
+func (m *interactiveModel) runQueuePrompt(text string, images []ai.ContentBlock, behavior StreamingBehavior) tea.Cmd {
+	return func() tea.Msg {
+		agent, err := runtimeAgent(m.runtime)
+		if err != nil {
+			return interactiveQueueDoneMsg{Err: err}
+		}
+		switch behavior {
+		case StreamingFollowUp:
+			err = agent.FollowUp(m.ctx, text, images)
+		default:
+			err = agent.Steer(m.ctx, text, images)
+		}
+		return interactiveQueueDoneMsg{Err: err}
+	}
+}
+
+func (m *interactiveModel) runAbort() tea.Cmd {
+	return func() tea.Msg {
+		agent, err := runtimeAgent(m.runtime)
+		if err != nil {
+			return interactiveAbortDoneMsg{Err: err}
+		}
+		return interactiveAbortDoneMsg{Err: agent.Abort(m.ctx)}
+	}
+}
+
+func (m *interactiveModel) runSlashCommand(ctx context.Context, line string) tea.Cmd {
 	return func() tea.Msg {
 		var stdout bytes.Buffer
 		var stderr bytes.Buffer
-		done, err := handleSlashWithPrompt(m.ctx, m.runtime, line, nil, &stdout, &stderr)
+		done, err := handleSlashWithPrompt(ctx, m.runtime, line, nil, &stdout, &stderr)
 		return interactiveCommandDoneMsg{
 			Stdout: stdout.String(),
 			Stderr: stderr.String(),
@@ -370,7 +565,7 @@ func (m *interactiveModel) runSlashCommand(line string) tea.Cmd {
 	}
 }
 
-func (m *interactiveModel) runBashCommand(line string) tea.Cmd {
+func (m *interactiveModel) runBashCommand(ctx context.Context, line string) tea.Cmd {
 	return func() tea.Msg {
 		agent, err := runtimeAgent(m.runtime)
 		if err != nil {
@@ -381,7 +576,7 @@ func (m *interactiveModel) runBashCommand(line string) tea.Cmd {
 		if command == "" {
 			return interactiveCommandDoneMsg{Err: errorsString("empty bash command")}
 		}
-		result := (catools.BashTool{CWD: agent.Session.CWD()}).Execute(m.ctx, mustJSON(map[string]any{"command": command}), nil)
+		result := (catools.BashTool{CWD: agent.Session.CWD(), BinDir: BinDir()}).Execute(ctx, mustJSON(map[string]any{"command": command}), nil)
 		text := ai.MessageText(ai.ToolResultMessage{Content: result.Content})
 		exit := 0
 		if result.IsError {
@@ -397,19 +592,27 @@ func (m *interactiveModel) runBashCommand(line string) tea.Cmd {
 
 func (m *interactiveModel) applyAgentEvent(event ai.Event) {
 	switch event["type"] {
+	case "agent_start":
+		m.busy = true
+		m.busyKind = interactiveBusyAgent
+	case "agent_end":
+		m.busyKind = interactiveBusyNone
 	case "tool_execution_start":
 		name := fmt.Sprint(event["toolName"])
 		if strings.TrimSpace(name) == "" || name == "<nil>" {
 			name = "tool"
 		}
 		m.assistantSlot = -1
-		m.appendMessage(interactiveRoleTool, "["+name+"]")
+		slot := m.appendMessage(interactiveRoleTool, "["+name+"]")
+		if id := strings.TrimSpace(fmt.Sprint(event["toolCallId"])); id != "" && id != "<nil>" {
+			m.toolSlots[id] = slot
+		}
+	case "tool_execution_update":
+		m.updateToolResult(event, "partialResult")
 	case "tool_execution_end":
-		if result, ok := event["result"].(ai.ToolResult); ok {
-			text := strings.TrimSpace(ai.MessageText(ai.ToolResultMessage{Content: result.Content}))
-			if text != "" {
-				m.appendMessage(interactiveRoleTool, text)
-			}
+		m.updateToolResult(event, "result")
+		if id := strings.TrimSpace(fmt.Sprint(event["toolCallId"])); id != "" {
+			delete(m.toolSlots, id)
 		}
 	case "message_update":
 		if assistantEvent, ok := event["assistantMessageEvent"].(ai.AssistantMessageEvent); ok && assistantEvent.Type == "text_delta" && assistantEvent.Delta != "" {
@@ -426,6 +629,70 @@ func (m *interactiveModel) applyAgentEvent(event ai.Event) {
 	}
 }
 
+func (m *interactiveModel) updateToolResult(event ai.Event, key string) {
+	result, ok := interactiveToolResult(event[key])
+	if !ok {
+		return
+	}
+	text := strings.TrimSpace(ai.MessageText(ai.ToolResultMessage{Content: result.Content}))
+	if text == "" {
+		return
+	}
+	id := strings.TrimSpace(fmt.Sprint(event["toolCallId"]))
+	if slot, ok := m.toolSlots[id]; ok && slot >= 0 && slot < len(m.messages) {
+		prefix := strings.TrimSpace(fmt.Sprint(event["toolName"]))
+		if prefix == "" || prefix == "<nil>" {
+			prefix = "tool"
+		}
+		m.messages[slot].Text = "[" + prefix + "]\n" + text
+		return
+	}
+	m.appendMessage(interactiveRoleTool, text)
+}
+
+func interactiveToolResult(value any) (ai.ToolResult, bool) {
+	switch result := value.(type) {
+	case ai.ToolResult:
+		return result, true
+	case agentcore.AgentToolResult:
+		return ai.ToolResult{Content: result.Content, Details: result.Details, IsError: result.IsError}, true
+	default:
+		return ai.ToolResult{}, false
+	}
+}
+
+func (m *interactiveModel) applySessionEvent(event SessionEvent) {
+	switch ev := event.(type) {
+	case QueueUpdateEvent:
+		m.queuedSteering = append([]string(nil), ev.Steering...)
+		m.queuedFollowUp = append([]string(nil), ev.FollowUp...)
+	case ModelChangedEvent:
+		m.setStatus("Model: " + ev.Model.Provider + "/" + ev.Model.ID)
+	case ThinkingLevelChangedEvent:
+		m.setStatus("Thinking: " + string(ev.Level))
+	case SessionInfoChangedEvent:
+		if ev.Name != "" {
+			m.setStatus("Session: " + ev.Name)
+		}
+	case CompactionStartEvent:
+		m.setStatus("Compacting context...")
+	case CompactionEndEvent:
+		if ev.Aborted {
+			m.setStatus("Compaction aborted.")
+		} else if ev.ErrorMessage != "" {
+			m.appendMessage(interactiveRoleError, ev.ErrorMessage)
+		} else {
+			m.setStatus("Compaction complete.")
+		}
+	case AutoRetryStartEvent:
+		m.setStatus(fmt.Sprintf("Retrying in %d ms (%d/%d).", ev.DelayMs, ev.Attempt, ev.MaxAttempts))
+	case AutoRetryEndEvent:
+		if ev.FinalError != "" {
+			m.appendMessage(interactiveRoleError, ev.FinalError)
+		}
+	}
+}
+
 func (m *interactiveModel) appendAssistantDelta(delta string) {
 	if m.assistantSlot < 0 || m.assistantSlot >= len(m.messages) || m.messages[m.assistantSlot].Role != interactiveRoleAssistant {
 		m.messages = append(m.messages, interactiveMessage{Role: interactiveRoleAssistant})
@@ -434,12 +701,13 @@ func (m *interactiveModel) appendAssistantDelta(delta string) {
 	m.messages[m.assistantSlot].Text += delta
 }
 
-func (m *interactiveModel) appendMessage(role interactiveRole, text string) {
+func (m *interactiveModel) appendMessage(role interactiveRole, text string) int {
 	text = strings.TrimRight(text, "\n")
 	if text == "" {
-		return
+		return -1
 	}
 	m.messages = append(m.messages, interactiveMessage{Role: role, Text: text})
+	return len(m.messages) - 1
 }
 
 func (m *interactiveModel) refreshViewport() {
@@ -478,7 +746,7 @@ func (m *interactiveModel) renderTranscript(width int) string {
 		if text == "" {
 			continue
 		}
-		lines := strings.Split(text, "\n")
+		lines := renderInteractiveMessageLines(msg, max(1, width-tui.VisibleWidth(prefix)))
 		for i, line := range lines {
 			currentPrefix := prefix
 			if i > 0 {
@@ -495,6 +763,18 @@ func (m *interactiveModel) renderTranscript(width int) string {
 		rendered = rendered[:len(rendered)-1]
 	}
 	return strings.Join(rendered, "\n")
+}
+
+func renderInteractiveMessageLines(msg interactiveMessage, width int) []string {
+	text := strings.TrimRight(msg.Text, "\n")
+	switch msg.Role {
+	case interactiveRoleUser, interactiveRoleAssistant:
+		lines := tui.NewMarkdown(text, 0, 0, tui.MarkdownTheme{}).Render(width)
+		if len(lines) > 0 {
+			return lines
+		}
+	}
+	return strings.Split(text, "\n")
 }
 
 func interactiveMessagePrefix(role interactiveRole) (string, lipgloss.Style) {
@@ -529,6 +809,9 @@ func (m *interactiveModel) footer() string {
 	status := "ready"
 	if m.busy {
 		status = "working"
+		if m.busyKind != interactiveBusyNone {
+			status += ":" + string(m.busyKind)
+		}
 	}
 	stats := agent.GetSessionStats()
 	parts := []string{
@@ -539,14 +822,20 @@ func (m *interactiveModel) footer() string {
 	if stats.Tokens.Total > 0 {
 		parts = append(parts, fmt.Sprintf("tokens=%d", stats.Tokens.Total))
 	}
-	if suggestions := slashCommandSuggestions(m.input.Value()); len(suggestions) > 0 {
+	if queued := len(m.queuedSteering) + len(m.queuedFollowUp) + len(m.localQueue) + len(m.initialQueue); queued > 0 {
+		parts = append(parts, fmt.Sprintf("queued=%d", queued))
+	}
+	if m.statusMessage != "" {
+		parts = append(parts, m.statusMessage)
+	}
+	if suggestions := m.currentSuggestions(); len(suggestions) > 0 {
 		parts = append(parts, "tab="+suggestions[0])
 	}
 	return tui.TruncateToWidth(strings.Join(parts, "  "), max(1, m.width), "...")
 }
 
 func (m *interactiveModel) renderSuggestions() string {
-	suggestions := slashCommandSuggestions(m.input.Value())
+	suggestions := m.currentSuggestions()
 	if len(suggestions) == 0 {
 		return ""
 	}
@@ -554,7 +843,7 @@ func (m *interactiveModel) renderSuggestions() string {
 }
 
 func (m *interactiveModel) completeSlashCommand() bool {
-	suggestions := slashCommandSuggestions(m.input.Value())
+	suggestions := m.currentSuggestions()
 	if len(suggestions) == 0 {
 		return false
 	}
@@ -563,8 +852,24 @@ func (m *interactiveModel) completeSlashCommand() bool {
 }
 
 func slashCommandSuggestions(input string) []string {
+	return interactiveSuggestions(input, nil)
+}
+
+func (m *interactiveModel) currentSuggestions() []string {
+	agent, _ := runtimeAgent(m.runtime)
+	return interactiveSuggestions(m.input.Value(), agent)
+}
+
+func interactiveSuggestions(input string, agent *AgentSession) []string {
+	raw := strings.TrimLeft(input, " \t\r\n")
 	text := strings.TrimSpace(input)
+	if strings.HasPrefix(raw, "/model ") {
+		return modelCommandSuggestions(raw, agent)
+	}
 	if !strings.HasPrefix(text, "/") || strings.Contains(text, " ") {
+		if strings.HasPrefix(text, "/model ") {
+			return modelCommandSuggestions(text, agent)
+		}
 		return nil
 	}
 	prefix := strings.TrimPrefix(text, "/")
@@ -574,9 +879,143 @@ func slashCommandSuggestions(input string) []string {
 			matches = append(matches, "/"+command)
 		}
 	}
+	if agent != nil {
+		for name := range agent.Resources.PromptTemplates {
+			if strings.HasPrefix(name, prefix) {
+				matches = append(matches, "/"+name)
+			}
+		}
+		for name := range agent.Resources.Skills {
+			command := "skill:" + name
+			if strings.HasPrefix(command, prefix) {
+				matches = append(matches, "/"+command)
+			}
+		}
+	}
 	sort.Strings(matches)
 	if len(matches) > 6 {
 		matches = matches[:6]
 	}
 	return matches
+}
+
+func modelCommandSuggestions(text string, agent *AgentSession) []string {
+	if agent == nil {
+		return nil
+	}
+	prefix := strings.TrimSpace(strings.TrimPrefix(text, "/model"))
+	prefix = strings.ToLower(prefix)
+	models := agent.availableModels()
+	if len(models) == 0 && agent.Registry != nil {
+		models = agent.Registry.List("")
+	}
+	matches := make([]string, 0, 6)
+	for _, model := range models {
+		label := model.Provider + "/" + model.ID
+		search := strings.ToLower(model.ID + " " + model.Provider + " " + label)
+		if prefix == "" || strings.Contains(search, prefix) {
+			matches = append(matches, "/model "+label)
+		}
+	}
+	sort.Strings(matches)
+	if len(matches) > 6 {
+		matches = matches[:6]
+	}
+	return matches
+}
+
+func (m *interactiveModel) handleCtrlC() tea.Cmd {
+	now := time.Now()
+	if now.Sub(m.lastCtrlC) < 500*time.Millisecond {
+		return tea.Quit
+	}
+	m.lastCtrlC = now
+	if strings.TrimSpace(m.input.Value()) != "" {
+		m.input.Reset()
+		m.setStatus("Editor cleared. Press Ctrl+C again to exit.")
+		return nil
+	}
+	m.setStatus("Press Ctrl+C again to exit.")
+	return nil
+}
+
+func (m *interactiveModel) handleEscape() tea.Cmd {
+	if m.busy && m.busyKind == interactiveBusyAgent {
+		m.setStatus("Abort requested.")
+		return m.runAbort()
+	}
+	if m.busy && m.busyKind == interactiveBusyCommand {
+		if m.commandCancel != nil {
+			m.clearCommandCancel()
+			m.setStatus("Cancelling command…")
+		}
+		return nil
+	}
+	if strings.TrimSpace(m.input.Value()) != "" {
+		m.input.Reset()
+		m.setStatus("Editor cleared.")
+		return nil
+	}
+	now := time.Now()
+	if now.Sub(m.lastEscape) < 500*time.Millisecond {
+		m.lastEscape = time.Time{}
+		agent, err := runtimeAgent(m.runtime)
+		if err != nil || agent == nil || agent.Settings == nil {
+			return nil
+		}
+		switch agent.Settings.DoubleEscapeAction() {
+		case "tree":
+			m.appendMessage(interactiveRoleUser, "/tree")
+			m.busy = true
+			m.busyKind = interactiveBusyCommand
+			return m.runSlashCommand(m.beginCommand(), "/tree")
+		case "fork":
+			m.appendMessage(interactiveRoleUser, "/fork")
+			m.busy = true
+			m.busyKind = interactiveBusyCommand
+			return m.runSlashCommand(m.beginCommand(), "/fork")
+		}
+		return nil
+	}
+	m.lastEscape = now
+	m.setStatus("Press Escape again for " + m.doubleEscapeActionLabel() + ".")
+	return nil
+}
+
+func (m *interactiveModel) doubleEscapeActionLabel() string {
+	agent, err := runtimeAgent(m.runtime)
+	if err != nil || agent == nil || agent.Settings == nil {
+		return "tree"
+	}
+	switch agent.Settings.DoubleEscapeAction() {
+	case "fork":
+		return "fork"
+	case "none":
+		return "nothing"
+	default:
+		return "tree"
+	}
+}
+
+func (m *interactiveModel) setStatus(text string) {
+	m.statusMessage = strings.TrimSpace(text)
+}
+
+func (m *interactiveModel) bindSession(agent *AgentSession) {
+	m.unbindSession()
+	if agent == nil {
+		return
+	}
+	m.sessionUnsubscribe = agent.Subscribe(func(event SessionEvent) {
+		if m.post != nil {
+			m.post(interactiveSessionEventMsg{Event: event})
+		}
+	})
+}
+
+func (m *interactiveModel) unbindSession() {
+	if m.sessionUnsubscribe != nil {
+		m.sessionUnsubscribe()
+		m.sessionUnsubscribe = nil
+	}
 }

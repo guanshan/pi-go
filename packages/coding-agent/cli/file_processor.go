@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"encoding/base64"
 	"fmt"
-	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -13,6 +12,7 @@ import (
 
 	"github.com/guanshan/pi-go/packages/ai"
 	"github.com/guanshan/pi-go/packages/ai/imageresize"
+	catools "github.com/guanshan/pi-go/packages/coding-agent/core/tools"
 	"golang.org/x/text/unicode/norm"
 )
 
@@ -126,63 +126,11 @@ func normalizePathInput(path string, stripAtPrefix bool) string {
 	return strings.TrimFunc(path, unicode.IsControl)
 }
 
+// fileURLPath delegates to the shared core/tools implementation so the tool path
+// resolver (tools/path.go), the top-level NormalizePath, and this CLI processor
+// all use a single file:// parser (parity review topic 8 P2-3).
 func fileURLPath(raw string) (string, bool) {
-	raw = strings.ReplaceAll(raw, "\\", "/")
-	if path, ok := windowsDriveFileURLPath(raw); ok {
-		return path, true
-	}
-	u, err := url.Parse(raw)
-	if err != nil || u.Scheme != "file" {
-		return "", false
-	}
-	path := u.Path
-	if path == "" {
-		path = u.Opaque
-	}
-	if u.Host != "" && u.Host != "localhost" {
-		if path == "" {
-			path = u.Host
-		} else {
-			path = "//" + u.Host + path
-		}
-	}
-	decoded, err := url.PathUnescape(path)
-	if err != nil || decoded == "" {
-		return "", false
-	}
-	if strings.HasPrefix(decoded, "/") && isWindowsDrivePath(decoded[1:]) {
-		decoded = decoded[1:]
-	}
-	return filepath.FromSlash(decoded), true
-}
-
-func windowsDriveFileURLPath(raw string) (string, bool) {
-	const scheme = "file:"
-	if !strings.HasPrefix(raw, scheme) {
-		return "", false
-	}
-	path := strings.TrimPrefix(raw, scheme)
-	if strings.HasPrefix(path, "//") {
-		path = strings.TrimPrefix(path, "//")
-	} else if strings.HasPrefix(path, "/") {
-		path = strings.TrimLeft(path, "/")
-	}
-	if !isWindowsDrivePath(path) {
-		return "", false
-	}
-	decoded, err := url.PathUnescape(path)
-	if err != nil || decoded == "" {
-		return "", false
-	}
-	return filepath.FromSlash(decoded), true
-}
-
-func isWindowsDrivePath(path string) bool {
-	if len(path) < 2 || path[1] != ':' {
-		return false
-	}
-	c := path[0]
-	return c >= 'A' && c <= 'Z' || c >= 'a' && c <= 'z'
+	return catools.FileURLToPath(raw)
 }
 
 func expandTilde(path string) string {

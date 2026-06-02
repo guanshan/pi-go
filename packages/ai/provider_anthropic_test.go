@@ -125,8 +125,14 @@ func TestAnthropicOAuthHeadersToolChoiceAndToolResultImages(t *testing.T) {
 		t.Fatalf("x-app=%q", got)
 	}
 	system := captured["system"].([]any)
-	if !strings.Contains(system[0].(map[string]any)["text"].(string), "Claude Code") {
+	identityBlock := system[0].(map[string]any)
+	if !strings.Contains(identityBlock["text"].(string), "Claude Code") {
 		t.Fatalf("system identity=%#v", system)
+	}
+	// P2-3: the OAuth identity block must carry the same cache_control breakpoint
+	// as the system prompt block (anthropic.ts:909-923).
+	if cc, ok := identityBlock["cache_control"].(map[string]any); !ok || cc["type"] != "ephemeral" {
+		t.Fatalf("identity cache_control=%#v", identityBlock["cache_control"])
 	}
 	toolChoice := captured["tool_choice"].(map[string]any)
 	if toolChoice["type"] != "tool" || toolChoice["name"] != "lookup" {

@@ -42,7 +42,23 @@ type packageCommandOptions struct {
 	ConflictingOptions string
 }
 
-func HandlePackageCommand(args []string, cwd, agentDir string, settings *SettingsManager) (bool, error) {
+// PackageManager performs the actual install/remove/update side effects for
+// the CLI package commands. The complete implementation — dependency install,
+// staged rollback, npm uninstall, on-disk removal — lives in the codingagent
+// DefaultPackageManager; core receives it through MainOptions to avoid an
+// import cycle. When no manager is supplied, the legacy in-package installer is
+// used as a fallback.
+type PackageManager interface {
+	InstallAndPersist(source string, local bool) error
+	RemoveAndPersist(source string, local bool) (bool, error)
+	Update(source string) error
+}
+
+// PackageManagerFactory builds a PackageManager bound to the given settings so
+// install/remove/update persist into the same configuration core loaded.
+type PackageManagerFactory func(cwd, agentDir string, settings *SettingsManager) PackageManager
+
+func HandlePackageCommand(args []string, cwd, agentDir string, settings *SettingsManager, newManager PackageManagerFactory) (bool, error) {
 	options, ok := parsePackageCommand(args)
 	if !ok {
 		return false, nil
@@ -57,14 +73,29 @@ func HandlePackageCommand(args []string, cwd, agentDir string, settings *Setting
 
 	switch options.Command {
 	case packageCommandInstall:
+		if newManager != nil {
+			return true, newManager(cwd, agentDir, settings).InstallAndPersist(options.Source, options.Local)
+		}
 		return true, installPackage(options.Source, options.Local, cwd, agentDir, settings)
 	case packageCommandRemove:
+		if newManager != nil {
+			removed, err := newManager(cwd, agentDir, settings).RemoveAndPersist(options.Source, options.Local)
+			if err != nil {
+				return true, err
+			}
+			if removed {
+				fmt.Println("Removed", options.Source)
+			} else {
+				fmt.Println("Package not found:", options.Source)
+			}
+			return true, nil
+		}
 		return true, removePackage(options.Source, options.Local, settings)
 	case packageCommandList:
 		listPackages(settings, cwd, agentDir)
 		return true, nil
 	case packageCommandUpdate:
-		return true, updatePackages(options.UpdateTarget, settings)
+		return true, updatePackages(options.UpdateTarget, settings, newManager, cwd, agentDir)
 	}
 	return false, nil
 }
@@ -257,11 +288,43 @@ func installPackage(source string, local bool, cwd, agentDir string, settings *S
 			return fmt.Errorf("unsupported package source or missing directory: %s", source)
 		}
 	}
-	settings.AddPackageSource(source, local)
+	settings.AddPackageSource(normalizePackageSourceForSettings(source, cwd, agentDir, local), local)
 	if local {
 		return settings.SaveProject()
 	}
 	return settings.SaveGlobal()
+}
+
+// packageScopeBaseDir returns the directory that local package source paths are
+// stored relative to, matching getBaseDirForScope() in package-manager.ts:
+// project scope -> <cwd>/.pi, user scope -> agentDir.
+func packageScopeBaseDir(cwd, agentDir string, local bool) string {
+	if local {
+		return ProjectPiDir(cwd)
+	}
+	return agentDir
+}
+
+// normalizePackageSourceForSettings rewrites a local package source so it is
+// stored relative to the scope base directory. CLI input is resolved from cwd to
+// locate the source; the stored value is then made relative to the scope base so
+// list/update from a different cwd resolve back to the same directory. Managed
+// sources (npm:, git:, URLs, github.com/...) are stored verbatim. Mirrors
+// normalizePackageSourceForSettings() in package-manager.ts.
+func normalizePackageSourceForSettings(source, cwd, agentDir string, local bool) string {
+	trimmed := strings.TrimSpace(source)
+	if isManagedPackageSource(trimmed) {
+		return source
+	}
+	resolved := ResolveInCWD(cwd, trimmed)
+	rel, err := filepath.Rel(packageScopeBaseDir(cwd, agentDir, local), resolved)
+	if err != nil {
+		return source
+	}
+	if rel == "" {
+		return "."
+	}
+	return rel
 }
 
 func removePackage(source string, local bool, settings *SettingsManager) error {
@@ -315,14 +378,22 @@ func printPackageEntry(entry packageEntry) {
 	}
 }
 
-func updatePackages(target packageUpdateTarget, settings *SettingsManager) error {
+func updatePackages(target packageUpdateTarget, settings *SettingsManager, newManager PackageManagerFactory, cwd, agentDir string) error {
 	if target.Kind == "all" || target.Kind == "extensions" {
-		matched, err := updateExtensionPackages(target.Source, settings)
-		if err != nil {
-			return err
-		}
-		if target.Source != "" && !matched {
-			return fmt.Errorf("no matching package found for %s", target.Source)
+		if newManager != nil {
+			// The DefaultPackageManager reinstalls dependencies after a git
+			// update and reports no-match itself, unlike the legacy path.
+			if err := newManager(cwd, agentDir, settings).Update(target.Source); err != nil {
+				return err
+			}
+		} else {
+			matched, err := updateExtensionPackages(target.Source, settings)
+			if err != nil {
+				return err
+			}
+			if target.Source != "" && !matched {
+				return fmt.Errorf("no matching package found for %s", target.Source)
+			}
 		}
 		if target.Source != "" {
 			fmt.Println("Updated", target.Source)
@@ -496,7 +567,10 @@ func packageEntries(settings *SettingsManager, cwd, agentDir string, local bool)
 
 func packageInstallPath(source string, local bool, cwd, agentDir string) string {
 	if !isManagedPackageSource(source) {
-		return ResolveInCWD(cwd, source)
+		// Stored local sources are relative to the scope base directory, so
+		// resolve from there (not cwd) to avoid drift when listing/updating from
+		// a different working directory. Matches getBaseDirForScope().
+		return ResolveInCWD(packageScopeBaseDir(cwd, agentDir, local), source)
 	}
 	root := filepath.Join(agentDir, "packages")
 	if local {

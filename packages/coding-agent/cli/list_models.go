@@ -13,20 +13,28 @@ import (
 // ModelLister is the small registry surface needed by PrintModels.
 type ModelLister interface {
 	List(search string) []ai.Model
+	// AvailableConfigured returns the models whose provider has auth configured
+	// (plus the faux placeholder). It mirrors the TS ModelRegistry.getAvailable
+	// surface used by --list-models.
+	AvailableConfigured() []ai.Model
 }
 
-// PrintModels renders the TS-compatible model table used by --list-models.
+// PrintModels renders the TS-compatible model table used by --list-models. It
+// lists only the available (auth-configured) models, matching TS listModels
+// (cli/list-models.ts), rather than the full catalog.
 func PrintModels(w io.Writer, registry ModelLister, searchPattern string) {
-	models := registry.List("")
+	models := availableModelsForListing(registry)
+	if len(models) == 0 {
+		// No configured models at all: show the no-models guidance regardless of
+		// any search pattern, matching TS listModels.
+		fmt.Fprintln(w, noModelsAvailableGuidance)
+		return
+	}
 	if searchPattern != "" {
 		models = fuzzyFilterModels(models, searchPattern)
 	}
 	if len(models) == 0 {
-		if searchPattern != "" {
-			fmt.Fprintf(w, "No models matching %q\n", searchPattern)
-			return
-		}
-		fmt.Fprintln(w, "No models available. Configure API keys or models.json and try again.")
+		fmt.Fprintf(w, "No models matching %q\n", searchPattern)
 		return
 	}
 
@@ -49,6 +57,25 @@ func PrintModels(w io.Writer, registry ModelLister, searchPattern string) {
 		})
 	}
 	printModelRows(w, rows)
+}
+
+// noModelsAvailableGuidance mirrors core.formatNoModelsAvailableMessage. It is
+// duplicated here because the cli package cannot import core (import cycle).
+const noModelsAvailableGuidance = "No models available. Use /login to log into a provider via OAuth or API key, or configure API keys or models.json and try again."
+
+// availableModelsForListing returns the auth-configured models, excluding the
+// faux placeholder (which AvailableConfigured includes unconditionally but TS
+// getAvailable does not, since faux has no configured auth).
+func availableModelsForListing(registry ModelLister) []ai.Model {
+	available := registry.AvailableConfigured()
+	out := make([]ai.Model, 0, len(available))
+	for _, model := range available {
+		if model.Provider == "faux" {
+			continue
+		}
+		out = append(out, model)
+	}
+	return out
 }
 
 type modelListRow struct {

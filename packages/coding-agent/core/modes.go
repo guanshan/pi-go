@@ -17,6 +17,14 @@ import (
 	"github.com/guanshan/pi-go/packages/tui"
 )
 
+// RunPrintMode mirrors the TS print (single-shot) mode
+// (src/modes/print-mode.ts:32-158). It runs every prompt turn and then emits
+// the result: for JSON mode it streams the session header plus every event; for
+// text mode it prints ONLY the final assistant message's text content to
+// stdout, with no per-turn streaming or "[tool]" noise. An assistant message
+// that stopped with "error"/"aborted" is reported to stderr and yields exit
+// code 1 (print-mode.ts:128-145). Any prompt error is written to stderr and
+// also yields exit code 1 (print-mode.ts:148-150).
 func RunPrintMode(ctx context.Context, runtime *AgentSessionRuntime, mode cli.Mode, message string, images []ai.ContentBlock, stdout, stderr io.Writer, remainingMessages ...[]string) (int, error) {
 	agent, err := runtimeAgent(runtime)
 	if err != nil {
@@ -31,42 +39,52 @@ func RunPrintMode(ctx context.Context, runtime *AgentSessionRuntime, mode cli.Mo
 		sink := func(event ai.Event) { _ = writeJSONLine(stdout, event) }
 		for _, turn := range turns {
 			if err := agent.Prompt(ctx, turn.Message, turn.Images, sink); err != nil {
-				return 1, err
+				fmt.Fprintln(stderr, err)
+				return 1, nil
 			}
 		}
 		return 0, nil
 	}
+	// Text mode: run all turns first (no streaming/tool output), then emit the
+	// final assistant text only. Mirrors print-mode.ts:120-126,148-150.
 	for _, turn := range turns {
-		var finalText string
-		streamedText := false
-		sink := func(event ai.Event) {
-			switch event["type"] {
-			case "tool_execution_start":
-				fmt.Fprintf(stderr, "[tool] %s\n", event["toolName"])
-			case "message_update":
-				if assistantEvent, ok := event["assistantMessageEvent"].(ai.AssistantMessageEvent); ok && assistantEvent.Type == "text_delta" && assistantEvent.Delta != "" {
-					fmt.Fprint(stdout, assistantEvent.Delta)
-					streamedText = true
-				}
-			case "message_end":
-				if msg, ok := event["message"].(ai.Message); ok && ai.MessageRole(msg) == "assistant" {
-					if !streamedText {
-						finalText = ai.MessageText(msg)
-					}
-				}
-			}
-		}
-		err = agent.Prompt(ctx, turn.Message, turn.Images, sink)
-		if streamedText {
-			fmt.Fprintln(stdout)
-		} else if finalText != "" {
-			fmt.Fprintln(stdout, finalText)
-		}
-		if err != nil {
-			return 1, err
+		if err := agent.Prompt(ctx, turn.Message, turn.Images, nil); err != nil {
+			fmt.Fprintln(stderr, err)
+			return 1, nil
 		}
 	}
-	return 0, nil
+	return printFinalAssistantText(agent, stdout, stderr), nil
+}
+
+// printFinalAssistantText mirrors print-mode.ts:128-145: it inspects the last
+// message in the session state and, when it is an assistant message, either
+// reports the error/aborted stop reason to stderr (exit code 1) or writes each
+// text content block to stdout. Non-assistant trailing messages produce no
+// output and exit code 0.
+func printFinalAssistantText(agent *AgentSession, stdout, stderr io.Writer) int {
+	messages := agent.Session.BuildContext().Messages
+	if len(messages) == 0 {
+		return 0
+	}
+	last := messages[len(messages)-1]
+	if ai.MessageRole(last) != "assistant" {
+		return 0
+	}
+	assistant, _ := ai.AsAssistantMessage(last)
+	if assistant.StopReason == "error" || assistant.StopReason == "aborted" {
+		errorMessage := assistant.ErrorMessage
+		if errorMessage == "" {
+			errorMessage = fmt.Sprintf("Request %s", assistant.StopReason)
+		}
+		fmt.Fprintln(stderr, errorMessage)
+		return 1
+	}
+	for _, block := range ai.MessageBlocks(last) {
+		if block.Type == "text" {
+			fmt.Fprintln(stdout, block.Text)
+		}
+	}
+	return 0
 }
 
 func RunInteractiveMode(ctx context.Context, runtime *AgentSessionRuntime, initial string, images []ai.ContentBlock, stdin io.Reader, stdout, stderr io.Writer, remainingMessages ...[]string) error {
@@ -148,7 +166,7 @@ func runLineInteractiveMode(ctx context.Context, runtime *AgentSessionRuntime, i
 		if strings.HasPrefix(line, "!") {
 			exclude := strings.HasPrefix(line, "!!")
 			command := strings.TrimSpace(strings.TrimPrefix(strings.TrimPrefix(line, "!"), "!"))
-			result := (catools.BashTool{CWD: agent.Session.CWD()}).Execute(ctx, mustJSON(map[string]any{"command": command}), nil)
+			result := (catools.BashTool{CWD: agent.Session.CWD(), BinDir: BinDir()}).Execute(ctx, mustJSON(map[string]any{"command": command}), nil)
 			text := ai.MessageText(ai.ToolResultMessage{Content: result.Content})
 			fmt.Fprintln(stdout, text)
 			exit := 0
@@ -353,7 +371,7 @@ func handleSlashWithPrompt(ctx context.Context, target any, line string, prompte
 		}
 		fmt.Fprintln(stdout, "Imported session:", current.Session.SessionID())
 	case "compact":
-		result, err := agent.Compact(arg, func(event ai.Event) {})
+		result, err := agent.CompactWithContext(ctx, arg, func(event ai.Event) {})
 		if err != nil {
 			return false, err
 		}

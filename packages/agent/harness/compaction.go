@@ -30,6 +30,9 @@ func (h *AgentHarness) Compact(ctx context.Context, customInstructions string) (
 	if err != nil {
 		return CompactionResult{}, err
 	}
+	if prep == nil {
+		return CompactionResult{}, &agent.AgentError{Code: agent.AgentErrCompaction, Msg: "Nothing to compact"}
+	}
 	before, err := h.emitSessionBeforeCompact(ctx, SessionBeforeCompactEvent{
 		Preparation:        prep,
 		BranchEntries:      append([]session.Entry(nil), branch...),
@@ -39,7 +42,7 @@ func (h *AgentHarness) Compact(ctx context.Context, customInstructions string) (
 		return CompactionResult{}, err
 	}
 	if before != nil && before.Cancel {
-		return CompactionResult{}, nil
+		return CompactionResult{}, &agent.AgentError{Code: agent.AgentErrCompaction, Msg: "Compaction cancelled"}
 	}
 	built, err := h.sess.BuildContext(ctx)
 	if err != nil {
@@ -51,9 +54,6 @@ func (h *AgentHarness) Compact(ctx context.Context, customInstructions string) (
 		result = *before.Compaction
 		fromHook = true
 	} else {
-		if prep == nil {
-			return CompactionResult{}, nil
-		}
 		model, thinking, apiKey, headers, err := h.compactionAuth(ctx)
 		if err != nil {
 			return CompactionResult{}, err

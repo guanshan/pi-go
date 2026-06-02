@@ -1,7 +1,6 @@
 package tools
 
 import (
-	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -17,6 +16,15 @@ func ResolveInCWD(cwd, path string) string {
 		return filepath.Clean(path)
 	}
 	return filepath.Clean(filepath.Join(cwd, path))
+}
+
+// ResolveToolPath resolves a file/dir path for the write/edit/grep/find/ls
+// tools. It strips a bare leading "@" (CLI @file syntax) before resolving,
+// matching the TS resolveToCwd which uses stripAtPrefix:true for all of these
+// tools. A literal "./@file" is unaffected because only a leading "@" is
+// stripped.
+func ResolveToolPath(cwd, path string) string {
+	return ResolveInCWD(cwd, normalizePathInput(path, true))
 }
 
 var macOSScreenshotAMPMPattern = regexp.MustCompile(` (?i:am|pm)\.`)
@@ -62,11 +70,9 @@ func normalizePathInput(path string, stripAtPrefix bool) string {
 			return r
 		}
 	}, path)
-	if strings.HasPrefix(path, "file://") {
-		if u, err := url.Parse(path); err == nil {
-			if decoded, err := url.PathUnescape(u.Path); err == nil && decoded != "" {
-				path = decoded
-			}
+	if strings.HasPrefix(path, "file:") {
+		if decoded, ok := FileURLToPath(path); ok {
+			path = decoded
 		}
 	}
 	path = expandTilde(path)

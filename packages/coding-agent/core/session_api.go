@@ -394,7 +394,14 @@ func (a *AgentSession) retryablePromptError(messages []agentcore.AgentMessage, m
 	if ai.IsContextOverflow(assistant, a.Model.ContextWindow) {
 		return ""
 	}
-	return firstNonEmpty(strings.TrimSpace(assistant.ErrorMessage), strings.TrimSpace(ai.MessageText(last)), "assistant error")
+	msg := firstNonEmpty(strings.TrimSpace(assistant.ErrorMessage), strings.TrimSpace(ai.MessageText(last)), "assistant error")
+	// Only retry transient provider/network errors. Provider-limit errors
+	// (quota/billing/usage caps) must not be retried, matching the TypeScript
+	// _isRetryableError / _isNonRetryableProviderLimitError classification.
+	if !ai.IsRetryableProviderError(msg) {
+		return ""
+	}
+	return msg
 }
 
 func (a *AgentSession) contextOverflowPromptError(messages []agentcore.AgentMessage, maxLoopHit bool) string {
@@ -455,6 +462,9 @@ func (a *AgentSession) compact(ctx context.Context, reason CompactionReason, cus
 func (a *AgentSession) compactInternal(ctx context.Context, reason CompactionReason, customInstructions string, sink ai.EventSink, willRetry bool) (map[string]any, error) {
 	if ctx == nil {
 		ctx = context.Background()
+	}
+	if err := ctxErr(ctx); err != nil {
+		return nil, err
 	}
 	compactionCtx, cancel := context.WithCancel(ctx)
 	a.mu.Lock()
@@ -887,11 +897,32 @@ func (a *AgentSession) ExecuteBash(ctx context.Context, command string, opts Bas
 	if a.Session != nil && a.Session.CWD() != "" {
 		cmd.Dir = a.Session.CWD()
 	}
+	// Prepend the agent bin directory to PATH so migrated/installed tools (fd,
+	// rg, package CLIs) resolve, mirroring the bash tool and getShellEnv() in TS.
+	cmd.Env = catools.ShellEnv(BinDir())
+	// Run in a dedicated process group and kill the whole tree on cancel, so
+	// AbortBash / signal shutdown terminates detached children too, not just the
+	// shell. Mirrors the bash tool's wiring (see ConfigureTreeKill).
+	catools.ConfigureTreeKill(cmd)
+	// Bound how long Wait blocks after the context is canceled (AbortBash /
+	// signal shutdown). Without this, a background child that inherited the
+	// command's output pipes can keep them open and wedge cmd.Run after the
+	// shell itself is killed. Mirrors cmd.WaitDelay in the bash tool.
+	cmd.WaitDelay = 2 * time.Second
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
-	err = cmd.Run()
+	// Run = Start + Wait, split so the detached process group can be tracked for
+	// shutdown cleanup (see catools.KillTrackedDetachedChildren / shell.ts).
+	if err = cmd.Start(); err == nil {
+		if cmd.Process != nil {
+			pid := cmd.Process.Pid
+			catools.TrackDetachedChildPID(pid)
+			defer catools.UntrackDetachedChildPID(pid)
+		}
+		err = cmd.Wait()
+	}
 	result := BashResult{Command: command, Output: strings.TrimSpace(strings.TrimRight(stdout.String()+stderr.String(), "\n")), ExitCode: 0, Cancelled: bashCtx.Err() == context.Canceled}
 	if exitErr, ok := err.(*exec.ExitError); ok {
 		result.ExitCode = exitErr.ExitCode()

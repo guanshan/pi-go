@@ -415,6 +415,13 @@ func AgentDir() string {
 	return filepath.Join(HomeDir(), ConfigDirName, DefaultAgentSubDir)
 }
 
+// BinDir returns the agent bin directory (<agentDir>/bin), where migrated and
+// package-installed executables (fd, rg, CLIs) live. Mirrors getBinDir() in
+// src/config.ts:519-520. The bash tool prepends this to PATH for every command.
+func BinDir() string {
+	return filepath.Join(AgentDir(), "bin")
+}
+
 func GetPackageDir() string {
 	exe, err := os.Executable()
 	if err != nil || exe == "" {
@@ -532,6 +539,24 @@ func (s *SettingsManager) AutoRetryEnabled() bool {
 
 func (s *SettingsManager) Transport() string {
 	return s.mergedString(s.Global.Transport, s.Project.Transport, "auto")
+}
+
+// ThinkingBudgets mirrors TS SettingsManager.getThinkingBudgets()
+// (settings-manager.ts:926-928): the custom per-level token budgets, with the
+// project file deep-merged over the global one (deepMergeSettings(global,
+// project)). Returns nil when neither file sets any budget so the provider can
+// fall back to its built-in defaults.
+func (s *SettingsManager) ThinkingBudgets() *ai.ThinkingBudgets {
+	merged := ai.ThinkingBudgets{
+		Minimal: firstPositiveInt(s.Project.ThinkingBudgets.Minimal, s.Global.ThinkingBudgets.Minimal, 0),
+		Low:     firstPositiveInt(s.Project.ThinkingBudgets.Low, s.Global.ThinkingBudgets.Low, 0),
+		Medium:  firstPositiveInt(s.Project.ThinkingBudgets.Medium, s.Global.ThinkingBudgets.Medium, 0),
+		High:    firstPositiveInt(s.Project.ThinkingBudgets.High, s.Global.ThinkingBudgets.High, 0),
+	}
+	if merged == (ai.ThinkingBudgets{}) {
+		return nil
+	}
+	return &merged
 }
 
 func (s *SettingsManager) CompactionReserveTokens() int {
@@ -817,7 +842,8 @@ func writeJSON(path string, value any) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}
-	data, err := json.MarshalIndent(value, "", "\t")
+	// TS writes settings.json with 2-space indent (settings-manager.ts:320,536).
+	data, err := json.MarshalIndent(value, "", "  ")
 	if err != nil {
 		return err
 	}

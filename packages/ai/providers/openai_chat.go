@@ -177,6 +177,9 @@ func BuildOpenAIChatRequest(key string, options OpenAIChatRequestOptions) Prepar
 	if options.Provider == "azure-openai" {
 		bearerAuth = false
 		headers = MergeHeaders(headers, map[string]string{"api-key": key})
+	} else if options.Provider == "cloudflare-ai-gateway" {
+		bearerAuth = false
+		headers = applyCloudflareGatewayAuthHeaders(headers, key)
 	}
 	return PreparedOpenAIChatRequest{Key: key, Headers: headers, Body: body, BearerAuth: bearerAuth}
 }
@@ -270,6 +273,12 @@ func OpenAIChatMessages(options OpenAIChatRequestOptions) []map[string]any {
 					m["reasoning_content"] = ""
 				}
 			}
+			// Skip assistant messages with no content and no tool calls. Some
+			// providers reject empty assistant messages (e.g. aborted responses);
+			// messages carrying reasoning_content but real text/tool calls are kept.
+			if !openAIChatMessageHasContent(m["content"]) && len(toolCalls) == 0 {
+				continue
+			}
 			out = append(out, m)
 		case "toolResult":
 			j := i
@@ -306,6 +315,21 @@ func OpenAIChatMessages(options OpenAIChatRequestOptions) []map[string]any {
 		lastRole = msg.Role
 	}
 	return out
+}
+
+func openAIChatMessageHasContent(content any) bool {
+	switch value := content.(type) {
+	case nil:
+		return false
+	case string:
+		return len(value) > 0
+	case []map[string]any:
+		return len(value) > 0
+	case []any:
+		return len(value) > 0
+	default:
+		return true
+	}
 }
 
 func openAIChatContent(msg OpenAIChatMessage) any {
@@ -376,6 +400,28 @@ func openAIChatToolResultText(msg OpenAIChatMessage) string {
 		return "(see attached image)"
 	}
 	return text
+}
+
+// applyCloudflareGatewayAuthHeaders rewrites auth headers for the
+// cloudflare-ai-gateway path. The gateway authenticates with
+// cf-aig-authorization: Bearer <apiKey>, while any upstream Authorization
+// header (BYOK) is preserved as-is and left unset when absent (BearerAuth is
+// disabled so the gateway key is not sent as the upstream Authorization).
+func applyCloudflareGatewayAuthHeaders(headers map[string]string, key string) map[string]string {
+	out := map[string]string{}
+	for k, v := range headers {
+		out[k] = v
+	}
+	ApplyCloudflareGatewayAuthHeadersInPlace(out, key)
+	return out
+}
+
+// ApplyCloudflareGatewayAuthHeadersInPlace mutates headers for the
+// cloudflare-ai-gateway path: any upstream Authorization header (BYOK) is kept,
+// otherwise Authorization is left unset, and cf-aig-authorization carries the
+// gateway key.
+func ApplyCloudflareGatewayAuthHeadersInPlace(headers map[string]string, key string) {
+	headers["cf-aig-authorization"] = "Bearer " + key
 }
 
 func OpenAIChatCopilotHeaders(messages []OpenAIChatMessage) map[string]string {

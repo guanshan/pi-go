@@ -2,6 +2,9 @@ package ai
 
 import (
 	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
 	"testing"
 )
 
@@ -19,6 +22,74 @@ func TestAuthStorageAPIKeyPrecedenceAndPersistence(t *testing.T) {
 	reloaded := NewAuthStorage(dir)
 	if got := reloaded.APIKey(Model{Provider: "anthropic"}); got != "stored-key" {
 		t.Fatalf("stored key=%q", got)
+	}
+}
+
+func TestAuthStorageCreatesPrivateParentDir(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX permission bits are not meaningful on Windows")
+	}
+	// A fresh agent dir that does not exist yet must be created 0700 with the
+	// auth file 0600 (matching src/core/auth-storage.ts).
+	agentDir := filepath.Join(t.TempDir(), "nested", "agent")
+	auth := NewAuthStorage(agentDir)
+	if err := auth.SaveAPIKey("anthropic", "stored-key"); err != nil {
+		t.Fatal(err)
+	}
+	dirInfo, err := os.Stat(agentDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if perm := dirInfo.Mode().Perm(); perm != 0o700 {
+		t.Fatalf("auth dir perm=%o, want 0700", perm)
+	}
+	fileInfo, err := os.Stat(filepath.Join(agentDir, "auth.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if perm := fileInfo.Mode().Perm(); perm != 0o600 {
+		t.Fatalf("auth file perm=%o, want 0600", perm)
+	}
+}
+
+func TestAuthStorageTightensExistingParentDir(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX permission bits are not meaningful on Windows")
+	}
+	agentDir := filepath.Join(t.TempDir(), "agent")
+	if err := os.MkdirAll(agentDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	auth := NewAuthStorage(agentDir)
+	if err := auth.SaveAPIKey("anthropic", "stored-key"); err != nil {
+		t.Fatal(err)
+	}
+	dirInfo, err := os.Stat(agentDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if perm := dirInfo.Mode().Perm(); perm != 0o700 {
+		t.Fatalf("auth dir perm=%o, want 0700", perm)
+	}
+}
+
+// P2-6: auth.json must be written with 2-space indent, matching TS
+// (auth-storage.ts:219,290,447), not tabs.
+func TestAuthStorageWritesTwoSpaceIndent(t *testing.T) {
+	dir := t.TempDir()
+	auth := NewAuthStorage(dir)
+	if err := auth.SaveAPIKey("anthropic", "stored-key"); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(filepath.Join(dir, "auth.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), "\n  \"anthropic\"") {
+		t.Fatalf("expected 2-space indent, got:\n%s", data)
+	}
+	if strings.Contains(string(data), "\n\t") {
+		t.Fatalf("auth.json must not use tab indent, got:\n%s", data)
 	}
 }
 

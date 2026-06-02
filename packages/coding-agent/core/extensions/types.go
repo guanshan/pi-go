@@ -178,19 +178,31 @@ type MessageEndEvent struct {
 	Message agentcore.AgentMessage
 }
 
+// ToolCallEvent mirrors the TS ToolCallEvent (tool_call). The JSON shape matches
+// the TS API surface so script handlers receive { toolCallId, toolName, input }.
+// Input is the decoded tool arguments and is mutable: a script handler may mutate
+// it in place to patch the arguments before execution. Block/Reason carry the
+// handler's decision back to the caller (the script bridge writes the merged
+// payload back, so Object.assign({block,reason}) round-trips through the JSON).
 type ToolCallEvent struct {
-	Type       string
-	ToolCallID string
-	ToolName   string
-	Args       any
+	Type       string `json:"type"`
+	ToolCallID string `json:"toolCallId"`
+	ToolName   string `json:"toolName"`
+	Input      any    `json:"input"`
+	Block      bool   `json:"block,omitempty"`
+	Reason     string `json:"reason,omitempty"`
 }
 
+// ToolResultEvent mirrors the TS ToolResultEvent (tool_result). The JSON shape is
+// { toolCallId, toolName, input, content, details, isError }. A script handler can
+// override Content/Details/IsError; the bridge merges its returned result onto the
+// payload, so these fields carry the overridden values back to the caller.
 type ToolResultEvent struct {
-	Type       string
-	ToolCallID string
-	ToolName   string
-	Args       any
-	Content    []ai.ContentBlock
-	Details    any
-	IsError    bool
+	Type       string            `json:"type"`
+	ToolCallID string            `json:"toolCallId"`
+	ToolName   string            `json:"toolName"`
+	Input      any               `json:"input"`
+	Content    []ai.ContentBlock `json:"content"`
+	Details    any               `json:"details"`
+	IsError    bool              `json:"isError"`
 }

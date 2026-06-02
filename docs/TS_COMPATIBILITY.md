@@ -92,7 +92,6 @@ Still incomplete versus TS:
 - prompt cache/provider-specific parity outside OpenAI-compatible
   chat/completions
 - full TypeBox compiler error wording/localization parity
-- image generation providers beyond OpenRouter
 
 ## packages/agent
 
@@ -128,9 +127,12 @@ Implemented in Go:
   directory listing, canonical path, exists, directory/remove/temp helpers,
   shell execution, timeout/abort/shell-unavailable errors, and shell-capture
   integration
-- generic `Result<TValue,TError>` helpers plus a result-returning
-  `ExecutionEnv`/`ResultExecutionEnv` adapter for NodeExecutionEnv filesystem
-  and shell operations
+- local NodeExecutionEnv filesystem/shell error handling. NOTE: the TS
+  `ExecutionEnv` returns a neverthrow-style `Result<TValue,TError>`; the Go port
+  intentionally does not port that monad. There is no `Result[TValue,TError]`
+  type and no `ResultExecutionEnv` adapter in this repo. Instead Go uses
+  idiomatic `(value, error)` returns with typed errors (e.g. `*FileError` /
+  execution errors that implement `Unwrap()`), matching `packages/agent/harness/env`.
 - local compaction and token estimation helpers
 - system prompt, prompt template, skill harness helpers
 - tests for prompt flow, continue/tool flow, JSONL repo, compaction, harness
@@ -146,21 +148,52 @@ Still incomplete versus TS:
 
 ## packages/tui
 
+Classification (ported / wired / not-wired):
+
+`packages/tui` is a ~9500-line component library. Most of it is **ported**
+(compiles, is unit-tested, and tracks the upstream TS TUI) but, under route A
+(see [docs/TUI_DESIGN.md](TUI_DESIGN.md)), the interactive coding-agent UI is
+driven by Bubble Tea, so the bulk of the library is **not wired** into any
+production path. To keep this distinction honest:
+
+- **Wired** (consumed by production code in `cmd/` + `packages/coding-agent`,
+  excluding tests): only five exported symbols are on a live path —
+  `TruncateToWidth`, `VisibleWidth`, `NewMarkdown`, `MarkdownTheme`, and
+  `FuzzyMatchString`. These are the allowlist enforced by
+  `scripts/check_arch.go` (`wiredTUIComponents`): wiring an additional component
+  requires adding it there and here, so dead code cannot silently become "live".
+  The only non-test importers are `core/interactive_tui.go`, `core/modes.go`,
+  and `cli/list_models.go`.
+- **Ported but not wired**: everything else listed under "Implemented in Go"
+  below — Input, SelectList, SettingsList, EditorComponent, Loader/
+  CancellableLoader, Image, ProcessTerminal, keybindings/keys, autocomplete,
+  stdin paste buffer, undo stack, kill ring, terminal image encoders/capability
+  detection, native-modifier helpers, etc. They exist and are tested but have no
+  production consumer yet; the interactive selectors/autocomplete/inline images
+  remain TODO (parity review topic 5: P1-3 markdown caching, P1-4 selectors,
+  P1-5 autocomplete).
+- **Intentionally not ported (route A)**: the upstream `TUI` event loop and
+  overlay machinery (see the dedicated subsection below).
+
+The "Implemented in Go" list below means **ported** (and where noted, wired); it
+does not imply the component is on the production interactive path.
+
 Implemented in Go:
 
 - Component, Container, Text, TruncatedText, Spacer, Box
-- Input/Editor, SelectList, SettingsList
+- single-line Input, Bubble Tea textarea integration in coding-agent, SelectList,
+  SettingsList
 - EditorComponent-style text/callback/history/autocomplete/padding surface for
-  custom editor integration
+  custom editor integration; the full upstream multi-line Editor remains a
+  Bubble-layer responsibility
 - Loader and CancellableLoader
 - Markdown text renderer with headings, paragraphs, fenced code blocks,
   blockquotes, horizontal rules, unordered/ordered lists, pipe tables, inline
   code, bold/italic/strikethrough, links with OSC 8 or URL fallback, padding,
   ANSI/OSC-aware visible width, and image-line preservation
-- Image fallback component
-- TUI and ProcessTerminal basics
-- overlay handles, hide/focus lifecycle, and simple overlay positioning
-- exported diff renderer helper
+- Image component with text fallback plus Kitty/iTerm2 sequence output when image
+  data and terminal capabilities are available
+- ProcessTerminal basics
 - key parsing, key matching, keybindings manager
 - fuzzy matching and autocomplete provider composition
 - stdin paste buffer
@@ -170,25 +203,71 @@ Implemented in Go:
   Terminal/VSCode/Alacritty, tmux/screen-safe fallbacks, truecolor and OSC 8
   hyperlink flags, image-line detection, OSC 8 hyperlink helper, and Kitty
   cleanup sequences
-- ProcessTerminal lifecycle surface for bracketed paste mode, Kitty protocol and
-  xterm modifyOtherKeys toggles, drain/reset handling, OSC 9;4 progress
-  keepalive, write-log path resolution, terminal dimensions, and Apple Terminal
-  Shift+Enter input normalization
+- ProcessTerminal output lifecycle helpers for bracketed paste mode, Kitty
+  protocol and xterm modifyOtherKeys toggles, drain/reset best-effort handling,
+  OSC 9;4 progress keepalive, write-log path resolution, terminal dimensions,
+  and Apple Terminal Shift+Enter input normalization helper
 - native modifier helper API with injectable helper and safe fallback
 - tests for render, input, settings, paste, keybindings, image dimensions,
   editor component surface, and native modifier fallback
+
+Intentionally not ported (route A — see [docs/TUI_DESIGN.md](TUI_DESIGN.md)):
+
+- the upstream `TUI` type and its overlay machinery (`OverlayHandle`,
+  hide/setHidden/focus/unfocus/isFocused, overlay positioning). `packages/tui`
+  deliberately does not own a main event loop, raw-mode stdin reader, `SIGWINCH`
+  handling, a differential renderer, or an overlay stack; the interactive
+  coding-agent UI is driven by Bubble Tea instead. There is therefore no Go
+  equivalent of the TS `TUI`/`OverlayHandle` public API.
 
 Still incomplete versus TS:
 
 - full differential renderer with cursor parity
 - OS raw-mode stdin handling, full Kitty keyboard negotiation, and real stdin
-  drain parity
+  drain parity in `packages/tui` itself (the interactive coding-agent path now
+  requests Bubble Tea keyboard enhancements)
 - complete editor behavior and autocomplete dropdown rendering parity
 - remaining markdown parser edge cases versus `marked`, nested block/list
   parity, and exact theme/style reset behavior
 - packaged macOS native modifier binary loading
 
 ## packages/coding-agent
+
+Public API surface and the `core` boundary (decision — parity review P1-F2):
+
+Upstream TS ships a single package (`@earendil-works/pi-coding-agent`) whose
+`src/index.ts` re-exports every public type from one entry point; downstream
+users only ever import that one package. In Go, `packages/coding-agent` is the
+public SDK facade, but its exported signatures reference roughly 103 distinct
+`core` / `core/extensions` implementation types directly — for example
+`CreateAgentSession` returns `*CreateAgentSessionResult{Session *core.AgentSession;
+Diagnostics []core.Diagnostic}`, `BuildSessionContext` takes `[]core.SessionEntry`
+and returns `core.SessionContext`, `NewCorePackageManager` returns
+`core.PackageManager`, and `DefineTool` returns `coreext.ToolDefinition`
+(`sdk_more.go`, `session_helpers.go`, `package_manager.go`). Arch guard rule P6
+(`scripts/check_arch.go`) forbids type aliases inside `packages/coding-agent`, so
+these types cannot be transparently re-exported behind a single-package facade
+the way TS does.
+
+**Decision: declare `packages/coding-agent/core` and
+`packages/coding-agent/core/extensions` to be public, stable sub-APIs**, rather
+than relaxing P6 to allow a re-export facade. Rationale:
+
+- It is the lowest-cost option that matches the code as it stands today, and it
+  is honest: downstream Go users already must import `core` / `core/extensions`
+  to name these return and parameter types, so calling them "implementation
+  detail" was misleading.
+- Relaxing P6 to permit `type AgentSession = core.AgentSession` style re-exports
+  would recover the TS "single import surface" shape, but at the cost of
+  duplicated godoc, added guard complexity, and a larger refactor; it was judged
+  not worth it for this pass and is explicitly not done here.
+- Stability expectation: `core` and `core/extensions` are now covered by the same
+  compatibility expectations as the `coding-agent` facade itself. Breaking
+  changes to their exported symbols are public API changes and should be treated
+  as such, not as free internal refactors.
+
+This decision is mirrored by a comment next to the P6 check in
+`scripts/check_arch.go`; do not loosen P6 without updating this section.
 
 Implemented in Go:
 
@@ -250,9 +329,15 @@ Implemented in Go:
 - session-root, commands-to-prompts, tools-to-bin, and deprecated extension
   directory migration helpers
 - frontmatter parsing/stripping, supported image MIME sniffing, HTML entity
-  decoding, ANSI stripping, shell environment/config helpers, path
-  normalization helpers, abortable sleep, binary-output sanitization, and
-  detached-child tracking helpers
+  decoding, ANSI stripping, path normalization helpers, abortable sleep, and
+  binary-output sanitization
+- shell environment/config helpers (agent-bin PATH injection). WIRED via a single
+  implementation: the bash tool and `AgentSession.ExecuteBash` set the command
+  environment through `core/tools.ShellEnv`, so the agent `bin` directory
+  (migrated `fd`/`rg` and package-installed CLIs) is prepended to `PATH`, mirroring
+  TS `getShellEnv()` (`src/utils/shell.ts:112-124`). The earlier redundant
+  map-based `GetShellEnv` in `packages/coding-agent/utils.go` was removed in favor
+  of this one (parity review topic 8 P1-G1).
 - public package manager with path/git/npm source parsing and progress events,
   including GitHub shorthand, explicit git URLs, scp-like SSH URLs, refs, and
   pinned-source detection
@@ -288,6 +373,26 @@ Partial versus TS:
   results from before-hooks; settings, rich `ctx.ui`, message renderers, and
   provider/model registration are not yet implemented
 
+Now wired (previously ported-but-dead helpers):
+
+- Detached child tracking: the registry moved to `packages/coding-agent/core/tools`
+  (`TrackDetachedChildPID` / `UntrackDetachedChildPID` /
+  `KillTrackedDetachedChildren` in `detached.go`) — the lowest package both shell
+  spawn sites and the signal handler can reach without an import cycle. Both
+  spawn paths now track their detached process group: `BashTool.Execute`
+  (`core/tools/bash.go`) and `AgentSession.ExecuteBash` (`core/session_api.go`)
+  call `TrackDetachedChildPID` after `Start` and untrack on completion. The
+  shutdown handler (`signal.go`) calls `catools.KillTrackedDetachedChildren()` on
+  SIGTERM/SIGHUP, matching `trackDetachedChildPid` / `killTrackedDetachedChildren`
+  in `src/utils/shell.ts`. Per-command aborts still kill the group via
+  `cmd.Cancel`; the registry additionally reaps background descendants left by a
+  normally-completed command when the whole agent is torn down.
+- `MarkPathIgnoredByCloudSync` (`packages/coding-agent/utils.go`): now called on
+  the shared npm install root right after it is created
+  (`package_manager.go`), mirroring `ensureNpmProject ->
+  markPathIgnoredByCloudSync` in `package-manager.ts` so large package directories
+  are not disrupted by Dropbox/iCloud sync.
+
 Still incomplete versus TS:
 
 - full interactive TUI mode parity
@@ -301,6 +406,40 @@ Still incomplete versus TS:
   viewer, including full tree branching behavior, vendored marked/highlight
   rendering, custom pre-rendered tool HTML, and theme injection
 - Windows self-update behavior
+
+Intentional behavioral divergences (safer or platform-specific; documented rather than aligned):
+
+- **Atomic write/edit (hardlinks/ownership)**: the `write` and `edit` tools write
+  via `atomicWriteFile` (temp file in the target dir, `EvalSymlinks`, then rename),
+  whereas TS writes in place (`fsWriteFile`). The Go approach is more crash-safe,
+  but `rename` swaps the inode, so it breaks hardlinks to the target, drops the
+  original inode's xattrs/ACLs, and (running as root) the replacement file's owner
+  may differ. Symlinks are preserved (the target is resolved before rename). This
+  is a deliberate robustness trade-off, not an oversight (parity review topic 8
+  P2-4).
+- **`write` byte count**: "Successfully wrote N bytes" reports the raw UTF-8 byte
+  length in Go vs the JS UTF-16 code-unit length in TS, so N differs for non-ASCII
+  content (parity review topic 4 P2-5).
+- **System prompt shape (partial)**: project context files and skills are now
+  injected with the TS XML shapes — `<project_context>` /
+  `<project_instructions path="...">` (system-prompt.ts:58-67) and
+  `<available_skills>` with `<name>/<description>/<location>` and the TS
+  `escapeXml` entities (skills.ts `formatSkillsForPrompt`) — replacing the old
+  markdown headings. Still partial vs TS: the built-in tool list is injected as a
+  `## Available Tools` markdown section of full tool descriptions rather than the
+  TS one-line `toolSnippets` + `Guidelines:` + `Pi documentation:` option-driven
+  default-prompt structure (`core/resources.go BuildSystemPrompt`).
+- **`grep` engine**: the grep tool now prefers a local `rg` binary (agent bin dir
+  then PATH), shelling out with the same flags as the TypeScript tool
+  (`--json --line-number --color=never --hidden`) so traversal/ignore semantics
+  and the Rust regex engine match exactly. When `rg` is absent it falls back to a
+  Go RE2 walk that produces byte-identical output for supported patterns; the
+  compile-error message names the engine so a pattern that behaves differently
+  than the TS CLI is explainable. Neither engine supports look-around or
+  backreferences (ripgrep would need `--pcre2`, which the TS CLI does not pass),
+  so that earlier "advanced regex works in TS" note was inaccurate. The Go path
+  also always excludes `.git` via `--glob '!.git'` (ripgrep 14 does not skip it
+  under `--hidden`), matching the RE2 fallback and never surfacing git internals.
 
 ## Verification Commands
 
@@ -316,3 +455,9 @@ go run ./cmd/pi --model faux/faux --no-session -p 'packages smoke'
 These checks prove the current Go package structure builds and the implemented
 surface works. They do not prove full TypeScript parity for the incomplete items
 above.
+
+CI matrix note: `go test -race` runs on `ubuntu-latest` and `macos-latest` only;
+`windows-latest` runs a plain `go test` (no `-race`) because the Go race detector
+needs a cgo/C toolchain that the Windows runner image does not provide. Concurrency
+regressions are therefore gated on the POSIX runners; Windows validates functional
+behavior without the race detector (`.github/workflows/ci.yml`).

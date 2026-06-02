@@ -5,18 +5,16 @@ import (
 	"errors"
 	"html"
 	"net/http"
-	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 	"unicode/utf8"
 
-	core "github.com/guanshan/pi-go/packages/coding-agent/core"
+	catools "github.com/guanshan/pi-go/packages/coding-agent/core/tools"
 )
 
 const imageTypeSniffBytes = 4100
@@ -190,38 +188,6 @@ func GetShellConfig(customShellPath ...string) (ShellConfig, error) {
 	return ShellConfig{Shell: "sh", Args: []string{"-c"}}, nil
 }
 
-func GetShellEnv(agentDirOpt ...string) map[string]string {
-	env := map[string]string{}
-	pathKey := "PATH"
-	for _, pair := range os.Environ() {
-		key, value, ok := strings.Cut(pair, "=")
-		if !ok {
-			continue
-		}
-		if strings.EqualFold(key, "PATH") {
-			pathKey = key
-		}
-		env[key] = value
-	}
-	agentDir := core.AgentDir()
-	if len(agentDirOpt) > 0 && agentDirOpt[0] != "" {
-		agentDir = agentDirOpt[0]
-	}
-	binDir := filepath.Join(agentDir, "bin")
-	pathEntries := filepath.SplitList(env[pathKey])
-	for _, entry := range pathEntries {
-		if entry == binDir {
-			return env
-		}
-	}
-	if env[pathKey] == "" {
-		env[pathKey] = binDir
-	} else {
-		env[pathKey] = binDir + string(os.PathListSeparator) + env[pathKey]
-	}
-	return env
-}
-
 func SanitizeBinaryOutput(value string) string {
 	var builder strings.Builder
 	for _, r := range value {
@@ -295,11 +261,9 @@ func NormalizePath(input string, options PathInputOptions) string {
 			return filepath.Join(home, normalized[2:])
 		}
 	}
-	if strings.HasPrefix(normalized, "file://") {
-		if parsed, err := url.Parse(normalized); err == nil {
-			if path, err := url.PathUnescape(parsed.Path); err == nil {
-				return path
-			}
+	if strings.HasPrefix(normalized, "file:") {
+		if path, ok := catools.FileURLToPath(normalized); ok {
+			return path
 		}
 	}
 	return normalized
@@ -365,36 +329,6 @@ func Sleep(ctx context.Context, duration time.Duration) error {
 		return errors.New("Aborted")
 	case <-timer.C:
 		return nil
-	}
-}
-
-var trackedDetachedChildren = struct {
-	sync.Mutex
-	pids map[int]struct{}
-}{pids: map[int]struct{}{}}
-
-func TrackDetachedChildPID(pid int) {
-	trackedDetachedChildren.Lock()
-	defer trackedDetachedChildren.Unlock()
-	trackedDetachedChildren.pids[pid] = struct{}{}
-}
-
-func UntrackDetachedChildPID(pid int) {
-	trackedDetachedChildren.Lock()
-	defer trackedDetachedChildren.Unlock()
-	delete(trackedDetachedChildren.pids, pid)
-}
-
-func KillTrackedDetachedChildren() {
-	trackedDetachedChildren.Lock()
-	pids := make([]int, 0, len(trackedDetachedChildren.pids))
-	for pid := range trackedDetachedChildren.pids {
-		pids = append(pids, pid)
-	}
-	trackedDetachedChildren.pids = map[int]struct{}{}
-	trackedDetachedChildren.Unlock()
-	for _, pid := range pids {
-		KillProcessTree(pid)
 	}
 }
 

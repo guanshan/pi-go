@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/guanshan/pi-go/packages/coding-agent/cli"
 )
@@ -60,10 +61,10 @@ func LoadResources(cwd, agentDir string, args cli.Args, settings *SettingsManage
 		filepath.Join(ProjectPiDir(cwd), "SYSTEM.md"),
 		filepath.Join(agentDir, "SYSTEM.md"),
 	)
-	loader.AppendPrompt = strings.Join(nonEmpty([]string{
-		loadFirstExisting(filepath.Join(agentDir, "APPEND_SYSTEM.md")),
-		loadFirstExisting(filepath.Join(ProjectPiDir(cwd), "APPEND_SYSTEM.md")),
-	}), "\n\n")
+	loader.AppendPrompt = loadFirstExisting(
+		filepath.Join(ProjectPiDir(cwd), "APPEND_SYSTEM.md"),
+		filepath.Join(agentDir, "APPEND_SYSTEM.md"),
+	)
 
 	if !args.NoPromptTemplates {
 		loader.loadConfiguredResourceType("prompts", agentDir, globalSettings.Prompts)
@@ -113,7 +114,8 @@ func LoadResources(cwd, agentDir string, args cli.Args, settings *SettingsManage
 		loader.Extensions = append(loader.Extensions, ResolveInCWD(cwd, ext))
 	}
 
-	sort.Strings(loader.ContextFiles)
+	// ContextFiles are intentionally NOT sorted: discoverContextFiles already
+	// returns them in TS order (global agent dir, then ancestors root->cwd).
 	loader.Themes = uniqueResourcePaths(loader.Themes)
 	loader.Extensions = uniqueResourcePaths(loader.Extensions)
 	return loader
@@ -137,36 +139,49 @@ func (r ResourceLoader) BuildSystemPrompt(args cli.Args, toolDescriptions []stri
 		}
 	}
 	if !args.NoContextFiles && len(r.ContextFiles) > 0 {
-		b.WriteString("\n\n## Project Context Files\n")
+		// Project context files are injected as a <project_context> XML block with
+		// one <project_instructions path="..."> element per file, mirroring TS
+		// buildSystemPrompt (system-prompt.ts:58-67) rather than markdown headings.
+		var blocks []string
 		for _, path := range r.ContextFiles {
 			content, err := os.ReadFile(path)
 			if err != nil {
 				continue
 			}
-			b.WriteString("\n### ")
-			b.WriteString(path)
-			b.WriteString("\n")
-			b.Write(bytes.TrimSpace(content))
-			b.WriteString("\n")
+			blocks = append(blocks, fmt.Sprintf("<project_instructions path=\"%s\">\n%s\n</project_instructions>\n\n", path, bytes.TrimSpace(content)))
+		}
+		if len(blocks) > 0 {
+			b.WriteString("\n\n<project_context>\n\nProject-specific instructions and guidelines:\n\n")
+			for _, block := range blocks {
+				b.WriteString(block)
+			}
+			b.WriteString("</project_context>\n")
 		}
 	}
-	if len(r.Skills) > 0 {
-		b.WriteString("\n\n## Available Skills\n")
+	// Skills are listed only when the read tool is available, since loading a
+	// skill's file requires reading it (mirrors TS system-prompt.ts:164). The
+	// block uses the <available_skills> XML shape from TS formatSkillsForPrompt
+	// (skills.ts) rather than a markdown list. Skills live in a map, so names are
+	// sorted for deterministic output (TS iterates an ordered slice).
+	if len(r.Skills) > 0 && toolDescriptionsHaveRead(toolDescriptions) {
 		names := make([]string, 0, len(r.Skills))
 		for name := range r.Skills {
 			names = append(names, name)
 		}
 		sort.Strings(names)
+		b.WriteString("\n\nThe following skills provide specialized instructions for specific tasks.\n")
+		b.WriteString("Use the read tool to load a skill's file when the task matches its description.\n")
+		b.WriteString("When a skill file references a relative path, resolve it against the skill directory (parent of SKILL.md / dirname of the path) and use that absolute path in tool commands.\n")
+		b.WriteString("\n<available_skills>\n")
 		for _, name := range names {
 			skill := r.Skills[name]
-			b.WriteString("- /skill:")
-			b.WriteString(skill.Name)
-			if skill.Description != "" {
-				b.WriteString(" - ")
-				b.WriteString(skill.Description)
-			}
-			b.WriteByte('\n')
+			b.WriteString("  <skill>\n")
+			b.WriteString("    <name>" + escapeXML(skill.Name) + "</name>\n")
+			b.WriteString("    <description>" + escapeXML(skill.Description) + "</description>\n")
+			b.WriteString("    <location>" + escapeXML(skill.Path) + "</location>\n")
+			b.WriteString("  </skill>\n")
 		}
+		b.WriteString("</available_skills>")
 	}
 	if r.AppendPrompt != "" {
 		b.WriteString("\n\n")
@@ -179,7 +194,41 @@ func (r ResourceLoader) BuildSystemPrompt(args cli.Args, toolDescriptions []stri
 		b.WriteString("\n\n")
 		b.WriteString(readTextArg(r.CWD, text))
 	}
-	return strings.TrimSpace(b.String())
+	out := strings.TrimSpace(b.String())
+	// Date and working directory are appended last, every turn (TS system-prompt.ts:168).
+	out += fmt.Sprintf("\nCurrent date: %s", time.Now().Format("2006-01-02"))
+	out += fmt.Sprintf("\nCurrent working directory: %s", filepath.ToSlash(r.CWD))
+	return out
+}
+
+// escapeXML escapes the five XML predefined entities exactly as the TypeScript
+// escapeXml helper (system-prompt.ts / skills.ts) does — note "&apos;"/"&quot;"
+// rather than Go html.EscapeString's numeric entities — so the skills block is
+// byte-identical to TS.
+func escapeXML(value string) string {
+	replacer := strings.NewReplacer(
+		"&", "&amp;",
+		"<", "&lt;",
+		">", "&gt;",
+		"\"", "&quot;",
+		"'", "&apos;",
+	)
+	return replacer.Replace(value)
+}
+
+// toolDescriptionsHaveRead reports whether the "read" tool is present in the
+// provided "name: description" tool descriptions.
+func toolDescriptionsHaveRead(toolDescriptions []string) bool {
+	for _, desc := range toolDescriptions {
+		name := desc
+		if idx := strings.IndexByte(desc, ':'); idx >= 0 {
+			name = desc[:idx]
+		}
+		if strings.TrimSpace(name) == "read" {
+			return true
+		}
+	}
+	return false
 }
 
 func (r ResourceLoader) ExpandInput(input string) (string, bool) {
@@ -213,17 +262,31 @@ func (r ResourceLoader) ExpandInput(input string) (string, bool) {
 }
 
 func discoverContextFiles(cwd, agentDir string) []string {
-	var files []string
-	for _, name := range []string{"AGENTS.md", "CLAUDE.md"} {
-		if path := filepath.Join(agentDir, name); fileExists(path) {
-			files = append(files, path)
-		}
-	}
-	for _, dir := range ancestorDirs(cwd) {
-		for _, name := range []string{"AGENTS.md", "CLAUDE.md"} {
+	// Mirror resource-loader.ts:57-112: each directory contributes only the FIRST
+	// matching candidate (all four casings), the global agent dir is loaded first,
+	// then ancestors ordered root->cwd, de-duplicated by absolute path. The caller
+	// must NOT re-sort the result (that would destroy this ordering).
+	candidates := []string{"AGENTS.md", "AGENTS.MD", "CLAUDE.md", "CLAUDE.MD"}
+	firstInDir := func(dir string) string {
+		for _, name := range candidates {
 			if path := filepath.Join(dir, name); fileExists(path) {
-				files = append(files, path)
+				return path
 			}
+		}
+		return ""
+	}
+	var files []string
+	seen := map[string]bool{}
+	if path := firstInDir(agentDir); path != "" {
+		files = append(files, path)
+		seen[path] = true
+	}
+	// ancestorDirs already yields root->cwd order, so append each hit to preserve
+	// it (matching TS, which walks cwd->root and unshifts to the same result).
+	for _, dir := range ancestorDirs(cwd) {
+		if path := firstInDir(dir); path != "" && !seen[path] {
+			files = append(files, path)
+			seen[path] = true
 		}
 	}
 	return files

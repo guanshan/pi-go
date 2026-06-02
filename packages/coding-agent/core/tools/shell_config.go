@@ -48,8 +48,76 @@ func ShellCommand(config ShellConfig, command string) *exec.Cmd {
 	return exec.Command(config.Shell, shellCommandArgs(config, command)...)
 }
 
+// ShellEnv returns the process environment with the agent bin directory
+// prepended to PATH, so commands migrated/installed there (fd, rg, package
+// CLIs) resolve. It mirrors getShellEnv() in src/utils/shell.ts:112-124 and
+// returns an os/exec-style ["KEY=value", ...] slice ready for cmd.Env. When
+// binDir is empty (agent dir unknown) the unmodified environment is returned.
+func ShellEnv(binDir string) []string {
+	environ := os.Environ()
+	if binDir == "" {
+		return environ
+	}
+	// Find the existing PATH key, preserving its original casing (matters on
+	// Windows where it may be "Path"), defaulting to "PATH".
+	pathKey := "PATH"
+	currentPath := ""
+	for _, pair := range environ {
+		key, value, ok := strings.Cut(pair, "=")
+		if !ok {
+			continue
+		}
+		if strings.EqualFold(key, "PATH") {
+			pathKey = key
+			currentPath = value
+			break
+		}
+	}
+	// If the bin dir is already on PATH, leave the environment unchanged.
+	for _, entry := range filepath.SplitList(currentPath) {
+		if entry == binDir {
+			return environ
+		}
+	}
+	updatedPath := binDir
+	if currentPath != "" {
+		updatedPath = binDir + string(os.PathListSeparator) + currentPath
+	}
+	out := make([]string, 0, len(environ)+1)
+	replaced := false
+	for _, pair := range environ {
+		key, _, ok := strings.Cut(pair, "=")
+		if ok && strings.EqualFold(key, "PATH") {
+			out = append(out, pathKey+"="+updatedPath)
+			replaced = true
+			continue
+		}
+		out = append(out, pair)
+	}
+	if !replaced {
+		out = append(out, pathKey+"="+updatedPath)
+	}
+	return out
+}
+
 func ShellCommandContext(ctx context.Context, config ShellConfig, command string) *exec.Cmd {
 	return exec.CommandContext(ctx, config.Shell, shellCommandArgs(config, command)...)
+}
+
+// ConfigureTreeKill makes cmd run in its own process group (where the platform
+// supports it) and kill the entire process tree when its context is canceled,
+// so an abort/timeout or signal shutdown does not leave grandchildren running.
+// This mirrors the wiring the bash tool uses; it is exported for the direct
+// shell path in AgentSession.ExecuteBash, which lives in another package.
+func ConfigureTreeKill(cmd *exec.Cmd) {
+	if cmd == nil {
+		return
+	}
+	configureProcessGroup(cmd)
+	cmd.Cancel = func() error {
+		killProcessGroup(cmd)
+		return nil
+	}
 }
 
 func shellCommandArgs(config ShellConfig, command string) []string {

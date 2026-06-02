@@ -118,7 +118,10 @@ func openAIStandardResponsesBody(options OpenAIResponsesRequestOptions) map[stri
 		body["model"] = AzureResponsesDeploymentName(options.ModelID)
 	}
 	cacheRetention := ResolveCacheRetention(options.CacheRetention)
-	if cacheRetention != "none" && options.SessionID != "" {
+	// Azure Responses sends prompt_cache_key whenever a sessionId is present,
+	// without the cacheRetention gate that openai-responses applies
+	// (azure-openai-responses.ts:258 vs openai-responses.ts:237).
+	if options.SessionID != "" && (options.API == "azure-openai-responses" || cacheRetention != "none") {
 		body["prompt_cache_key"] = ClampOpenAIPromptCacheKey(options.SessionID)
 		if options.API == "openai-responses" && cacheRetention == "long" && OpenAICompatSupportsLongCacheRetention(options.SupportsLongCacheRetention) {
 			body["prompt_cache_retention"] = "24h"
@@ -270,7 +273,11 @@ func OpenAIResponsesRequest(options OpenAIResponsesRequestOptions, key string) (
 		return CodexResponsesURL(options.BaseURL), headers, nil
 	default:
 		headers := RequestHeaders(options.ModelHeaders, options.RequestHeaders)
-		headers["Authorization"] = "Bearer " + key
+		if options.Provider == "cloudflare-ai-gateway" {
+			ApplyCloudflareGatewayAuthHeadersInPlace(headers, key)
+		} else {
+			headers["Authorization"] = "Bearer " + key
+		}
 		cacheRetention := ResolveCacheRetention(options.CacheRetention)
 		if cacheRetention != "none" && options.SessionID != "" {
 			if OpenAIResponsesSendSessionIDHeader(options.SendSessionIDHeader) {
@@ -352,6 +359,7 @@ func ResponsesUserMessage(msg OpenAIResponsesMessage) (map[string]any, bool) {
 func ResponsesAssistantItems(options OpenAIResponsesRequestOptions, msg OpenAIResponsesMessage, messageIndex int) []map[string]any {
 	out := []map[string]any{}
 	isDifferentModel := msg.Model != "" && msg.Model != options.ModelID && msg.Provider == options.Provider && msg.API == options.API
+	textBlockIndex := 0
 	for _, block := range msg.Blocks {
 		switch block.Type {
 		case "thinking":
@@ -370,11 +378,13 @@ func ResponsesAssistantItems(options OpenAIResponsesRequestOptions, msg OpenAIRe
 			if strings.TrimSpace(block.Text) == "" {
 				continue
 			}
+			messageID := ResponsesTextMessageID(block.TextSignature, messageIndex, textBlockIndex)
+			textBlockIndex++
 			out = append(out, map[string]any{
 				"type":   "message",
 				"role":   "assistant",
 				"status": "completed",
-				"id":     ResponsesTextMessageID(block.TextSignature, messageIndex),
+				"id":     messageID,
 				"content": []map[string]any{{
 					"type":        "output_text",
 					"text":        SanitizeProviderText(block.Text),

@@ -100,12 +100,9 @@ func (r *ModelRegistry) InitialModel(options InitialModelOptions) (Model, bool, 
 		}
 	}
 	for _, m := range r.Models {
-		if r.HasAuth(m) || m.Provider == "faux" {
+		if m.Provider != "faux" && r.HasAuth(m) {
 			return m, true, ""
 		}
-	}
-	if len(r.Models) > 0 {
-		return r.Models[0], true, "No configured API key found; selected first known model"
 	}
 	return Model{}, false, "No models available"
 }
@@ -128,12 +125,21 @@ func (r *ModelRegistry) HasAuth(model Model) bool {
 		return bedrockHasAuth(r.Auth, model)
 	}
 	if model.Provider == "google-vertex" {
-		return r.Auth.APIKey(model) != "" || aiproviders.HasGoogleVertexADC()
+		return r.modelAPIKey(model) != "" || aiproviders.HasGoogleVertexADC()
 	}
 	if IsCloudflareProvider(model.Provider) {
-		return r.Auth.APIKey(model) != "" && HasCloudflareRequiredEnv(model.Provider)
+		return r.modelAPIKey(model) != "" && HasCloudflareRequiredEnv(model.Provider)
 	}
-	return r.Auth.APIKey(model) != ""
+	return r.modelAPIKey(model) != ""
+}
+
+func (r *ModelRegistry) modelAPIKey(model Model) string {
+	if r != nil && r.Auth != nil {
+		if key := r.Auth.APIKey(model); key != "" {
+			return key
+		}
+	}
+	return model.APIKey
 }
 
 func (r *ModelRegistry) APIKey(ctx context.Context, model Model) (string, error) {

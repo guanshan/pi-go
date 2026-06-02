@@ -1,0 +1,4 @@
+{"type":"session","version":1,"id":"ts-legacy","timestamp":"2025-01-01T00:00:00Z","cwd":"/tmp/ts-legacy"}
+{"type":"message","timestamp":"2025-01-01T00:00:01Z","message":{"role":"user","content":"legacy user","timestamp":1735689601000}}
+{"type":"message","timestamp":"2025-01-01T00:00:02Z","message":{"role":"hookMessage","content":"legacy hook","timestamp":1735689602000}}
+{"type":"compaction","timestamp":"2025-01-01T00:00:03Z","summary":"legacy summary","firstKeptEntryIndex":1,"tokensBefore":10}

@@ -17,9 +17,11 @@ func TestCloudflareOpenAICompatibleBaseURLResolution(t *testing.T) {
 
 	var capturedPath string
 	var auth string
+	var cfAuth string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		capturedPath = r.URL.Path
 		auth = r.Header.Get("Authorization")
+		cfAuth = r.Header.Get("cf-aig-authorization")
 		var payload map[string]any
 		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
 			t.Fatal(err)
@@ -49,8 +51,14 @@ func TestCloudflareOpenAICompatibleBaseURLResolution(t *testing.T) {
 	if capturedPath != "/v1/account-id/gateway-id/compat/chat/completions" {
 		t.Fatalf("path=%q", capturedPath)
 	}
-	if auth != "Bearer cf-key" {
-		t.Fatalf("auth=%q", auth)
+	// TS (openai-completions.ts:480-486) sends the gateway key only via
+	// cf-aig-authorization and leaves the upstream Authorization unset (null)
+	// unless a BYOK Authorization header was supplied.
+	if auth != "" {
+		t.Fatalf("upstream Authorization should be unset, got auth=%q", auth)
+	}
+	if cfAuth != "Bearer cf-key" {
+		t.Fatalf("cf-aig-authorization=%q", cfAuth)
 	}
 	if MessageText(response.Message) != "ok" {
 		t.Fatalf("message=%#v", response.Message)

@@ -43,8 +43,17 @@ type BashTool struct {
 	CWD           string
 	ShellPath     string
 	CommandPrefix string
+	// BinDir is the agent bin directory prepended to PATH for every command,
+	// matching getShellEnv() in TS. Passed in from the core package to avoid an
+	// import cycle (core/tools must not import core). Empty leaves PATH as-is.
+	BinDir string
 }
-type GrepTool struct{ CWD string }
+type GrepTool struct {
+	CWD string
+	// BinDir is the agent bin directory searched for a vendored rg binary before
+	// falling back to PATH. Empty consults PATH only.
+	BinDir string
+}
 type FindTool struct{ CWD string }
 type LsTool struct{ CWD string }
 
@@ -52,6 +61,8 @@ type BuiltinToolOptions struct {
 	ShellPath     string
 	CommandPrefix string
 	AutoResize    bool
+	// BinDir is the agent bin directory the bash tool prepends to PATH.
+	BinDir string
 }
 
 type FilterOptions struct {

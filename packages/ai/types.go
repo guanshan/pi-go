@@ -623,6 +623,17 @@ func MessageText(msg Message) string {
 		if text, ok := custom.Content.(string); ok {
 			return text
 		}
+		if custom.Summary != "" {
+			return custom.Summary
+		}
+	}
+	if custom, ok := msg.(*CustomMessage); ok && custom != nil {
+		if text, ok := custom.Content.(string); ok {
+			return text
+		}
+		if custom.Summary != "" {
+			return custom.Summary
+		}
 	}
 	return ""
 }

@@ -13,7 +13,7 @@ const DefaultAgentMaxLoop = 25
 type ToolSet map[string]catools.RuntimeTool
 
 func BuiltinTools(cwd string, settings *SettingsManager) ToolSet {
-	options := catools.BuiltinToolOptions{AutoResize: true}
+	options := catools.BuiltinToolOptions{AutoResize: true, BinDir: BinDir()}
 	if settings != nil {
 		options.ShellPath = settings.mergedString(settings.Global.ShellPath, settings.Project.ShellPath, "")
 		options.CommandPrefix = settings.ShellCommandPrefix()

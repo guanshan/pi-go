@@ -1,0 +1,13 @@
+{"type":"session","version":3,"id":"ts-branch","timestamp":"2025-01-02T00:00:00Z","cwd":"/tmp/ts-branch"}
+{"type":"message","id":"1","parentId":null,"timestamp":"2025-01-02T00:00:01Z","message":{"role":"user","content":"start","timestamp":1735776001000}}
+{"type":"message","id":"2","parentId":"1","timestamp":"2025-01-02T00:00:02Z","message":{"role":"assistant","content":[{"type":"text","text":"r1"}],"api":"anthropic-messages","provider":"anthropic","model":"claude-test","usage":{"input":1,"output":1,"cacheRead":0,"cacheWrite":0,"totalTokens":2},"stopReason":"stop","timestamp":1735776002000}}
+{"type":"message","id":"3","parentId":"2","timestamp":"2025-01-02T00:00:03Z","message":{"role":"user","content":"q2","timestamp":1735776003000}}
+{"type":"message","id":"4","parentId":"3","timestamp":"2025-01-02T00:00:04Z","message":{"role":"assistant","content":[{"type":"text","text":"r2"}],"api":"anthropic-messages","provider":"anthropic","model":"claude-test","usage":{"input":1,"output":1,"cacheRead":0,"cacheWrite":0,"totalTokens":2},"stopReason":"stop","timestamp":1735776004000}}
+{"type":"compaction","id":"5","parentId":"4","timestamp":"2025-01-02T00:00:05Z","summary":"Compacted history","firstKeptEntryId":"3","tokensBefore":1000}
+{"type":"message","id":"6","parentId":"5","timestamp":"2025-01-02T00:00:06Z","message":{"role":"user","content":"q3","timestamp":1735776006000}}
+{"type":"message","id":"7","parentId":"6","timestamp":"2025-01-02T00:00:07Z","message":{"role":"assistant","content":[{"type":"text","text":"r3"}],"api":"anthropic-messages","provider":"anthropic","model":"claude-test","usage":{"input":1,"output":1,"cacheRead":0,"cacheWrite":0,"totalTokens":2},"stopReason":"stop","timestamp":1735776007000}}
+{"type":"message","id":"8","parentId":"3","timestamp":"2025-01-02T00:00:08Z","message":{"role":"user","content":"wrong path","timestamp":1735776008000}}
+{"type":"message","id":"9","parentId":"8","timestamp":"2025-01-02T00:00:09Z","message":{"role":"assistant","content":[{"type":"text","text":"wrong response"}],"api":"anthropic-messages","provider":"anthropic","model":"claude-test","usage":{"input":1,"output":1,"cacheRead":0,"cacheWrite":0,"totalTokens":2},"stopReason":"stop","timestamp":1735776009000}}
+{"type":"branch_summary","id":"10","parentId":"3","timestamp":"2025-01-02T00:00:10Z","summary":"Tried wrong approach","fromId":"9"}
+{"type":"custom","id":"10a","parentId":"10","timestamp":"2025-01-02T00:00:11Z","customType":"fixture","data":{"foo":"bar"}}
+{"type":"message","id":"11","parentId":"10a","timestamp":"2025-01-02T00:00:12Z","message":{"role":"user","content":"better approach","timestamp":1735776012000}}

@@ -15,7 +15,7 @@ func TestDetectCapabilitiesFromEnv(t *testing.T) {
 	}{
 		{name: "unknown", env: map[string]string{}, images: ImageProtocolNone, trueColor: false, hyperlinks: false},
 		{name: "truecolor hint", env: map[string]string{"COLORTERM": "truecolor"}, images: ImageProtocolNone, trueColor: true, hyperlinks: false},
-		{name: "tmux blocks images and hyperlinks", env: map[string]string{"TMUX": "/tmp/tmux", "TERM_PROGRAM": "ghostty"}, images: ImageProtocolNone, trueColor: false, hyperlinks: false},
+		{name: "tmux blocks images and hyperlinks by default", env: map[string]string{"TMUX": "/tmp/tmux", "TERM_PROGRAM": "ghostty"}, images: ImageProtocolNone, trueColor: false, hyperlinks: false},
 		{name: "tmux trusts explicit truecolor", env: map[string]string{"TERM": "tmux-256color", "COLORTERM": "24bit"}, images: ImageProtocolNone, trueColor: true, hyperlinks: false},
 		{name: "kitty", env: map[string]string{"KITTY_WINDOW_ID": "1"}, images: ImageProtocolKitty, trueColor: true, hyperlinks: true},
 		{name: "ghostty", env: map[string]string{"TERM_PROGRAM": "ghostty"}, images: ImageProtocolKitty, trueColor: true, hyperlinks: true},
@@ -37,6 +37,36 @@ func TestDetectCapabilitiesFromEnv(t *testing.T) {
 				t.Fatalf("iterm2 compatibility flag mismatch: %#v", caps)
 			}
 		})
+	}
+}
+
+func TestDetectCapabilitiesFromEnvTmuxHyperlinkProbe(t *testing.T) {
+	caps := DetectCapabilitiesFromEnvWithTmuxProbe(map[string]string{"TMUX": "/tmp/tmux", "COLORTERM": "truecolor"}, func() bool {
+		return true
+	})
+	if caps.Images != ImageProtocolNone || !caps.TrueColor || !caps.Hyperlinks {
+		t.Fatalf("tmux forwarded caps=%#v", caps)
+	}
+	caps = DetectCapabilitiesFromEnvWithTmuxProbe(map[string]string{"TERM": "screen-256color", "COLORTERM": "truecolor"}, func() bool {
+		t.Fatal("screen should not call tmux probe")
+		return true
+	})
+	if caps.Images != ImageProtocolNone || !caps.TrueColor || caps.Hyperlinks {
+		t.Fatalf("screen caps=%#v", caps)
+	}
+
+	// tmux that does not forward OSC 8 keeps hyperlinks off.
+	caps = DetectCapabilitiesFromEnvWithTmuxProbe(map[string]string{"TERM": "tmux-256color"}, func() bool {
+		return false
+	})
+	if caps.Images != ImageProtocolNone || caps.TrueColor || caps.Hyperlinks {
+		t.Fatalf("tmux non-forwarding caps=%#v", caps)
+	}
+
+	// A nil probe must not panic and defaults hyperlinks off.
+	caps = DetectCapabilitiesFromEnvWithTmuxProbe(map[string]string{"TMUX": "/tmp/tmux"}, nil)
+	if caps.Hyperlinks {
+		t.Fatalf("nil probe should leave hyperlinks off: %#v", caps)
 	}
 }
 
@@ -65,6 +95,20 @@ func TestTerminalImageProtocolsAndHyperlinks(t *testing.T) {
 	}
 	if got := Hyperlink("click me", "https://example.com"); got != "\x1b]8;;https://example.com\x1b\\click me\x1b]8;;\x1b\\" {
 		t.Fatalf("hyperlink=%q", got)
+	}
+}
+
+func TestEncodeKittyChunksLargePayloads(t *testing.T) {
+	data := []byte(strings.Repeat("x", 4096))
+	seq := EncodeKitty(data, ImageRenderOptions{ID: 99})
+	if !strings.Contains(seq, ",m=1;") {
+		t.Fatalf("first chunk missing m=1: %q", seq[:min(len(seq), 120)])
+	}
+	if !strings.Contains(seq, "\x1b_Gm=0;") {
+		t.Fatalf("last chunk missing m=0: %q", seq[len(seq)-min(len(seq), 120):])
+	}
+	if strings.Count(seq, "\x1b_G") < 2 {
+		t.Fatalf("expected multiple kitty chunks: %q", seq)
 	}
 }
 

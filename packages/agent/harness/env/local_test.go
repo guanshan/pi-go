@@ -5,7 +5,9 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -137,5 +139,116 @@ func TestLocalExecutionEnvExecAndErrors(t *testing.T) {
 	_, err = env.Exec(ctx, "sleep 1", ExecOptions{Timeout: 10 * time.Millisecond})
 	if !errors.As(err, &execErr) || execErr.Code != ExecErrTimeout {
 		t.Fatalf("timeout err=%#v", err)
+	}
+}
+
+// TestLocalExecutionEnvExecCallbackError mirrors the TS callback_error test: a
+// panicking output callback must surface as ExecErrCallback and terminate the
+// child process tree so its delayed side effects never run.
+func TestLocalExecutionEnvExecCallbackError(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("requires a POSIX shell for the delayed-write child")
+	}
+	ctx := context.Background()
+	dir := t.TempDir()
+	env, err := NewLocalExecutionEnv(dir, "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	marker := filepath.Join(dir, "after-kill")
+	for _, tc := range []struct {
+		name string
+		opts ExecOptions
+	}{
+		{"stdout", ExecOptions{OnStdout: func(string) { panic("boom") }}},
+		{"stderr", ExecOptions{OnStderr: func(string) { panic("boom") }}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_ = os.Remove(marker)
+			stream := ">&2"
+			if tc.name == "stdout" {
+				stream = ""
+			}
+			cmd := `printf "x" ` + stream + `; sleep 5; touch "` + marker + `"`
+			_, err := env.Exec(ctx, cmd, tc.opts)
+			var execErr *ExecutionError
+			if !errors.As(err, &execErr) || execErr.Code != ExecErrCallback {
+				t.Fatalf("expected callback_error, got %#v", err)
+			}
+			if _, statErr := os.Stat(marker); statErr == nil {
+				t.Fatal("child kept running after callback error: marker file was created")
+			}
+		})
+	}
+}
+
+// TestLocalExecutionEnvExecCallbackErrorNoLeak ensures a panicking callback on a
+// long-running child kills the process and leaves no exec copy goroutines behind:
+// recovering at the writer boundary must not leak the cmd's internal pumps.
+func TestLocalExecutionEnvExecCallbackErrorNoLeak(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("requires a POSIX shell for the long-running child")
+	}
+	ctx := context.Background()
+	env, err := NewLocalExecutionEnv(t.TempDir(), "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := runtime.NumGoroutine()
+	// Emit output (triggering the panicking callback) then linger so the child is
+	// only gone if Exec actually killed its process tree.
+	_, err = env.Exec(ctx, `printf "x"; sleep 5`, ExecOptions{
+		OnStdout: func(string) { panic("boom") },
+	})
+	var execErr *ExecutionError
+	if !errors.As(err, &execErr) || execErr.Code != ExecErrCallback {
+		t.Fatalf("expected callback_error, got %#v", err)
+	}
+	// The copy goroutines should unwind once Wait returns; allow a brief grace
+	// period before asserting we did not strand any.
+	deadline := time.Now().Add(2 * time.Second)
+	for runtime.NumGoroutine() > before+2 && time.Now().Before(deadline) {
+		runtime.Gosched()
+		time.Sleep(10 * time.Millisecond)
+	}
+	if leaked := runtime.NumGoroutine() - before; leaked > 2 {
+		t.Fatalf("leaked %d goroutines after callback error", leaked)
+	}
+}
+
+// TestLocalExecutionEnvConcurrentTempDirs guards the tempDirs slice against the
+// agent loop's parallel tool execution: multiple goroutines create temp
+// dirs/files on a shared env while another calls Cleanup. Run with -race.
+func TestLocalExecutionEnvConcurrentTempDirs(t *testing.T) {
+	ctx := context.Background()
+	env, err := NewLocalExecutionEnv(t.TempDir(), "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var wg sync.WaitGroup
+	for i := 0; i < 16; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if _, err := env.CreateTempDir(ctx, "pi-"); err != nil {
+				t.Errorf("CreateTempDir: %v", err)
+			}
+			if _, err := env.CreateTempFile(ctx, "pi-", ".tmp"); err != nil {
+				t.Errorf("CreateTempFile: %v", err)
+			}
+		}()
+	}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		if err := env.Cleanup(); err != nil {
+			t.Errorf("Cleanup: %v", err)
+		}
+	}()
+	wg.Wait()
+	// A final Cleanup must remove everything that survived the concurrent run
+	// without leaking entries or double-freeing the slice.
+	if err := env.Cleanup(); err != nil {
+		t.Fatalf("final Cleanup: %v", err)
 	}
 }

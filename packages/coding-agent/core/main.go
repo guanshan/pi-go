@@ -7,8 +7,10 @@ import (
 	"io"
 	"os"
 	"strings"
+	"sync"
 
 	"github.com/guanshan/pi-go/packages/ai"
+	aiutils "github.com/guanshan/pi-go/packages/ai/utils"
 	"github.com/guanshan/pi-go/packages/coding-agent/cli"
 	coreext "github.com/guanshan/pi-go/packages/coding-agent/core/extensions"
 )
@@ -19,7 +21,20 @@ func Main(ctx context.Context, argv []string) error {
 
 type MainOptions struct {
 	ExtensionFactories []coreext.Factory
+	// PackageManagerFactory supplies the full package manager for CLI
+	// install/remove/update. When nil, the legacy in-package installer is used.
+	PackageManagerFactory PackageManagerFactory
+	// Shutdown installs OS-signal-driven shutdown once the agent runtime exists.
+	// It receives a dispose callback to run before the process exits and returns
+	// a stop func that uninstalls the handler. Supplied by the binary layer so
+	// core stays free of platform-specific signal code. When nil, the default
+	// OS signal behavior applies.
+	Shutdown ShutdownInstaller
 }
+
+// ShutdownInstaller wires a runtime-dispose callback into signal handling. See
+// MainOptions.Shutdown.
+type ShutdownInstaller func(dispose func()) (stop func())
 
 func MainWithOptions(ctx context.Context, argv []string, options MainOptions) error {
 	cwd, err := os.Getwd()
@@ -30,7 +45,7 @@ func MainWithOptions(ctx context.Context, argv []string, options MainOptions) er
 	agentDir := AgentDir()
 	settings := NewSettingsManager(cwd, agentDir)
 
-	if handled, err := HandlePackageCommand(argv, cwd, agentDir, settings); handled || err != nil {
+	if handled, err := HandlePackageCommand(argv, cwd, agentDir, settings, options.PackageManagerFactory); handled || err != nil {
 		return err
 	}
 
@@ -108,19 +123,6 @@ func MainWithOptions(ctx context.Context, argv []string, options MainOptions) er
 		return nil
 	}
 
-	if args.APIKey != "" {
-		provider := args.Provider
-		if provider == "" && strings.Contains(args.Model, "/") {
-			provider = strings.SplitN(args.Model, "/", 2)[0]
-		}
-		if provider == "" {
-			provider = settings.DefaultProvider()
-		}
-		if provider != "" {
-			auth.SetRuntime(provider, args.APIKey)
-		}
-	}
-
 	if args.ListModels != nil {
 		cli.PrintModels(os.Stdout, registry, *args.ListModels)
 		return nil
@@ -137,7 +139,10 @@ func MainWithOptions(ctx context.Context, argv []string, options MainOptions) er
 		}
 		return err
 	}
-	if err := validateSessionCWD(session, args.NoSession); err != nil {
+	if err := validateSessionCWD(session, cwd, isNonInteractiveMode(args), os.Stdin, os.Stderr); err != nil {
+		if errors.Is(err, cli.ErrSessionSelectionCancelled) {
+			return nil
+		}
 		return err
 	}
 	if session.CWD() != "" && session.CWD() != services.Cwd {
@@ -177,7 +182,24 @@ func MainWithOptions(ctx context.Context, argv []string, options MainOptions) er
 	if warning != "" {
 		fmt.Fprintln(os.Stderr, "Warning:", warning)
 	}
+	// --api-key binds the supplied key to the RESOLVED session model's provider,
+	// so it must run after model resolution. Without a resolved model there is no
+	// provider to bind to, which is a fatal error. Mirrors TS main.ts:641-651.
+	if args.APIKey != "" {
+		if !ok {
+			return fmt.Errorf("--api-key requires a model to be specified via --model, --provider/--model, or --models")
+		}
+		auth.SetRuntime(model.Provider, args.APIKey)
+	}
+	// When no real model resolved, non-interactive modes (print/json/rpc) must not
+	// silently run against a faux model: error with the TS no-model guidance and
+	// exit non-zero. Interactive mode keeps the faux fallback so the user can pick
+	// a model via /model. Explicit "--model faux/faux" sets ok=true above, so it is
+	// unaffected. Mirrors TS main.ts:731-734.
 	if !ok {
+		if isNonInteractiveMode(args) {
+			return fmt.Errorf("%s", formatNoModelsAvailableMessage())
+		}
 		model = ai.Model{Provider: "faux", ID: "faux", API: "faux"}
 	}
 	thinking := settings.DefaultThinkingLevel()
@@ -198,7 +220,10 @@ func MainWithOptions(ctx context.Context, argv []string, options MainOptions) er
 	}
 	toolNames := append([]string(nil), args.Tools...)
 	excludeToolNames := append([]string(nil), args.ExcludeTools...)
-	scopedModels := resolveScopedModels(registry, args.Models)
+	scopedModels, scopedWarnings := resolveScopedModels(registry, args.Models)
+	for _, scopedWarning := range scopedWarnings {
+		fmt.Fprintln(os.Stderr, "Warning:", scopedWarning)
+	}
 	var runtime *AgentSessionRuntime
 	runtime, err = CreateAgentSessionRuntime(ctx, func(ctx context.Context, options CreateAgentSessionRuntimeFactoryInput) (CreateAgentSessionRuntimeResult, error) {
 		activeModel := model
@@ -251,6 +276,33 @@ func MainWithOptions(ctx context.Context, argv []string, options MainOptions) er
 		return err
 	}
 
+	// An error-level diagnostic (e.g. an explicitly requested extension that
+	// failed to load) is fatal: abort before creating a session turn or calling
+	// the provider, mirroring TS reportDiagnostics + process.exit(1) (main.ts:
+	// 725-727). Diagnostics were already printed during service creation above;
+	// here we only enforce the non-zero exit. --help and --list-models return
+	// earlier, so they stay lenient as in TS.
+	if err := fatalDiagnostic(runtime.Diagnostics()); err != nil {
+		// Dispose synchronously here since we return before installing the defer
+		// below would matter; the deferred guard is harmless if unset.
+		_ = runtime.Dispose(ctx)
+		return err
+	}
+
+	// Dispose the runtime exactly once on any exit path so extension/session
+	// shutdown hooks (session_shutdown) always fire — on normal return and on
+	// the signal path below. Mirrors the dispose/shutdown finally blocks in the
+	// TS print/rpc/interactive modes.
+	var disposeOnce sync.Once
+	disposeRuntime := func() {
+		disposeOnce.Do(func() { _ = runtime.Dispose(ctx) })
+	}
+	defer disposeRuntime()
+	if options.Shutdown != nil {
+		stop := options.Shutdown(disposeRuntime)
+		defer stop()
+	}
+
 	if args.Mode == cli.ModeRPC {
 		return RunRPC(ctx, runtime, os.Stdin, os.Stdout)
 	}
@@ -270,11 +322,32 @@ func MainWithOptions(ctx context.Context, argv []string, options MainOptions) er
 	if args.Print || args.Mode == cli.ModeJSON {
 		exit, err := RunPrintMode(ctx, runtime, args.Mode, initial.Message, initial.Images, os.Stdout, os.Stderr, initial.Remaining)
 		if exit != 0 {
+			// os.Exit skips deferred disposal, so dispose explicitly first.
+			disposeRuntime()
 			os.Exit(exit)
 		}
 		return err
 	}
 	return RunInteractiveMode(ctx, runtime, initial.Message, initial.Images, os.Stdin, os.Stdout, os.Stderr, initial.Remaining)
+}
+
+// fatalDiagnostic returns a non-nil error if any diagnostic is error-level, so
+// the caller can abort with a non-zero exit. The individual diagnostic messages
+// are already printed at service-creation time, so the returned error is a short
+// summary that avoids re-printing the full message.
+func fatalDiagnostic(diagnostics []Diagnostic) error {
+	for _, diagnostic := range diagnostics {
+		if diagnostic.Type == DiagError {
+			return fmt.Errorf("failed to load required resources")
+		}
+	}
+	return nil
+}
+
+// isNonInteractiveMode reports whether the CLI runs in a mode that never prompts
+// the user (print/json/rpc), matching the TS `appMode !== "interactive"` checks.
+func isNonInteractiveMode(args cli.Args) bool {
+	return args.Print || args.Mode == cli.ModeJSON || args.Mode == cli.ModeRPC
 }
 
 // capitalizeASCII upper-cases the first byte of s. It is used for short,
@@ -376,11 +449,31 @@ func createSession(args cli.Args, cwd, sessionDir string, settings *SettingsMana
 		return ForkSessionWithID(path, cwd, sessionDir, args.SessionID)
 	}
 	if args.Session != "" {
-		path, err := ResolveSessionPath(args.Session, cwd, sessionDir)
-		if err != nil {
-			return nil, err
+		resolved := ResolveSession(args.Session, cwd, sessionDir)
+		switch resolved.Type {
+		case ResolvedSessionPathType, ResolvedSessionLocal:
+			return OpenSession(resolved.Path, cwd)
+		case ResolvedSessionGlobal:
+			// A cross-project hit must NOT be silently opened. Non-interactive modes
+			// get a clear error; interactive callers are prompted to fork the session
+			// into the current project, aborting cleanly if declined (mirrors TS
+			// main.ts:288-300).
+			if isNonInteractiveMode(args) {
+				return nil, fmt.Errorf("session found in different project: %s\nRe-run from that directory, or use --fork to copy it into the current project", resolved.CWD)
+			}
+			fmt.Fprintf(stderr, "Session found in different project: %s\n", resolved.CWD)
+			confirmed, err := cli.Confirm(stdin, stderr, "Fork this session into current directory?")
+			if err != nil {
+				return nil, err
+			}
+			if !confirmed {
+				fmt.Fprintln(stderr, "Aborted.")
+				return nil, cli.ErrSessionSelectionCancelled
+			}
+			return ForkSessionWithID(resolved.Path, cwd, sessionDir, "")
+		default:
+			return nil, fmt.Errorf("no session found matching %q", resolved.Arg)
 		}
-		return OpenSession(path, cwd)
 	}
 	if args.Continue {
 		return ContinueRecent(cwd, sessionDir)
@@ -413,24 +506,43 @@ func createSession(args cli.Args, cwd, sessionDir string, settings *SettingsMana
 	return NewSessionManager(cwd, sessionDir)
 }
 
-func validateSessionCWD(session *SessionManager, allowMissing bool) error {
-	if session == nil || allowMissing {
+// validateSessionCWD enforces that a stored session's working directory still
+// exists, mirroring TS getMissingSessionCwdIssue + MissingSessionCwdError
+// (session-cwd.ts). In-memory sessions (no session file) are skipped, matching
+// the TS `!sessionFile` early return. When the stored cwd is missing,
+// non-interactive callers get the TS-worded error; interactive callers are
+// prompted to continue in the current cwd (mirroring TS
+// formatMissingSessionCwdPrompt + the Continue/Cancel selector), and on confirm
+// the session's runtime cwd is overridden to fallbackCwd without rewriting the
+// session file. Declining aborts cleanly via cli.ErrSessionSelectionCancelled.
+func validateSessionCWD(session *SessionManager, fallbackCwd string, nonInteractive bool, stdin io.Reader, stderr io.Writer) error {
+	if session == nil {
 		return nil
 	}
-	cwd := strings.TrimSpace(session.CWD())
-	if cwd == "" {
+	sessionFile := session.File()
+	if sessionFile == "" {
 		return nil
 	}
-	info, err := os.Stat(cwd)
+	sessionCwd := strings.TrimSpace(session.CWD())
+	if sessionCwd == "" {
+		return nil
+	}
+	if _, err := os.Stat(sessionCwd); err == nil {
+		return nil
+	}
+	if nonInteractive {
+		return fmt.Errorf("Stored session working directory does not exist: %s\nSession file: %s\nCurrent working directory: %s", sessionCwd, sessionFile, fallbackCwd)
+	}
+	fmt.Fprintf(stderr, "cwd from session file does not exist\n%s\n\ncontinue in current cwd\n%s\n", sessionCwd, fallbackCwd)
+	confirmed, err := cli.Confirm(stdin, stderr, "Continue in current cwd?")
 	if err != nil {
-		if os.IsNotExist(err) {
-			return fmt.Errorf("session cwd no longer exists: %s", cwd)
-		}
-		return fmt.Errorf("cannot access session cwd %s: %w", cwd, err)
+		return err
 	}
-	if !info.IsDir() {
-		return fmt.Errorf("session cwd is not a directory: %s", cwd)
+	if !confirmed {
+		fmt.Fprintln(stderr, "Aborted.")
+		return cli.ErrSessionSelectionCancelled
 	}
+	session.OverrideCWD(fallbackCwd)
 	return nil
 }
 
@@ -486,12 +598,28 @@ func splitModelThinking(model string) (string, ai.ThinkingLevel, bool) {
 	return model[:idx], ai.ThinkingLevel(level), true
 }
 
-func resolveScopedModels(registry *ai.ModelRegistry, values []string) []ScopedModel {
+// resolveScopedModels resolves --models patterns to scoped models, returning any
+// per-pattern warnings (e.g. no-match). Glob patterns (containing *, ?, or [)
+// expand to ALL matching available models — matched against both "provider/id"
+// and the bare "id" — with the optional :thinking suffix applied to every
+// expanded model. Non-glob patterns resolve to a single best match. Mirrors TS
+// resolveModelScope (model-resolver.ts:255).
+func resolveScopedModels(registry *ai.ModelRegistry, values []string) ([]ScopedModel, []string) {
 	if registry == nil || len(values) == 0 {
-		return nil
+		return nil, nil
 	}
+	var available []ai.Model
 	resolved := make([]ScopedModel, 0, len(values))
+	var warnings []string
 	seen := map[string]struct{}{}
+	add := func(model ai.Model, thinking ai.ThinkingLevel) {
+		key := model.Provider + "/" + model.ID + ":" + string(thinking)
+		if _, exists := seen[key]; exists {
+			return
+		}
+		seen[key] = struct{}{}
+		resolved = append(resolved, ScopedModel{Model: model, ThinkingLevel: thinking})
+	}
 	for _, value := range values {
 		candidate := strings.TrimSpace(value)
 		if candidate == "" {
@@ -502,6 +630,20 @@ func resolveScopedModels(registry *ai.ModelRegistry, values []string) []ScopedMo
 			candidate = modelName
 			thinking = level
 		}
+		if isGlobPattern(candidate) {
+			if available == nil {
+				available = registry.AvailableConfigured()
+			}
+			matches := globMatchModels(available, candidate)
+			if len(matches) == 0 {
+				warnings = append(warnings, fmt.Sprintf("No models match pattern %q", value))
+				continue
+			}
+			for _, model := range matches {
+				add(model, thinking)
+			}
+			continue
+		}
 		provider := ""
 		modelID := candidate
 		if strings.Contains(candidate, "/") {
@@ -511,14 +653,32 @@ func resolveScopedModels(registry *ai.ModelRegistry, values []string) []ScopedMo
 		}
 		model, ok, _ := registry.Match(provider, modelID)
 		if !ok {
+			warnings = append(warnings, fmt.Sprintf("No models match pattern %q", value))
 			continue
 		}
-		key := model.Provider + "/" + model.ID + ":" + string(thinking)
-		if _, exists := seen[key]; exists {
-			continue
-		}
-		seen[key] = struct{}{}
-		resolved = append(resolved, ScopedModel{Model: model, ThinkingLevel: thinking})
+		add(model, thinking)
 	}
-	return resolved
+	return resolved, warnings
+}
+
+// isGlobPattern reports whether a model pattern uses glob syntax, matching the
+// TS check (model-resolver.ts) for `*`, `?`, or `[`.
+func isGlobPattern(pattern string) bool {
+	return strings.ContainsAny(pattern, "*?[")
+}
+
+// globMatchModels returns every model whose "provider/id" or bare "id" matches
+// the glob pattern case-insensitively, preserving registry order. Bracket
+// classes are not fully supported (GlobToRegexp only expands * and ?).
+func globMatchModels(models []ai.Model, pattern string) []ai.Model {
+	re := aiutils.GlobToRegexp(strings.ToLower(pattern))
+	var out []ai.Model
+	for _, model := range models {
+		fullID := strings.ToLower(model.Provider + "/" + model.ID)
+		id := strings.ToLower(model.ID)
+		if re.MatchString(fullID) || re.MatchString(id) {
+			out = append(out, model)
+		}
+	}
+	return out
 }

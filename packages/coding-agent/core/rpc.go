@@ -217,7 +217,7 @@ func handleRPCCommand(ctx context.Context, runtime *AgentSessionRuntime, cmd rpc
 		agent.SetFollowUpMode(queueMode(cmd.Mode))
 		w.response(cmd.ID, "set_follow_up_mode", true, nil, "")
 	case "compact":
-		result, err := agent.Compact(cmd.CustomInstructions, sink)
+		result, err := agent.CompactWithContext(ctx, cmd.CustomInstructions, sink)
 		if err != nil {
 			return err
 		}

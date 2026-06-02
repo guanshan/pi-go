@@ -30,7 +30,7 @@ func ProviderEnvKeys(provider string) []string {
 	case "google":
 		return []string{"GEMINI_API_KEY", "GOOGLE_API_KEY"}
 	case "google-vertex":
-		return []string{"GOOGLE_CLOUD_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY"}
+		return []string{"GOOGLE_CLOUD_API_KEY"}
 	case "azure-openai", "azure-openai-responses":
 		return []string{"AZURE_OPENAI_API_KEY"}
 	case "amazon-bedrock":

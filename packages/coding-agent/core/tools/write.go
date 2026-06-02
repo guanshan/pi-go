@@ -28,7 +28,7 @@ func (t WriteTool) Execute(ctx context.Context, raw json.RawMessage, _ ToolUpdat
 	if err := json.Unmarshal(raw, &args); err != nil || args.Path == "" {
 		return toolError("Invalid write input: path and content are required")
 	}
-	abs := ResolveInCWD(t.CWD, args.Path)
+	abs := ResolveToolPath(t.CWD, args.Path)
 	return withFileMutationQueue(abs, func() ai.ToolResult {
 		if err := ctx.Err(); err != nil {
 			return toolError(err.Error())

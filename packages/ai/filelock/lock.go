@@ -8,10 +8,15 @@ import (
 	"time"
 )
 
-// Tuning constants. These mirror the retry/stale behaviour the TypeScript
-// baseline gets from proper-lockfile so concurrent pi processes serialize access
-// instead of clobbering each other.
-const (
+// Tuning knobs. These mirror the retry/stale behaviour the TypeScript baseline
+// gets from proper-lockfile so concurrent pi processes serialize access instead
+// of clobbering each other. They are package-level vars (not consts) solely so
+// tests can shrink the durations for deterministic, fast stale/heartbeat/retry
+// coverage; production code never mutates them. The safety invariant
+// heartbeat < staleAge must always hold (see TestHeartbeatBelowStaleAge): a live
+// holder must be able to refresh its lock before it is judged abandoned, or
+// live processes would steal each other's locks.
+var (
 	staleAge   = 30 * time.Second
 	maxRetries = 100
 	retryDelay = 20 * time.Millisecond

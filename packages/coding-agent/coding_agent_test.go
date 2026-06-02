@@ -3,6 +3,7 @@ package codingagent
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -10,7 +11,52 @@ import (
 
 	"github.com/guanshan/pi-go/packages/ai"
 	core "github.com/guanshan/pi-go/packages/coding-agent/core"
+	catools "github.com/guanshan/pi-go/packages/coding-agent/core/tools"
 )
+
+type probeTool struct{}
+
+func (probeTool) Name() string           { return "probe" }
+func (probeTool) Description() string    { return "probe tool" }
+func (probeTool) Schema() map[string]any { return map[string]any{"type": "object"} }
+func (probeTool) Execute(context.Context, json.RawMessage, catools.ToolUpdate) ai.ToolResult {
+	return ai.ToolResult{Content: ai.TextBlocks("ok")}
+}
+
+// TestCreateAgentSessionMergesCustomToolsThroughCore verifies the root facade
+// routes through the core SDK: custom tools are merged on top of the builtin
+// tool set rather than replacing it, and the core diagnostics/fallback fields
+// are surfaced on the result.
+func TestCreateAgentSessionMergesCustomToolsThroughCore(t *testing.T) {
+	dir := t.TempDir()
+	registry := ai.NewModelRegistry(dir, ai.NewAuthStorage(dir))
+	model, _, _ := registry.Match("faux", "faux")
+	result, err := CreateAgentSession(CreateAgentSessionOptions{
+		CWD:         t.TempDir(),
+		AgentDir:    dir,
+		Registry:    registry,
+		Model:       model,
+		CustomTools: core.ToolSet{"probe": probeTool{}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tools := result.Session.Tools
+	if _, ok := tools["probe"]; !ok {
+		t.Fatalf("custom tool not merged: %v", toolNames(tools))
+	}
+	if _, ok := tools["read"]; !ok {
+		t.Fatalf("builtin tools dropped when custom tools provided: %v", toolNames(tools))
+	}
+}
+
+func toolNames(tools core.ToolSet) []string {
+	names := make([]string, 0, len(tools))
+	for name := range tools {
+		names = append(names, name)
+	}
+	return names
+}
 
 func TestCreateAgentSessionAndPrompt(t *testing.T) {
 	dir := t.TempDir()

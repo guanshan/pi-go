@@ -23,13 +23,6 @@ func (h *AgentHarness) NavigateTree(ctx context.Context, targetID string, opts N
 	}
 	defer release()
 
-	target, err := h.sess.Entry(ctx, targetID)
-	if err != nil {
-		return NavigateTreeResult{}, err
-	}
-	if target == nil {
-		return NavigateTreeResult{}, &agent.AgentError{Code: agent.AgentErrInvalidArgument, Msg: "target entry not found"}
-	}
 	oldLeaf, err := h.sess.LeafID(ctx)
 	if err != nil {
 		return NavigateTreeResult{}, err
@@ -37,6 +30,16 @@ func (h *AgentHarness) NavigateTree(ctx context.Context, targetID string, opts N
 	oldLeafID := ""
 	if oldLeaf != nil {
 		oldLeafID = *oldLeaf
+	}
+	if oldLeafID == targetID {
+		return NavigateTreeResult{Canceled: false}, nil
+	}
+	target, err := h.sess.Entry(ctx, targetID)
+	if err != nil {
+		return NavigateTreeResult{}, err
+	}
+	if target == nil {
+		return NavigateTreeResult{}, &agent.AgentError{Code: agent.AgentErrInvalidArgument, Msg: "target entry not found"}
 	}
 	collected, err := harnesscompaction.CollectEntriesForBranchSummary(ctx, h.sess, oldLeaf, targetID)
 	if err != nil {
@@ -61,10 +64,14 @@ func (h *AgentHarness) NavigateTree(ctx context.Context, targetID string, opts N
 	}
 
 	summary := opts.Summary
+	summaryDetails := opts.Details
 	fromHook := opts.GeneratedFromHook
 	if before != nil {
 		if before.Summary != nil {
 			summary = before.Summary.Summary
+			if len(before.Summary.ReadFiles) > 0 || len(before.Summary.ModifiedFiles) > 0 {
+				summaryDetails = branchSummaryDetails(before.Summary.ReadFiles, before.Summary.ModifiedFiles)
+			}
 			fromHook = true
 		}
 		if before.CustomInstructions != "" {
@@ -95,6 +102,7 @@ func (h *AgentHarness) NavigateTree(ctx context.Context, targetID string, opts N
 			return NavigateTreeResult{}, err
 		}
 		summary = generated.Summary
+		summaryDetails = branchSummaryDetails(generated.ReadFiles, generated.ModifiedFiles)
 	}
 
 	var editorText string
@@ -111,7 +119,7 @@ func (h *AgentHarness) NavigateTree(ctx context.Context, targetID string, opts N
 	}
 	var move *session.BranchMove
 	if strings.TrimSpace(summary) != "" {
-		move = &session.BranchMove{Summary: strings.TrimSpace(summary), Details: opts.Details, FromHook: fromHook}
+		move = &session.BranchMove{Summary: strings.TrimSpace(summary), Details: summaryDetails, FromHook: fromHook}
 	}
 	newLeafID, err := h.sess.MoveTo(ctx, newLeaf, move)
 	if err != nil {
@@ -168,6 +176,13 @@ func customMessageText(content any) string {
 		return b.String()
 	default:
 		return ""
+	}
+}
+
+func branchSummaryDetails(readFiles, modifiedFiles []string) map[string]any {
+	return map[string]any{
+		"readFiles":     readFiles,
+		"modifiedFiles": modifiedFiles,
 	}
 }
 

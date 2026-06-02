@@ -88,10 +88,6 @@ func TestPathAndShellUtilities(t *testing.T) {
 	if IsLocalPath("https://example.com/repo.git") {
 		t.Fatal("remote URL considered local")
 	}
-	env := GetShellEnv(home)
-	if env["PATH"] == "" {
-		t.Fatal("PATH missing")
-	}
 }
 
 func TestSleepAndSanitize(t *testing.T) {

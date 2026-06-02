@@ -32,6 +32,7 @@ type CreateAgentSessionOptions struct {
 	NoTools               NoToolsMode
 	Tools                 []string
 	ExcludeTools          []string
+	CustomTools           ToolSet
 	ResourceLoader        *ResourceLoader
 	ResourceLoaderOptions DefaultResourceLoaderOptions
 	SessionManager        *SessionManager
@@ -80,6 +81,7 @@ func CreateAgentSession(ctx context.Context, options CreateAgentSessionOptions) 
 		ScopedModels:   options.ScopedModels,
 		Tools:          options.Tools,
 		ExcludeTools:   options.ExcludeTools,
+		CustomTools:    options.CustomTools,
 		NoTools:        options.NoTools,
 	})
 }
