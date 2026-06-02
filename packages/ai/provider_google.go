@@ -363,9 +363,12 @@ func googleUsage(usage aiproviders.GoogleUsage) Usage {
 
 func googleGenAIClient(ctx context.Context, req ChatRequest, key string, vertex bool, headers map[string]string) (*genai.Client, error) {
 	config := &genai.ClientConfig{
-		APIKey:      key,
-		Backend:     genai.BackendGeminiAPI,
-		HTTPClient:  providerHTTPClient(req),
+		APIKey:  key,
+		Backend: genai.BackendGeminiAPI,
+		// The genai SDK's JSON encoder HTML-escapes < > & by default, diverging
+		// from the TS upstream (JSON.stringify). Wrap the transport so the outgoing
+		// request body carries the literal characters and matches TS wire bytes.
+		HTTPClient:  withHTMLUnescapingTransport(providerHTTPClient(req)),
 		HTTPOptions: aiproviders.GoogleHTTPOptions(req.Model.BaseURL, req.Model.Headers, headers, vertex),
 	}
 	if vertex {

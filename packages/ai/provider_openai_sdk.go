@@ -122,7 +122,9 @@ func (r *ModelRegistry) runOpenAIResponsesChatStream(ctx context.Context, req Ch
 func (r *ModelRegistry) runOpenAIResponsesHTTPStream(ctx context.Context, req ChatRequest, url string, headers map[string]string, body map[string]any, partial AssistantMessage, stream *AssistantMessageEventStream) (AssistantMessage, error) {
 	streamBody := cloneMap(body)
 	streamBody["stream"] = true
-	rawBody, err := json.Marshal(streamBody)
+	// MarshalJSON keeps < > & literal to match the TS upstream wire bytes (the
+	// SDK path already disables HTML escaping; this is the manual HTTP fallback).
+	rawBody, err := aiproviders.MarshalJSON(streamBody)
 	if err != nil {
 		return openAIStreamError(partial, err, stream)
 	}

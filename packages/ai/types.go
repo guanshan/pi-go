@@ -299,6 +299,7 @@ func detectOpenAICompletionsCompat(model Model) OpenAICompletionsCompat {
 	isMoonshot := provider == "moonshotai" || provider == "moonshotai-cn" || strings.Contains(baseLower, "api.moonshot.")
 	isCloudflareWorkersAI := provider == "cloudflare-workers-ai" || strings.Contains(baseLower, "api.cloudflare.com")
 	isCloudflareAIGateway := provider == "cloudflare-ai-gateway" || strings.Contains(baseLower, "gateway.ai.cloudflare.com")
+	isOpenRouter := provider == "openrouter" || strings.Contains(baseLower, "openrouter.ai")
 	isDeepSeekThinkingFormat := provider == "deepseek" || strings.Contains(baseLower, "deepseek.com") || strings.Contains(strings.ToLower(model.ID), "deepseek-v4")
 	isNonStandard := provider == "cerebras" ||
 		strings.Contains(baseLower, "cerebras.ai") ||
@@ -331,12 +332,15 @@ func detectOpenAICompletionsCompat(model Model) OpenAICompletionsCompat {
 		thinkingFormat = "zai"
 	case isTogether:
 		thinkingFormat = "together"
-	case provider == "openrouter" || strings.Contains(baseLower, "openrouter.ai"):
+	case isOpenRouter:
 		thinkingFormat = "openrouter"
 	}
 	return OpenAICompletionsCompat{
-		SupportsStore:                               !isNonStandard,
-		SupportsDeveloperRole:                       !isNonStandard,
+		SupportsStore: !isNonStandard,
+		// OpenRouter reasoning models use the standard `system` role, not
+		// `developer` (most OpenRouter backends reject developer). Mirrors
+		// openai-completions.ts: supportsDeveloperRole: !isNonStandard && !isOpenRouter.
+		SupportsDeveloperRole:                       !isNonStandard && !isOpenRouter,
 		SupportsReasoningEffort:                     !isGrok && !isZai && !isMoonshot && !isTogether && !isCloudflareAIGateway,
 		SupportsUsageInStreaming:                    true,
 		MaxTokensField:                              maxTokensField,

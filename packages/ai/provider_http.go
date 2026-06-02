@@ -1,11 +1,63 @@
 package ai
 
 import (
+	"bytes"
 	"context"
+	"io"
 	"net/http"
+	"strings"
 
 	aiproviders "github.com/guanshan/pi-go/packages/ai/providers"
 )
+
+// htmlUnescapingTransport wraps an http.RoundTripper and rewrites outgoing JSON
+// request bodies so the HTML-significant characters < > & appear literally rather
+// than HTML-escaped (\uXXXX). It is used to align third-party SDKs whose internal
+// JSON encoder HTML-escapes by default (e.g. google.golang.org/genai) with the
+// TypeScript upstream's JSON.stringify wire bytes. Bodies are only rewritten when
+// the request advertises a JSON content type and exposes a re-readable body.
+type htmlUnescapingTransport struct {
+	base http.RoundTripper
+}
+
+func (t htmlUnescapingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	base := t.base
+	if base == nil {
+		base = http.DefaultTransport
+	}
+	if req != nil && req.Body != nil && isJSONContentType(req.Header.Get("Content-Type")) {
+		if raw, err := io.ReadAll(req.Body); err == nil {
+			_ = req.Body.Close()
+			rewritten := aiproviders.UnescapeJSONHTML(raw)
+			// Clone the request so we never mutate the caller's *http.Request.
+			clone := req.Clone(req.Context())
+			clone.Body = io.NopCloser(bytes.NewReader(rewritten))
+			clone.ContentLength = int64(len(rewritten))
+			clone.GetBody = func() (io.ReadCloser, error) {
+				return io.NopCloser(bytes.NewReader(rewritten)), nil
+			}
+			return base.RoundTrip(clone)
+		}
+	}
+	return base.RoundTrip(req)
+}
+
+func isJSONContentType(value string) bool {
+	value = strings.ToLower(value)
+	return strings.Contains(value, "application/json") || strings.Contains(value, "+json")
+}
+
+// withHTMLUnescapingTransport returns a copy of client whose transport rewrites
+// HTML-escaped JSON request bodies to their literal form. The input client is not
+// mutated (callers may share it), and a nil client falls back to a new one.
+func withHTMLUnescapingTransport(client *http.Client) *http.Client {
+	if client == nil {
+		client = aiproviders.NewHTTPClient()
+	}
+	wrapped := *client
+	wrapped.Transport = htmlUnescapingTransport{base: client.Transport}
+	return &wrapped
+}
 
 func (r *ModelRegistry) doJSON(ctx context.Context, req ChatRequest, model Model, key string, body any, extraHeaders map[string]string) ([]byte, error) {
 	headers := map[string]string{}

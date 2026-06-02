@@ -3,7 +3,6 @@ package providers
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -94,7 +93,9 @@ func DoJSONURL(ctx context.Context, url, userAgent string, headers map[string]st
 }
 
 func DoJSONURLWithClient(ctx context.Context, url, userAgent string, headers map[string]string, body any, httpClient *http.Client, options RequestOptions) ([]byte, error) {
-	data, err := json.Marshal(body)
+	// MarshalJSON (not json.Marshal) so < > & are sent literally, matching the
+	// TS upstream wire bytes. Used by the Mistral and Google providers.
+	data, err := MarshalJSON(body)
 	if err != nil {
 		return nil, err
 	}

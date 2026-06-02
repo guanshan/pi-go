@@ -60,6 +60,14 @@ func (s *StreamAccumulator) SawChunk() bool {
 	return s.sawChunk
 }
 
+// SawFinishReason reports whether any streamed choice carried a finish_reason.
+// Mirrors the TypeScript `hasFinishReason` guard in openai-completions.ts: a
+// stream that ends without a finish_reason is treated as truncated/failed rather
+// than a silent successful "stop".
+func (s *StreamAccumulator) SawFinishReason() bool {
+	return s.finishReason != ""
+}
+
 func (s *StreamAccumulator) Apply(chunk openai.ChatCompletionChunk) []StreamUpdate {
 	s.sawChunk = true
 	if s.responseID == "" {
@@ -69,12 +77,21 @@ func (s *StreamAccumulator) Apply(chunk openai.ChatCompletionChunk) []StreamUpda
 		s.responseModel = chunk.Model
 	}
 	if chunk.Usage.PromptTokens != 0 || chunk.Usage.CompletionTokens != 0 || chunk.Usage.TotalTokens != 0 {
-		cacheRead := int(chunk.Usage.PromptTokensDetails.CachedTokens)
-		s.usage = aiproviders.OpenAIChatUsage{
-			Input:       aiproviders.MaxInt(0, int(chunk.Usage.PromptTokens)-cacheRead),
-			Output:      int(chunk.Usage.CompletionTokens),
-			CacheRead:   cacheRead,
-			TotalTokens: int(chunk.Usage.TotalTokens),
+		// Parse usage from the chunk's raw JSON so the non-standard
+		// cache_write_tokens (OpenRouter/DS4) and DeepSeek prompt_cache_hit_tokens
+		// fallback are honored exactly like the non-streaming path; the typed SDK
+		// chunk struct omits both. Fall back to the typed fields only if the raw
+		// JSON is unavailable.
+		if usage, ok := aiproviders.OpenAIChatStreamUsageFromRaw([]byte(chunk.RawJSON())); ok {
+			s.usage = usage
+		} else {
+			cacheRead := int(chunk.Usage.PromptTokensDetails.CachedTokens)
+			s.usage = aiproviders.OpenAIChatUsage{
+				Input:       aiproviders.MaxInt(0, int(chunk.Usage.PromptTokens)-cacheRead),
+				Output:      int(chunk.Usage.CompletionTokens),
+				CacheRead:   cacheRead,
+				TotalTokens: int(chunk.Usage.TotalTokens),
+			}
 		}
 	}
 	var updates []StreamUpdate
@@ -120,11 +137,20 @@ func (s *StreamAccumulator) Apply(chunk openai.ChatCompletionChunk) []StreamUpda
 func (s *StreamAccumulator) ApplyRaw(raw []byte) ([]StreamUpdate, error) {
 	var errorPayload struct {
 		Error *struct {
-			Message string `json:"message"`
+			Message  string `json:"message"`
+			Metadata struct {
+				Raw string `json:"raw"`
+			} `json:"metadata"`
 		} `json:"error"`
 	}
 	if err := json.Unmarshal(raw, &errorPayload); err == nil && errorPayload.Error != nil {
-		return nil, errors.New(errorPayload.Error.Message)
+		message := errorPayload.Error.Message
+		// Some providers via OpenRouter put extra diagnostics in error.metadata.raw;
+		// append it to match openai-completions.ts.
+		if rawMetadata := errorPayload.Error.Metadata.Raw; rawMetadata != "" {
+			message += "\n" + rawMetadata
+		}
+		return nil, errors.New(message)
 	}
 	var chunk openai.ChatCompletionChunk
 	if err := json.Unmarshal(raw, &chunk); err != nil {
@@ -250,11 +276,13 @@ func (s *StreamAccumulator) applyRawExtensions(raw []byte) ([]StreamUpdate, erro
 	var extras struct {
 		Choices []struct {
 			Usage *struct {
-				PromptTokens     int `json:"prompt_tokens"`
-				CompletionTokens int `json:"completion_tokens"`
-				TotalTokens      int `json:"total_tokens"`
-				PromptDetails    struct {
-					CachedTokens int `json:"cached_tokens"`
+				PromptTokens         int `json:"prompt_tokens"`
+				CompletionTokens     int `json:"completion_tokens"`
+				TotalTokens          int `json:"total_tokens"`
+				PromptCacheHitTokens int `json:"prompt_cache_hit_tokens"`
+				PromptDetails        struct {
+					CachedTokens     int `json:"cached_tokens"`
+					CacheWriteTokens int `json:"cache_write_tokens"`
 				} `json:"prompt_tokens_details"`
 			} `json:"usage"`
 			Delta struct {
@@ -271,13 +299,17 @@ func (s *StreamAccumulator) applyRawExtensions(raw []byte) ([]StreamUpdate, erro
 	var updates []StreamUpdate
 	for _, choice := range extras.Choices {
 		if choice.Usage != nil {
-			cacheRead := choice.Usage.PromptDetails.CachedTokens
-			s.usage = aiproviders.OpenAIChatUsage{
-				Input:       aiproviders.MaxInt(0, choice.Usage.PromptTokens-cacheRead),
-				Output:      choice.Usage.CompletionTokens,
-				CacheRead:   cacheRead,
-				TotalTokens: choice.Usage.TotalTokens,
-			}
+			// Mirror parseChunkUsage for the non-standard choice.usage location
+			// (Moonshot): include cache_write_tokens and the prompt_cache_hit_tokens
+			// fallback so cacheWrite/cacheRead are not under-reported.
+			s.usage = aiproviders.OpenAIChatUsageFromValues(
+				choice.Usage.PromptTokens,
+				choice.Usage.CompletionTokens,
+				choice.Usage.TotalTokens,
+				choice.Usage.PromptDetails.CachedTokens,
+				choice.Usage.PromptDetails.CacheWriteTokens,
+				choice.Usage.PromptCacheHitTokens,
+			)
 		}
 		if thinking, signature := aiproviders.OpenAIChatReasoningText(choice.Delta.ReasoningContent, choice.Delta.Reasoning, choice.Delta.ReasoningText, s.provider); thinking != "" {
 			s.thinking.WriteString(thinking)

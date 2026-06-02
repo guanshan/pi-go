@@ -703,3 +703,38 @@ func openAIChatParsedUsage(promptTokens, completionTokens, totalTokens, cachedTo
 		TotalTokens: totalTokens,
 	}
 }
+
+// OpenAIChatUsageFromValues applies the shared OpenAI usage accounting rules
+// (DeepSeek prompt_cache_hit_tokens fallback, cache_write subtraction, total
+// derivation) to already-extracted token counts. Exported so the streaming
+// accumulator computes usage identically to the non-streaming path.
+func OpenAIChatUsageFromValues(promptTokens, completionTokens, totalTokens, cachedTokens, cacheWriteTokens, promptCacheHitTokens int) OpenAIChatUsage {
+	return openAIChatParsedUsage(promptTokens, completionTokens, totalTokens, cachedTokens, cacheWriteTokens, promptCacheHitTokens)
+}
+
+// OpenAIChatStreamUsageFromRaw parses a streaming chunk's top-level `usage`
+// object (the chunk's raw JSON) into OpenAIChatUsage using exactly the same rules
+// as the non-streaming path. Crucially this includes the non-standard
+// cache_write_tokens (OpenRouter/DS4) and the DeepSeek-style
+// prompt_cache_hit_tokens fallback, both of which the typed SDK chunk struct does
+// not expose. Mirrors parseChunkUsage in openai-completions.ts. The second return
+// value reports whether a usage object was present.
+func OpenAIChatStreamUsageFromRaw(raw []byte) (OpenAIChatUsage, bool) {
+	var parsed struct {
+		Usage *struct {
+			PromptTokens         int `json:"prompt_tokens"`
+			CompletionTokens     int `json:"completion_tokens"`
+			TotalTokens          int `json:"total_tokens"`
+			PromptCacheHitTokens int `json:"prompt_cache_hit_tokens"`
+			PromptTokensDetails  struct {
+				CachedTokens     int `json:"cached_tokens"`
+				CacheWriteTokens int `json:"cache_write_tokens"`
+			} `json:"prompt_tokens_details"`
+		} `json:"usage"`
+	}
+	if err := json.Unmarshal(raw, &parsed); err != nil || parsed.Usage == nil {
+		return OpenAIChatUsage{}, false
+	}
+	u := parsed.Usage
+	return openAIChatParsedUsage(u.PromptTokens, u.CompletionTokens, u.TotalTokens, u.PromptTokensDetails.CachedTokens, u.PromptTokensDetails.CacheWriteTokens, u.PromptCacheHitTokens), true
+}

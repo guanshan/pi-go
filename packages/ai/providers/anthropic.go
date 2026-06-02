@@ -1,7 +1,9 @@
 package providers
 
 import (
+	"bytes"
 	"encoding/json"
+	"io"
 	"net/http"
 	"strings"
 
@@ -9,6 +11,27 @@ import (
 	anthropicoption "github.com/anthropics/anthropic-sdk-go/option"
 	anthropicparam "github.com/anthropics/anthropic-sdk-go/packages/param"
 )
+
+// unescapeJSONHTMLBodyMiddleware rewrites the outgoing JSON request body so the
+// HTML-significant characters < > & appear literally instead of HTML-escaped
+// (\uXXXX), matching the TypeScript upstream's JSON.stringify output. The
+// Anthropic SDK encoder HTML-escapes by default and offers no toggle, so the fix
+// is applied at the serialized-body layer. Bodies are only rewritten when they
+// are buffered JSON; streaming/unknown bodies are passed through untouched.
+func unescapeJSONHTMLBodyMiddleware(req *http.Request, next anthropicoption.MiddlewareNext) (*http.Response, error) {
+	if req != nil && req.Body != nil && req.GetBody != nil {
+		if raw, err := io.ReadAll(req.Body); err == nil {
+			_ = req.Body.Close()
+			rewritten := UnescapeJSONHTML(raw)
+			req.Body = io.NopCloser(bytes.NewReader(rewritten))
+			req.ContentLength = int64(len(rewritten))
+			req.GetBody = func() (io.ReadCloser, error) {
+				return io.NopCloser(bytes.NewReader(rewritten)), nil
+			}
+		}
+	}
+	return next(req)
+}
 
 func NewAnthropicClient(key, baseURL string, headers map[string]string, httpClient *http.Client, requestOptions ...RequestOptions) anthropic.Client {
 	return NewAnthropicClientWithAuth(key, baseURL, headers, httpClient, false, requestOptions...)
@@ -27,6 +50,13 @@ func NewAnthropicClientWithMode(key, baseURL string, headers map[string]string, 
 	options := firstRequestOptions(requestOptions)
 	opts := []anthropicoption.RequestOption{
 		anthropicoption.WithRequestTimeout(RequestTimeout(options)),
+		// The Anthropic Go SDK's internal JSON encoder HTML-escapes < > & by
+		// default (EscapeHTMLByDefault = true), which diverges from the TS upstream
+		// (JSON.stringify) wire bytes. Rewrite the serialized body to the literal
+		// characters so the request bytes match TS and prompt-cache hashing stays
+		// stable. The OpenAI Go SDK already disables this escaping, so no equivalent
+		// is needed there.
+		anthropicoption.WithMiddleware(unescapeJSONHTMLBodyMiddleware),
 	}
 	if gatewayAuth {
 		// Do not let the SDK contribute x-api-key / Authorization from the

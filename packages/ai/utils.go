@@ -3,6 +3,7 @@ package ai
 import (
 	"fmt"
 
+	aiproviders "github.com/guanshan/pi-go/packages/ai/providers"
 	aiutils "github.com/guanshan/pi-go/packages/ai/utils"
 )
 
@@ -150,6 +151,20 @@ func ShortHash(s string) string {
 
 func MergeHeaders(base map[string]string, override map[string]string) map[string]string {
 	return aiutils.MergeHeaders(base, override)
+}
+
+// marshalNoHTMLEscape serializes value to JSON without escaping the
+// HTML-significant characters < > &, matching the TypeScript upstream's
+// JSON.stringify wire bytes. Use it for any provider request body serialized by
+// our own code in this package.
+func marshalNoHTMLEscape(value any) ([]byte, error) {
+	return aiproviders.MarshalJSON(value)
+}
+
+// unescapeJSONHTML rewrites the < > & escapes that some third-party
+// SDKs (Anthropic) emit back into literal < > &, matching JSON.stringify.
+func unescapeJSONHTML(data []byte) []byte {
+	return aiproviders.UnescapeJSONHTML(data)
 }
 
 type SessionResourceCleanup = aiutils.SessionResourceCleanup

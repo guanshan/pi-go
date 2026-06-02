@@ -108,7 +108,8 @@ func (r *ModelRegistry) runMistralChatStream(ctx context.Context, req ChatReques
 	if err != nil {
 		return mistralStreamError(partial, err, stream)
 	}
-	rawBody, err := json.Marshal(body)
+	// MarshalJSON keeps < > & literal to match the TS upstream wire bytes.
+	rawBody, err := aiproviders.MarshalJSON(body)
 	if err != nil {
 		return mistralStreamError(partial, err, stream)
 	}

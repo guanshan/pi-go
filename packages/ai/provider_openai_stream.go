@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -66,6 +65,12 @@ func (r *ModelRegistry) runOpenAIChatStream(ctx context.Context, req ChatRequest
 		}
 		return openAIStreamError(message, fmt.Errorf("%s", message.ErrorMessage), stream)
 	}
+	if !accumulator.SawFinishReason() {
+		// Mirror openai-completions.ts: a stream that ends without a finish_reason
+		// is truncated; surface an error so the retry whitelist ("ended without")
+		// can re-issue the request instead of silently returning a partial "stop".
+		return openAIStreamError(message, fmt.Errorf("Stream ended without finish_reason"), stream)
+	}
 	tracker.Finish(stream, message)
 	stream.Push(AssistantMessageEvent{Type: "done", Reason: doneReason(message.StopReason), Partial: message, Message: message})
 	return message, nil
@@ -77,7 +82,9 @@ func (r *ModelRegistry) runOpenAIChatHTTPStream(ctx context.Context, req ChatReq
 	if _, ok := body["stream_options"]; !ok {
 		body["stream_options"] = map[string]any{"include_usage": true}
 	}
-	rawBody, err := json.Marshal(body)
+	// MarshalJSON keeps < > & literal to match the TS upstream wire bytes (the
+	// SDK path already disables HTML escaping; this is the manual HTTP fallback).
+	rawBody, err := aiproviders.MarshalJSON(body)
 	if err != nil {
 		return openAIStreamError(partial, err, stream)
 	}
@@ -167,6 +174,12 @@ func (r *ModelRegistry) runOpenAIChatHTTPStream(ctx context.Context, req ChatReq
 			message.ErrorMessage = "Provider returned an error stop reason"
 		}
 		return openAIStreamError(message, fmt.Errorf("%s", message.ErrorMessage), stream)
+	}
+	if !accumulator.SawFinishReason() {
+		// Mirror openai-completions.ts: a stream that ends without a finish_reason
+		// is truncated; surface an error so the retry whitelist ("ended without")
+		// can re-issue the request instead of silently returning a partial "stop".
+		return openAIStreamError(message, fmt.Errorf("Stream ended without finish_reason"), stream)
 	}
 	tracker.Finish(stream, message)
 	stream.Push(AssistantMessageEvent{Type: "done", Reason: doneReason(message.StopReason), Partial: message, Message: message})

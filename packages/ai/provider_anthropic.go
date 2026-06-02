@@ -89,12 +89,20 @@ func (r *ModelRegistry) runAnthropicChatStream(ctx context.Context, req ChatRequ
 	var accumulated anthropic.Message
 	blocks := []ContentBlock{}
 	sawEvent := false
+	sawMessageStart := false
+	sawMessageStop := false
 	for sdkStream.Next() {
 		if err := ctx.Err(); err != nil {
 			return anthropicStreamError(partial, err, stream)
 		}
 		sawEvent = true
 		event := sdkStream.Current()
+		switch event.Type {
+		case "message_start":
+			sawMessageStart = true
+		case "message_stop":
+			sawMessageStop = true
+		}
 		if err := accumulated.Accumulate(event); err != nil {
 			return anthropicStreamError(partial, err, stream)
 		}
@@ -113,6 +121,13 @@ func (r *ModelRegistry) runAnthropicChatStream(ctx context.Context, req ChatRequ
 		}
 		pushAssistantMessage(stream, response.Message)
 		return response.Message, nil
+	}
+	if sawMessageStart && !sawMessageStop {
+		// Mirror anthropic.ts iterateAnthropicEvents: a stream that began
+		// (message_start) but ended before message_stop was truncated. Surface an
+		// error so the retry whitelist ("stream ended before message_stop") can
+		// re-issue instead of silently returning a partial "stop".
+		return anthropicStreamError(partial, fmt.Errorf("Anthropic stream ended before message_stop"), stream)
 	}
 	response := anthropicChatResponse(aiproviders.ParseAnthropicMessage(&accumulated, isOAuth, tools), req.Model)
 	if response.Message.StopReason == "error" {

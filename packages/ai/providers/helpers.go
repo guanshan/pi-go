@@ -104,6 +104,100 @@ func ThinkingBudgetWithBudgets(level string, budgets ThinkingBudgets) int {
 	}
 }
 
+// MarshalJSON serializes value the same way TypeScript's JSON.stringify does:
+// it does NOT escape the HTML-significant characters < > &. Go's standard
+// json.Marshal HTML-escapes these (producing <, >, &), which
+// diverges from the TS upstream wire bytes and can break prompt-cache hashing on
+// providers that hash the raw request body. Use this for every provider request
+// body that is serialized by our own code (the OpenAI Go SDK already disables
+// HTML escaping; Anthropic/Google paths rely on this helper or UnescapeJSONHTML).
+//
+// Like encoding/json, this rejects values that cannot be marshalled. Unlike
+// Encoder.Encode it does not append a trailing newline, matching JSON.stringify.
+func MarshalJSON(value any) ([]byte, error) {
+	var buf bytes.Buffer
+	encoder := json.NewEncoder(&buf)
+	encoder.SetEscapeHTML(false)
+	if err := encoder.Encode(value); err != nil {
+		return nil, err
+	}
+	out := buf.Bytes()
+	// Encoder.Encode always appends a single trailing '\n'; strip it so the
+	// output matches json.Marshal / JSON.stringify byte-for-byte.
+	if n := len(out); n > 0 && out[n-1] == '\n' {
+		out = out[:n-1]
+	}
+	return out, nil
+}
+
+// UnescapeJSONHTML rewrites the <, > and & escape sequences that
+// Go's encoding/json emits for the HTML-significant characters < > & back into
+// their literal forms, matching what TypeScript's JSON.stringify produces. It is
+// used on already-serialized JSON produced by third-party SDKs (Anthropic) whose
+// internal encoder HTML-escapes by default and cannot be reconfigured.
+//
+// The scan is JSON-string aware: it only rewrites a sequence when the leading
+// backslash is a genuine escape introducer inside a JSON string literal. A
+// backslash that is itself escaped (e.g. the literal six-character text "<",
+// serialized as \\u003c) is left untouched, so payloads that legitimately contain
+// that text are not corrupted. The transform never changes the decoded value;
+// "<" and "<" decode to the same character.
+func UnescapeJSONHTML(data []byte) []byte {
+	// Fast path: nothing to do if none of the escapes are present.
+	if !bytes.Contains(data, []byte(`\u00`)) {
+		return data
+	}
+	out := make([]byte, 0, len(data))
+	inString := false
+	for i := 0; i < len(data); {
+		c := data[i]
+		if !inString {
+			if c == '"' {
+				inString = true
+			}
+			out = append(out, c)
+			i++
+			continue
+		}
+		// Inside a string literal.
+		if c == '\\' {
+			// Look at the escape sequence following the backslash.
+			if i+5 < len(data) && data[i+1] == 'u' {
+				switch string(data[i+1 : i+6]) {
+				case "u003c", "u003C":
+					out = append(out, '<')
+					i += 6
+					continue
+				case "u003e", "u003E":
+					out = append(out, '>')
+					i += 6
+					continue
+				case "u0026":
+					out = append(out, '&')
+					i += 6
+					continue
+				}
+			}
+			// Any other escape (including \\ and \"): copy both bytes verbatim so
+			// the second byte cannot be misread as a string terminator or as the
+			// start of another escape.
+			out = append(out, c)
+			i++
+			if i < len(data) {
+				out = append(out, data[i])
+				i++
+			}
+			continue
+		}
+		if c == '"' {
+			inString = false
+		}
+		out = append(out, c)
+		i++
+	}
+	return out
+}
+
 func ShortID() string {
 	b := make([]byte, 4)
 	if _, err := rand.Read(b); err != nil {

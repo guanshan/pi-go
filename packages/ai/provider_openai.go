@@ -181,7 +181,11 @@ func openAIChatMessages(messages []Message, model Model) []aiproviders.OpenAICha
 			Role:       MessageRole(msg),
 			Text:       MessageText(msg),
 			ToolCallID: MessageToolCallID(msg),
-			Blocks:     openAIChatMessageBlocks(MessageBlocks(msg)),
+			// Populate ToolName so models with requiresToolResultName get the tool
+			// `name` on tool messages, matching the Mistral/Google paths and the TS
+			// upstream (openai-completions.ts: requiresToolResultName && toolName).
+			ToolName: MessageToolName(msg),
+			Blocks:   openAIChatMessageBlocks(MessageBlocks(msg)),
 		})
 	}
 	return out

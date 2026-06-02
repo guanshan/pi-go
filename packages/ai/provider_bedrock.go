@@ -75,9 +75,17 @@ func (r *ModelRegistry) bedrockRuntimeClient(ctx context.Context, req ChatReques
 		region = "us-east-1"
 	}
 	baseEndpoint := aiproviders.BedrockBaseEndpoint(model.BaseURL, region)
+	// forcedHeaders are auth headers we set ourselves (the over-http bearer
+	// workaround); they bypass the reserved-header filter applied to
+	// caller-supplied headers.
+	var forcedHeaders map[string]string
 	if token := r.bedrockBearerToken(model); token != "" && os.Getenv("AWS_BEDROCK_SKIP_AUTH") != "1" {
 		if strings.HasPrefix(strings.ToLower(baseEndpoint), "http://") {
-			headers = aiproviders.MergeHeaders(map[string]string{"Authorization": "Bearer " + token}, headers)
+			// The AWS SDK's bearer auth scheme refuses to send Authorization over
+			// plaintext http, so set it ourselves and disable SDK signing. This
+			// header is intentional and must not be dropped by the reserved-header
+			// filter that guards against caller-supplied auth overrides.
+			forcedHeaders = map[string]string{"Authorization": "Bearer " + token}
 			cfg.Credentials = aws.AnonymousCredentials{}
 			cfg.AuthSchemePreference = []string{"noAuth"}
 		} else {
@@ -96,7 +104,7 @@ func (r *ModelRegistry) bedrockRuntimeClient(ctx context.Context, req ChatReques
 		o.BaseEndpoint = aws.String(baseEndpoint)
 		o.HTTPClient = providerHTTPClient(req)
 		o.RetryMaxAttempts = 1 + aiproviders.MaxInt(0, req.MaxRetries)
-	}, bedrockWithHeaders(headers), bedrockWithResponse(req))
+	}, bedrockWithHeaders(headers, forcedHeaders), bedrockWithResponse(req))
 	return client, nil
 }
 
@@ -123,15 +131,37 @@ func (r *ModelRegistry) bedrockBearerToken(model Model) string {
 	return r.Auth.BedrockBearerToken(model)
 }
 
-func bedrockWithHeaders(headers map[string]string) func(*bedrockruntime.Options) {
+// bedrockIsReservedHeader reports whether key is an auth/SigV4 header that must
+// never be overwritten by caller-supplied headers. Mirrors isReservedHeader in
+// amazon-bedrock.ts: `host` and `x-amz-*` participate in the SigV4 canonical
+// request and `authorization` is owned by SigV4 or the bearer-token path.
+// Comparison is case-insensitive.
+func bedrockIsReservedHeader(key string) bool {
+	lower := strings.ToLower(key)
+	return strings.HasPrefix(lower, "x-amz-") || lower == "authorization" || lower == "host"
+}
+
+// bedrockWithHeaders applies caller-supplied custom headers to the outgoing
+// Bedrock request via a build-step middleware (runs after serialization, before
+// SigV4 signing). Reserved auth/SigV4 headers in callerHeaders are silently
+// skipped so they cannot break SigV4 or bearer auth, matching TS. forcedHeaders
+// are auth headers we deliberately set ourselves (the over-http bearer
+// workaround) and are applied unconditionally.
+func bedrockWithHeaders(callerHeaders, forcedHeaders map[string]string) func(*bedrockruntime.Options) {
 	return func(o *bedrockruntime.Options) {
-		if len(headers) == 0 {
+		if len(callerHeaders) == 0 && len(forcedHeaders) == 0 {
 			return
 		}
 		o.APIOptions = append(o.APIOptions, func(stack *smithymiddleware.Stack) error {
 			return stack.Build.Add(smithymiddleware.BuildMiddlewareFunc("piBedrockHeaders", func(ctx context.Context, in smithymiddleware.BuildInput, next smithymiddleware.BuildHandler) (smithymiddleware.BuildOutput, smithymiddleware.Metadata, error) {
 				if req, ok := in.Request.(*smithyhttp.Request); ok {
-					for key, value := range headers {
+					for key, value := range callerHeaders {
+						if bedrockIsReservedHeader(key) {
+							continue
+						}
+						req.Header.Set(key, value)
+					}
+					for key, value := range forcedHeaders {
 						req.Header.Set(key, value)
 					}
 				}
