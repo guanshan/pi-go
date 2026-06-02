@@ -3,6 +3,9 @@ package tools
 import (
 	"os"
 	"path/filepath"
+	"runtime"
+	"sort"
+	"strings"
 	"sync"
 
 	"github.com/guanshan/pi-go/packages/ai"
@@ -24,40 +27,69 @@ type refLock struct {
 
 var fileMutations = &fileMutationQueue{locks: map[string]*refLock{}}
 
-// mutationQueueKey resolves path to a stable key. Like the TS implementation it
-// uses the real (symlink-resolved) path when the file exists so two aliases of
-// the same file share a queue, falling back to the cleaned absolute path.
-func mutationQueueKey(path string) string {
+// mutationQueueKeys resolves path to stable queue keys. The cleaned absolute
+// path keeps creates/overwrites for the same requested file serialized even
+// when the file appears between concurrent calls; the resolved path, when
+// available, keeps symlink aliases on the same queue too.
+func mutationQueueKeys(path string) []string {
 	abs, err := filepath.Abs(path)
 	if err != nil {
 		abs = filepath.Clean(path)
 	}
+	keys := []string{normalizeMutationQueueKey(abs)}
 	if resolved, err := filepath.EvalSymlinks(abs); err == nil {
-		return resolved
+		keys = append(keys, normalizeMutationQueueKey(resolved))
 	}
-	return abs
+	sort.Strings(keys)
+	n := 0
+	for _, key := range keys {
+		if n == 0 || key != keys[n-1] {
+			keys[n] = key
+			n++
+		}
+	}
+	return keys[:n]
+}
+
+func normalizeMutationQueueKey(path string) string {
+	key := filepath.Clean(path)
+	if runtime.GOOS == "windows" {
+		key = strings.ToLower(key)
+	}
+	return key
 }
 
 // withFileMutationQueue runs fn while holding the per-file lock for path.
 func withFileMutationQueue(path string, fn func() ai.ToolResult) ai.ToolResult {
-	key := mutationQueueKey(path)
+	keys := mutationQueueKeys(path)
 
 	fileMutations.mu.Lock()
-	lock := fileMutations.locks[key]
-	if lock == nil {
-		lock = &refLock{}
-		fileMutations.locks[key] = lock
+	locks := make([]*refLock, 0, len(keys))
+	for _, key := range keys {
+		lock := fileMutations.locks[key]
+		if lock == nil {
+			lock = &refLock{}
+			fileMutations.locks[key] = lock
+		}
+		lock.ref++
+		locks = append(locks, lock)
 	}
-	lock.ref++
 	fileMutations.mu.Unlock()
 
-	lock.mu.Lock()
+	for _, lock := range locks {
+		lock.mu.Lock()
+	}
 	defer func() {
-		lock.mu.Unlock()
+		for i := len(locks) - 1; i >= 0; i-- {
+			locks[i].mu.Unlock()
+		}
 		fileMutations.mu.Lock()
-		lock.ref--
-		if lock.ref == 0 {
-			delete(fileMutations.locks, key)
+		for i, key := range keys {
+			lock := locks[i]
+			lock.ref--
+			if lock.ref == 0 {
+				delete(fileMutations.locks, key)
+			}
 		}
 		fileMutations.mu.Unlock()
 	}()

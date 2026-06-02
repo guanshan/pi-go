@@ -61,6 +61,27 @@ func TestWriteMutationQueueSerializesSameFile(t *testing.T) {
 	}
 }
 
+func TestMutationQueueKeysKeepAbsolutePathAfterFileAppears(t *testing.T) {
+	cwd := t.TempDir()
+	path := filepath.Join(cwd, "shared.txt")
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := normalizeMutationQueueKey(abs)
+	before := mutationQueueKeys(path)
+	if !containsString(before, key) {
+		t.Fatalf("keys before create = %v, want %q", before, key)
+	}
+	if err := os.WriteFile(path, []byte("created"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	after := mutationQueueKeys(path)
+	if !containsString(after, key) {
+		t.Fatalf("keys after create = %v, want %q", after, key)
+	}
+}
+
 func TestWritePreservesExistingMode(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("Windows does not preserve Unix permission bits")
@@ -111,4 +132,13 @@ func TestEditPreservesExistingMode(t *testing.T) {
 	if got := info.Mode().Perm(); got != 0o755 {
 		t.Fatalf("mode=%#o, want 0755", got)
 	}
+}
+
+func containsString(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
 }
