@@ -503,6 +503,22 @@ func (s *SettingsManager) EnabledModels() []string {
 	return append([]string(nil), s.Global.EnabledModels...)
 }
 
+// SetDefaultModelAndProvider persists the selected model+provider as the global
+// default so the next launch (new session) remembers the choice. Mirrors
+// settings-manager.ts:617 setDefaultModelAndProvider.
+func (s *SettingsManager) SetDefaultModelAndProvider(provider, modelID string) error {
+	s.Global.DefaultProvider = provider
+	s.Global.DefaultModel = modelID
+	return s.SaveGlobal()
+}
+
+// SetDefaultThinkingLevel persists the thinking level as the global default.
+// Mirrors settings-manager.ts:659 setDefaultThinkingLevel.
+func (s *SettingsManager) SetDefaultThinkingLevel(level ai.ThinkingLevel) error {
+	s.Global.DefaultThinkingLevel = level
+	return s.SaveGlobal()
+}
+
 func (s *SettingsManager) SessionDir() string {
 	if s.Project.SessionDir != "" {
 		return ExpandTilde(s.Project.SessionDir)

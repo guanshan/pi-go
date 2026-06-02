@@ -57,7 +57,7 @@ type scriptRuntime struct {
 	cmd     *exec.Cmd
 	stdin   io.WriteCloser
 	scanner *bufio.Scanner
-	stderr  *bytes.Buffer
+	stderr  *syncBuffer
 	mu      sync.Mutex
 	nextID  int64
 }
@@ -157,7 +157,7 @@ func startScriptRuntime(ctx context.Context, path string, flagValues map[string]
 	if err != nil {
 		return nil, scriptReadyMessage{}, fmt.Errorf("%s: %w", path, err)
 	}
-	stderr := &bytes.Buffer{}
+	stderr := &syncBuffer{}
 	cmd.Stderr = stderr
 	if err := cmd.Start(); err != nil {
 		return nil, scriptReadyMessage{}, fmt.Errorf("%s: %w", path, err)
@@ -313,7 +313,35 @@ func (r *scriptRuntime) request(ctx context.Context, payload map[string]any) (sc
 	return response, nil
 }
 
-func scriptStderrSuffix(stderr *bytes.Buffer) string {
+// syncBuffer is a goroutine-safe bytes.Buffer wrapper. os/exec's stderr copy
+// goroutine writes to cmd.Stderr while the process runs, while request() and
+// scriptStderrSuffix read it concurrently to attach stderr context to errors;
+// the mutex prevents a data race between those reads and the copy goroutine's
+// writes.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) Len() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Len()
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+func scriptStderrSuffix(stderr *syncBuffer) string {
 	if stderr == nil || stderr.Len() == 0 {
 		return ""
 	}
@@ -532,23 +560,27 @@ const api = {
 	onShutdown(handler) {
 		if (typeof handler === "function") shutdownHandlers.push(handler);
 	},
+	// Unsupported registration APIs degrade gracefully: warn and skip rather than
+	// throw at load time, so the rest of an extension (tools/commands/flags/hooks)
+	// still loads instead of the whole extension failing. The warning goes to
+	// stderr via the console shim above.
 	registerProvider() {
-		throw new Error("pi.registerProvider is unsupported in the Go bridge");
+		console.warn("pi.registerProvider is not supported in the Go bridge; skipping (custom providers are unavailable).");
 	},
 	unregisterProvider() {
-		throw new Error("pi.unregisterProvider is unsupported in the Go bridge");
+		console.warn("pi.unregisterProvider is not supported in the Go bridge; skipping.");
 	},
 	registerMessageRenderer() {
-		throw new Error("pi.registerMessageRenderer is unsupported in the Go bridge");
+		console.warn("pi.registerMessageRenderer is not supported in the Go bridge; skipping (custom message renderers are unavailable).");
 	},
 	addAutocompleteProvider() {
-		throw new Error("pi.addAutocompleteProvider is unsupported in the Go bridge");
+		console.warn("pi.addAutocompleteProvider is not supported in the Go bridge; skipping (custom autocomplete is unavailable).");
 	},
 	registerShortcut() {
-		throw new Error("pi.registerShortcut is unsupported in the Go bridge (interactive keybindings are not bridged)");
+		console.warn("pi.registerShortcut is not supported in the Go bridge; skipping (interactive keybindings are not bridged).");
 	},
 	unregisterShortcut() {
-		throw new Error("pi.unregisterShortcut is unsupported in the Go bridge (interactive keybindings are not bridged)");
+		console.warn("pi.unregisterShortcut is not supported in the Go bridge; skipping (interactive keybindings are not bridged).");
 	},
 	events: {
 		on(event, handler) { return api.on(event, handler); },
@@ -556,8 +588,16 @@ const api = {
 	},
 	ui: {
 		notify(message) { console.error(String(message ?? "")); },
-		async select(_message, options = []) { return Array.isArray(options) ? options[0] : undefined; },
-		async confirm() { return false; },
+		// The Go bridge runs headless: there is no interactive prompter. Reject
+		// with an explicit error instead of silently auto-answering, so a
+		// confirm-gated extension (e.g. confirm-destructive) does not quietly take
+		// the wrong branch. (TS routes these to a real prompter when a UI exists.)
+		async select() {
+			throw new Error("pi.ui.select requires interactive input, which is not available in the Go bridge (headless).");
+		},
+		async confirm() {
+			throw new Error("pi.ui.confirm requires interactive input, which is not available in the Go bridge (headless).");
+		},
 	},
 };
 

@@ -56,6 +56,48 @@ func TestRunRPCBashCommand(t *testing.T) {
 	}
 }
 
+// TestRunRPCSetModelPersistsDefault locks P1-1 for the RPC surface: the
+// documented `set_model` persistence side-effect must update settings.json
+// (mirroring agent-session.ts setModel -> setDefaultModelAndProvider), not just
+// append a session entry.
+func TestRunRPCSetModelPersistsDefault(t *testing.T) {
+	runtime := newRPCTestRuntime(t)
+	out := runRPCCommands(t, runtime, map[string]any{"id": "1", "type": "set_model", "provider": "faux", "modelId": "faux"})
+	if !strings.Contains(out, `"command":"set_model"`) || !strings.Contains(out, `"success":true`) {
+		t.Fatalf("set_model response missing: %s", out)
+	}
+	settings := runtime.Session().Settings
+	// Re-read from disk to prove the side-effect was persisted, not just held in memory.
+	reloaded := NewSettingsManager(settings.CWD, settings.AgentDir)
+	if reloaded.DefaultProvider() != "faux" || reloaded.DefaultModel() != "faux" {
+		t.Fatalf("RPC set_model did not persist default: provider=%q model=%q",
+			reloaded.DefaultProvider(), reloaded.DefaultModel())
+	}
+}
+
+// TestRunRPCOutputDoesNotHTMLEscape locks 7.md P0-1 (RPC part): RPC JSONL output
+// must not HTML-escape `<`, `>`, `&`, mirroring TS serializeJsonLine
+// (`${JSON.stringify(value)}\n`). Go's default json.Marshal escapes them, which
+// would diverge the wire bytes for common code payloads.
+func TestRunRPCOutputDoesNotHTMLEscape(t *testing.T) {
+	runtime := newRPCTestRuntime(t)
+	out := runRPCCommands(t, runtime, map[string]any{"id": "1", "type": "bash", "command": "printf '%s' '<a> && b </a>'"})
+	if !strings.Contains(out, `"command":"bash"`) || !strings.Contains(out, `"success":true`) {
+		t.Fatalf("bash response missing: %s", out)
+	}
+	// The raw angle brackets and ampersands must appear verbatim in the JSON line.
+	if !strings.Contains(out, "<a> && b </a>") {
+		t.Fatalf("expected raw <>& in RPC output, got: %s", out)
+	}
+	// The HTML-escaped forms (Go's json.Marshal default) must NOT appear: the
+	// literal 6-char escape sequences "<", ">", "&".
+	for _, escaped := range []string{"\\u003c", "\\u003e", "\\u0026"} {
+		if strings.Contains(out, escaped) {
+			t.Fatalf("RPC output should not HTML-escape (found %s): %s", escaped, out)
+		}
+	}
+}
+
 func TestRunRPCBashRequiresCommand(t *testing.T) {
 	runtime := newRPCTestRuntime(t)
 	out := runRPCCommands(t, runtime, map[string]any{"id": "1", "type": "bash"})

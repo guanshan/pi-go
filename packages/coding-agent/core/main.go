@@ -230,7 +230,14 @@ func MainWithOptions(ctx context.Context, argv []string, options MainOptions) er
 	}
 	toolNames := append([]string(nil), args.Tools...)
 	excludeToolNames := append([]string(nil), args.ExcludeTools...)
-	scopedModels, scopedWarnings := resolveScopedModels(registry, args.Models)
+	// Fall back to the enabledModels setting when no --models flag is passed so
+	// the configured list constrains Ctrl+P cycling, mirroring main.ts:625
+	// `parsed.models ?? settingsManager.getEnabledModels()`.
+	modelPatterns := args.Models
+	if len(modelPatterns) == 0 {
+		modelPatterns = settings.EnabledModels()
+	}
+	scopedModels, scopedWarnings := resolveScopedModels(registry, modelPatterns)
 	for _, scopedWarning := range scopedWarnings {
 		fmt.Fprintln(os.Stderr, "Warning:", scopedWarning)
 	}

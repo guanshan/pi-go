@@ -228,6 +228,44 @@ func TestResolveScopedModelsExpandsGlob(t *testing.T) {
 	})
 }
 
+// TestEnabledModelsConstrainScopeWhenNoModelsFlag locks the main.ts:625 fallback
+// (`parsed.models ?? settingsManager.getEnabledModels()`): with no --models flag
+// the enabledModels setting must constrain the scoped/cycle set rather than
+// falling through to the full configured registry.
+func TestEnabledModelsConstrainScopeWhenNoModelsFlag(t *testing.T) {
+	registry := scopeRegistry(t, []ai.Model{
+		{Provider: "anthropic", ID: "claude-sonnet-4-5", API: "anthropic"},
+		{Provider: "anthropic", ID: "claude-opus-4-1", API: "anthropic"},
+		{Provider: "openai", ID: "gpt-4.1", API: "openai"},
+	})
+	settings := NewSettingsManager(t.TempDir(), t.TempDir())
+	settings.Global.EnabledModels = []string{"anthropic/*"}
+
+	// Mirror the main.go composition: no --models flag falls back to enabledModels.
+	var argsModels []string
+	modelPatterns := argsModels
+	if len(modelPatterns) == 0 {
+		modelPatterns = settings.EnabledModels()
+	}
+	resolved, warnings := resolveScopedModels(registry, modelPatterns)
+	if len(warnings) != 0 {
+		t.Fatalf("warnings=%#v", warnings)
+	}
+	got := map[string]bool{}
+	for _, sm := range resolved {
+		got[sm.Model.Provider+"/"+sm.Model.ID] = true
+	}
+	if !got["anthropic/claude-sonnet-4-5"] || !got["anthropic/claude-opus-4-1"] {
+		t.Fatalf("enabledModels did not constrain scope to anthropic: %#v", got)
+	}
+	if got["openai/gpt-4.1"] {
+		t.Fatalf("openai model leaked into scope despite enabledModels=anthropic/*: %#v", got)
+	}
+	if len(resolved) != 2 {
+		t.Fatalf("expected exactly the 2 enabled anthropic models, got %#v", got)
+	}
+}
+
 func TestApiKeyBindsToResolvedProviderOnly(t *testing.T) {
 	// Mirrors the inline --api-key binding in MainWithOptions: the key is bound to
 	// the resolved model's provider only.

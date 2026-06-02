@@ -67,18 +67,32 @@ export default function (pi) {
 	}
 }
 
-// TestScriptExtensionUnsupportedShortcutFailsFast verifies pi.registerShortcut
-// raises a clear unsupported error rather than an opaque "not a function".
-func TestScriptExtensionUnsupportedShortcutFailsFast(t *testing.T) {
+// TestScriptExtensionUnsupportedRegisterDegradesGracefully verifies that the
+// unsupported registration APIs (registerShortcut/registerProvider/
+// registerMessageRenderer/addAutocompleteProvider) warn and skip instead of
+// throwing at load time (4.md), so the rest of the extension still loads.
+func TestScriptExtensionUnsupportedRegisterDegradesGracefully(t *testing.T) {
 	if _, err := exec.LookPath("node"); err != nil {
 		t.Skip("node not available")
 	}
 	dir := t.TempDir()
 	ext := filepath.Join(dir, "shortcut-ext.mjs")
+	// The extension calls several unsupported register* APIs AND registers a
+	// tool. Graceful degradation means the unsupported calls are skipped (not
+	// fatal) and the tool is still registered.
 	source := `
 import { Key } from "@earendil-works/pi-tui";
 export default function (pi) {
 	pi.registerShortcut(Key.ctrlAlt("p"), { handler() {} });
+	pi.registerProvider({ name: "custom" });
+	pi.registerMessageRenderer("custom", () => []);
+	pi.addAutocompleteProvider(() => []);
+	pi.registerTool({
+		name: "survivor",
+		description: "still registered despite unsupported register* calls",
+		parameters: { type: "object", properties: {} },
+		execute() { return { content: [{ type: "text", text: "ok" }] }; },
+	});
 }
 `
 	if err := os.WriteFile(ext, []byte(source), 0o644); err != nil {
@@ -86,10 +100,18 @@ export default function (pi) {
 	}
 	api := NewAPI()
 	errs := LoadScriptExtensions(context.Background(), api, []string{ext}, nil)
-	if len(errs) == 0 {
-		t.Fatal("expected an error from registerShortcut")
+	if len(errs) != 0 {
+		t.Fatalf("expected graceful load (no errors) from unsupported register* calls, got: %v", errs)
 	}
-	if !strings.Contains(errs[0].Error(), "registerShortcut is unsupported") {
-		t.Fatalf("error should explain the unsupported API, got: %v", errs[0])
+	// The tool registered after the unsupported calls must survive.
+	found := false
+	for _, tool := range api.SnapshotTools() {
+		if tool.Name == "survivor" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("tool registered after unsupported register* calls was lost; tools=%v", api.SnapshotTools())
 	}
 }

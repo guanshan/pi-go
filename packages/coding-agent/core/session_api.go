@@ -136,11 +136,12 @@ type SendUserMessageOptions struct {
 }
 
 type BashResult struct {
-	Command   string `json:"command"`
-	Output    string `json:"output"`
-	ExitCode  int    `json:"exitCode"`
-	Cancelled bool   `json:"cancelled"`
-	Truncated bool   `json:"truncated"`
+	Command        string `json:"command"`
+	Output         string `json:"output"`
+	ExitCode       int    `json:"exitCode"`
+	Cancelled      bool   `json:"cancelled"`
+	Truncated      bool   `json:"truncated"`
+	FullOutputPath string `json:"fullOutputPath,omitempty"`
 }
 
 type BashRunOptions struct {
@@ -923,7 +924,20 @@ func (a *AgentSession) ExecuteBash(ctx context.Context, command string, opts Bas
 		}
 		err = cmd.Wait()
 	}
-	result := BashResult{Command: command, Output: strings.TrimSpace(strings.TrimRight(stdout.String()+stderr.String(), "\n")), ExitCode: 0, Cancelled: bashCtx.Err() == context.Canceled}
+	// Sanitize (strip ANSI / binary / CR) and truncate the combined output, then
+	// spill the full output to a temp file when truncated, mirroring TS
+	// bash-executor.ts executeBashWithOperations (the shared interactive+RPC bash
+	// executor). Without this, the RPC/SDK bash path returned unbounded, unsanitized
+	// output straight into the session context (8.md P1-1).
+	sanitized := catools.SanitizeAndTruncateBashOutput(stdout.String() + stderr.String())
+	result := BashResult{
+		Command:        command,
+		Output:         sanitized.Output,
+		ExitCode:       0,
+		Cancelled:      bashCtx.Err() == context.Canceled,
+		Truncated:      sanitized.Truncated,
+		FullOutputPath: sanitized.FullOutputPath,
+	}
 	if exitErr, ok := err.(*exec.ExitError); ok {
 		result.ExitCode = exitErr.ExitCode()
 		err = nil
@@ -942,6 +956,9 @@ func (a *AgentSession) RecordBashResult(command string, result BashResult, opts 
 		return
 	}
 	details := map[string]any{"command": command, "exitCode": result.ExitCode, "cancelled": result.Cancelled, "truncated": result.Truncated}
+	if result.FullOutputPath != "" {
+		details["fullOutputPath"] = result.FullOutputPath
+	}
 	_ = a.Session.Append(SessionEntry{Type: "custom_message", CustomType: "bash_result", Content: result.Output, Display: true, Details: details})
 }
 

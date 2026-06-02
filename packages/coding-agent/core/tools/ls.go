@@ -59,13 +59,14 @@ func (t LsTool) Execute(ctx context.Context, raw json.RawMessage, _ ToolUpdate) 
 		}
 		name := entry.Name()
 		// Follow symlinks when deciding the trailing slash, matching TS which
-		// stats the full path (ls.ts:159-166) rather than using the dirent type;
-		// fall back to the dirent type for broken links.
-		isDir := entry.IsDir()
-		if info, statErr := os.Stat(filepath.Join(dir, entry.Name())); statErr == nil {
-			isDir = info.IsDir()
+		// stats the full path (ls.ts:159-166) rather than using the dirent type.
+		// TS skips entries it cannot stat (broken symlinks, unreadable entries);
+		// see ls.ts:166-168 `catch { continue }`.
+		info, statErr := os.Stat(filepath.Join(dir, entry.Name()))
+		if statErr != nil {
+			continue
 		}
-		if isDir {
+		if info.IsDir() {
 			name += "/"
 		}
 		out = append(out, name)

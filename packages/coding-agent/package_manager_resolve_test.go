@@ -427,6 +427,64 @@ exit 2
 	}
 }
 
+// TestDefaultPackageManagerUpdateReinstallsNpm locks 4.md P1-3: `pi update` must
+// refresh npm-installed packages (reinstall <name>@latest into the npm root),
+// not silently skip them. Mirrors updateConfiguredSources -> updateNpmBatch ->
+// installNpmBatch (`${name}@latest`) in package-manager.ts.
+func TestDefaultPackageManagerUpdateReinstallsNpm(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell fake npm is POSIX-only")
+	}
+	cwd := t.TempDir()
+	agentDir := t.TempDir()
+	argLog := filepath.Join(agentDir, "npm-args.log")
+	installFakeNPM(t, `#!/bin/sh
+set -eu
+echo "$@" >> "`+argLog+`"
+if [ "$1" = "install" ]; then
+	spec="$2"
+	prefix=""
+	while [ "$#" -gt 0 ]; do
+		if [ "$1" = "--prefix" ]; then
+			prefix="$2"
+		fi
+		shift
+	done
+	name=$(printf '%s' "$spec" | sed 's/@[^@/]*$//')
+	mkdir -p "$prefix/node_modules/$name"
+	printf installed > "$prefix/node_modules/$name/.installed"
+	exit 0
+fi
+echo "unexpected npm $*" >&2
+exit 2
+`)
+
+	settings := core.NewSettingsManager(cwd, agentDir)
+	// A non-pinned npm source (eligible for update) and a pinned one (must be skipped).
+	settings.Global.Packages = []core.PackageSetting{
+		{Source: "npm:fixture"},
+		{Source: "npm:locked@1.0.0"},
+	}
+	manager := NewDefaultPackageManager(cwd, agentDir, settings)
+
+	if err := manager.Update("", nil); err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+	logged, err := os.ReadFile(argLog)
+	if err != nil {
+		t.Fatalf("npm was not invoked during update: %v", err)
+	}
+	got := string(logged)
+	wantPrefix := filepath.Join(agentDir, "npm")
+	if !strings.Contains(got, "install fixture@latest --prefix "+wantPrefix) {
+		t.Fatalf("expected npm update to reinstall fixture@latest, got %q", got)
+	}
+	// The pinned package must not be reinstalled.
+	if strings.Contains(got, "locked") {
+		t.Fatalf("pinned npm package should be skipped during update, got %q", got)
+	}
+}
+
 // TestDefaultPackageManagerGitInstallRollbackKeepsExistingPackage proves the git
 // branch still stages into a sibling temp dir and atomically swaps, so a failed
 // dependency install leaves a prior checkout intact. The git dest follows the TS

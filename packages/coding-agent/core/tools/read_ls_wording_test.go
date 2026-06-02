@@ -78,6 +78,31 @@ func TestLsErrorWording(t *testing.T) {
 	})
 }
 
+// TestLsSkipsUnstatableEntries verifies that ls drops entries it cannot stat
+// (e.g. a dangling symlink), matching TS ls.ts:166-168 `catch { continue }`.
+func TestLsSkipsUnstatableEntries(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "real.txt"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// A symlink whose target does not exist -> os.Stat (which follows the link)
+	// fails, so the entry must be skipped.
+	if err := os.Symlink(filepath.Join(dir, "does-not-exist"), filepath.Join(dir, "dangling")); err != nil {
+		t.Skipf("symlinks unsupported: %v", err)
+	}
+	res := LsTool{CWD: dir}.Execute(context.Background(), raw(map[string]any{"path": "."}), nil)
+	if res.IsError {
+		t.Fatalf("ls failed: %s", toolText(res.Content))
+	}
+	out := toolText(res.Content)
+	if !strings.Contains(out, "real.txt") {
+		t.Fatalf("expected real.txt in output, got: %q", out)
+	}
+	if strings.Contains(out, "dangling") {
+		t.Fatalf("expected dangling symlink to be skipped, got: %q", out)
+	}
+}
+
 func lastLine(s string) string {
 	lines := strings.Split(strings.TrimRight(s, "\n"), "\n")
 	return lines[len(lines)-1]

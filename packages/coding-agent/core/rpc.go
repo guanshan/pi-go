@@ -2,6 +2,7 @@ package core
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -25,7 +26,25 @@ type rpcWriter struct {
 func (w *rpcWriter) writeLine(value any) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	_ = writeJSONLine(w.out, value)
+	_ = writeRPCJSONLine(w.out, value)
+}
+
+// writeRPCJSONLine serializes a single RPC JSONL record without HTML-escaping
+// `<`, `>`, `&`. TS `serializeJsonLine` is `${JSON.stringify(value)}\n`, which
+// does not escape those characters; Go's default json.Marshal does, which would
+// make the RPC wire bytes diverge for common code payloads (HTML, `&&`,
+// `List<String>`). Scoped to the RPC output path only.
+func writeRPCJSONLine(w io.Writer, value any) error {
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(value); err != nil {
+		return err
+	}
+	// json.Encoder.Encode already appends a trailing newline, matching the
+	// `\n` framing of TS serializeJsonLine.
+	_, err := w.Write(buf.Bytes())
+	return err
 }
 
 func (w *rpcWriter) response(id any, command string, success bool, data any, errorMessage string) {

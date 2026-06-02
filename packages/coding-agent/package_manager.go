@@ -347,6 +347,24 @@ func (m *DefaultPackageManager) Update(source string, progress ProgressCallback)
 				return err
 			}
 			emitProgress(progress, "done", "updated "+record.Source, record.Path)
+			continue
+		}
+		// npm packages: reinstall <name>@latest into the shared npm root so the
+		// installed tree advances to the newest published version. Mirrors
+		// updateConfiguredSources -> updateNpmBatch -> installNpmBatch in
+		// package-manager.ts (which installs `${name}@latest`). Pinned npm
+		// versions are fixed and were already skipped above.
+		if parsed := ParsePackageSource(record.Source); parsed.Kind == "npm" {
+			npmRoot := m.npmInstallRoot(record.Local)
+			if err := os.MkdirAll(npmRoot, 0o755); err != nil {
+				return err
+			}
+			MarkPathIgnoredByCloudSync(npmRoot)
+			emitProgress(progress, "start", "updating "+record.Source, record.Path)
+			if err := m.runNpm("", m.npmInstallArgs(parsed.Name+"@latest", npmRoot)...); err != nil {
+				return err
+			}
+			emitProgress(progress, "done", "updated "+record.Source, record.Path)
 		}
 	}
 	if source != "" && !matched {

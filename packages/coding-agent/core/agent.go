@@ -440,6 +440,11 @@ func (a *AgentSession) SetModel(provider, modelID string) (ai.Model, error) {
 	}
 	a.Model = model
 	_ = a.Session.AppendModelChange(provider, modelID)
+	// Persist as the global default so a fresh launch remembers the choice,
+	// mirroring agent-session.ts:1448 setModel -> setDefaultModelAndProvider.
+	if a.Settings != nil {
+		_ = a.Settings.SetDefaultModelAndProvider(provider, modelID)
+	}
 	a.emitSessionEvent(ModelChangedEvent{Model: model, ThinkingLevel: a.ThinkingLevel})
 	return model, nil
 }
@@ -459,6 +464,12 @@ func (a *AgentSession) CycleModel() (map[string]any, bool) {
 	next := models[(idx+1)%len(models)]
 	a.Model = next
 	_ = a.Session.AppendModelChange(next.Provider, next.ID)
+	// Persist the cycled model as the global default, mirroring
+	// agent-session.ts:1485/1513 (_cycleScopedModel/_cycleAvailableModel ->
+	// setDefaultModelAndProvider).
+	if a.Settings != nil {
+		_ = a.Settings.SetDefaultModelAndProvider(next.Provider, next.ID)
+	}
 	a.emitSessionEvent(ModelChangedEvent{Model: next, ThinkingLevel: a.ThinkingLevel})
 	return map[string]any{"model": next, "thinkingLevel": a.ThinkingLevel, "isScoped": len(a.scopedModels) > 0}, true
 }
@@ -467,11 +478,26 @@ func (a *AgentSession) SetThinkingLevel(level ai.ThinkingLevel) error {
 	if !ai.IsValidThinkingLevel(string(level)) {
 		return fmt.Errorf("invalid thinking level: %s", level)
 	}
-	a.ThinkingLevel = ClampThinking(a.Model, level)
-	if err := a.Session.AppendThinkingChange(a.ThinkingLevel); err != nil {
+	// Clamp to the model's capabilities, then persist to session + settings only
+	// when the effective level actually changes, mirroring
+	// agent-session.ts:1532 setThinkingLevel (which gates the session append,
+	// settings write, and event on isChanging).
+	effectiveLevel := ClampThinking(a.Model, level)
+	previousLevel := a.ThinkingLevel
+	a.ThinkingLevel = effectiveLevel
+	if effectiveLevel == previousLevel {
+		return nil
+	}
+	if err := a.Session.AppendThinkingChange(effectiveLevel); err != nil {
 		return err
 	}
-	a.emitSessionEvent(ThinkingLevelChangedEvent{Level: a.ThinkingLevel})
+	// Only persist as the global default when the model supports thinking or the
+	// level is non-off, mirroring the `supportsThinking() || level !== "off"`
+	// guard at agent-session.ts:1544.
+	if a.Settings != nil && (a.SupportsThinking() || effectiveLevel != ai.ThinkingOff) {
+		_ = a.Settings.SetDefaultThinkingLevel(effectiveLevel)
+	}
+	a.emitSessionEvent(ThinkingLevelChangedEvent{Level: effectiveLevel})
 	return nil
 }
 

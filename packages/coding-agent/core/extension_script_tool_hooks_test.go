@@ -7,7 +7,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strings"
 	"testing"
 
 	"github.com/guanshan/pi-go/packages/ai"
@@ -204,7 +203,11 @@ func TestScriptExtensionOverridesToolResult(t *testing.T) {
 // unsupported bridge API (registerProvider / registerMessageRenderer /
 // addAutocompleteProvider) fails loading with a clear error instead of silently
 // being undefined.
-func TestScriptExtensionUnsupportedAPIsFailFast(t *testing.T) {
+// TestScriptExtensionUnsupportedAPIsDegradeGracefully verifies that the
+// unsupported registration APIs warn and skip instead of failing the whole
+// extension load (4.md): the extension still loads and any tools it registers
+// after the unsupported call survive.
+func TestScriptExtensionUnsupportedAPIsDegradeGracefully(t *testing.T) {
 	if _, err := exec.LookPath("node"); err != nil {
 		t.Skip("node not available")
 	}
@@ -218,15 +221,25 @@ func TestScriptExtensionUnsupportedAPIsFailFast(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			path := writeScriptExtension(t, "export default function (pi) {\n\t"+tc.call+"\n}")
+			src := "export default function (pi) {\n\t" + tc.call + "\n\t" +
+				`pi.registerTool({ name: "survivor", description: "d", parameters: { type: "object", properties: {} }, execute() { return { content: [] }; } });` +
+				"\n}"
+			path := writeScriptExtension(t, src)
 			runtime := coreext.NewRunnerWithAPI(coreext.NewAPI())
 			errs := coreext.LoadScriptExtensions(context.Background(), runtime.API, []string{path}, nil)
 			t.Cleanup(func() { _ = runtime.Shutdown(context.Background()) })
-			if len(errs) == 0 {
-				t.Fatalf("expected load error for %s", tc.name)
+			if len(errs) != 0 {
+				t.Fatalf("expected graceful load (no errors) for %s, got: %v", tc.name, errs)
 			}
-			if msg := errs[0].Error(); !strings.Contains(msg, "unsupported in the Go bridge") {
-				t.Fatalf("error=%q want 'unsupported in the Go bridge'", msg)
+			found := false
+			for _, tool := range runtime.API.SnapshotTools() {
+				if tool.Name == "survivor" {
+					found = true
+					break
+				}
+			}
+			if !found {
+				t.Fatalf("tool registered after %s was lost; tools=%v", tc.name, runtime.API.SnapshotTools())
 			}
 		})
 	}
