@@ -41,19 +41,21 @@ export default function (pi) {
 		t.Fatal(err)
 	}
 
-	api := NewAPI()
-	if errs := LoadScriptExtensions(context.Background(), api, []string{ext}, nil); len(errs) > 0 {
+	runtime := NewRunnerWithAPI(NewAPI())
+	t.Cleanup(func() { _ = runtime.Shutdown(context.Background()) })
+	if errs := LoadScriptExtensions(context.Background(), runtime.API, []string{ext}, nil); len(errs) > 0 {
 		t.Fatalf("load errors: %v", errs)
 	}
 	var probe *ToolDefinition
-	for i := range api.Tools {
-		if api.Tools[i].Name == "keyprobe" {
-			probe = &api.Tools[i]
+	tools := runtime.API.SnapshotTools()
+	for i := range tools {
+		if tools[i].Name == "keyprobe" {
+			probe = &tools[i]
 			break
 		}
 	}
 	if probe == nil {
-		t.Fatalf("keyprobe tool not registered; tools=%v", api.Tools)
+		t.Fatalf("keyprobe tool not registered; tools=%v", tools)
 	}
 	result, err := probe.Execute(context.Background(), []byte("{}"))
 	if err != nil {

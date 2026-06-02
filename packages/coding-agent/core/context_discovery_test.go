@@ -3,6 +3,7 @@ package core
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -39,7 +40,7 @@ func TestDiscoverContextFilesMatchesTSOrderingAndVariants(t *testing.T) {
 		t.Fatalf("got %d files %v, want %d %v", len(got), got, len(want), want)
 	}
 	for i := range want {
-		if got[i] != want[i] {
+		if !sameContextPathForTest(got[i], want[i]) {
 			t.Fatalf("order mismatch at %d:\n got: %v\nwant: %v", i, got, want)
 		}
 	}
@@ -48,4 +49,16 @@ func TestDiscoverContextFilesMatchesTSOrderingAndVariants(t *testing.T) {
 			t.Fatalf("cwd CLAUDE.md must not load when AGENTS.md exists in the same dir; got %v", got)
 		}
 	}
+}
+
+func sameContextPathForTest(got, want string) bool {
+	if got == want {
+		return true
+	}
+	if !strings.EqualFold(got, want) {
+		return false
+	}
+	gotInfo, gotErr := os.Stat(got)
+	wantInfo, wantErr := os.Stat(want)
+	return gotErr == nil && wantErr == nil && os.SameFile(gotInfo, wantInfo)
 }
