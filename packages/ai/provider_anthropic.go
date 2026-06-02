@@ -127,7 +127,7 @@ func (r *ModelRegistry) runAnthropicChatStream(ctx context.Context, req ChatRequ
 		// (message_start) but ended before message_stop was truncated. Surface an
 		// error so the retry whitelist ("stream ended before message_stop") can
 		// re-issue instead of silently returning a partial "stop".
-		return anthropicStreamError(partial, fmt.Errorf("Anthropic stream ended before message_stop"), stream)
+		return anthropicStreamError(partial, fmt.Errorf("anthropic stream ended before message_stop"), stream)
 	}
 	response := anthropicChatResponse(aiproviders.ParseAnthropicMessage(&accumulated, isOAuth, tools), req.Model)
 	if response.Message.StopReason == "error" {
