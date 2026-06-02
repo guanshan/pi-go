@@ -68,6 +68,11 @@ type interactiveSessionEventMsg struct {
 	Event SessionEvent
 }
 
+type modelCycleDoneMsg struct {
+	ok     bool
+	scoped bool
+}
+
 type interactiveBusyKind string
 
 const (
@@ -90,6 +95,7 @@ type interactiveModel struct {
 	messages           []interactiveMessage
 	busy               bool
 	busyKind           interactiveBusyKind
+	cyclingModel       bool
 	width              int
 	height             int
 	assistantSlot      int
@@ -311,6 +317,14 @@ func (m *interactiveModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.autoScroll = true
 			m.viewport.GotoBottom()
 			return m, nil
+		case "ctrl+p":
+			cmd = m.cycleModel(false)
+			m.refreshViewport()
+			return m, cmd
+		case "ctrl+shift+p", "shift+ctrl+p":
+			cmd = m.cycleModel(true)
+			m.refreshViewport()
+			return m, cmd
 		case "tab":
 			if m.completeSlashCommand() {
 				m.refreshViewport()
@@ -400,6 +414,17 @@ func (m *interactiveModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if cmd, ok := m.popLocalQueuedCommand(); ok {
 			return m, cmd
 		}
+		return m, nil
+	case modelCycleDoneMsg:
+		m.cyclingModel = false
+		if !msg.ok {
+			if msg.scoped {
+				m.setStatus("Only one model in scope")
+			} else {
+				m.setStatus("Only one model available")
+			}
+		}
+		m.refreshViewport()
 		return m, nil
 	}
 	m.input, cmd = m.input.Update(msg)
@@ -995,6 +1020,41 @@ func (m *interactiveModel) doubleEscapeActionLabel() string {
 
 func (m *interactiveModel) setStatus(text string) {
 	m.statusMessage = strings.TrimSpace(text)
+}
+
+// cycleModel switches to the next (forward) or previous (backward) available
+// model in response to Ctrl+P / Shift+Ctrl+P, mirroring TS
+// app.model.cycleForward / cycleBackward. The switch runs in the returned
+// tea.Cmd goroutine: CycleModel emits ModelChangedEvent -> m.post ->
+// program.Send, which blocks on Bubble Tea's unbuffered msg channel, so
+// invoking it on the Update goroutine would deadlock. m.cyclingModel (toggled
+// only on the Update goroutine) serializes presses so the cmd never mutates
+// a.Model concurrently; cycling is also suppressed mid-turn (m.busy). Success
+// feedback rides the emitted ModelChangedEvent; only the "nothing to cycle"
+// case sets a status, via modelCycleDoneMsg.
+func (m *interactiveModel) cycleModel(backward bool) tea.Cmd {
+	if m.busy {
+		m.setStatus("Can't switch model while a response is streaming")
+		return nil
+	}
+	if m.cyclingModel {
+		return nil
+	}
+	agent, err := runtimeAgent(m.runtime)
+	if err != nil {
+		m.setStatus(err.Error())
+		return nil
+	}
+	m.cyclingModel = true
+	return func() tea.Msg {
+		var ok bool
+		if backward {
+			_, ok = agent.CycleModelBackward()
+		} else {
+			_, ok = agent.CycleModel()
+		}
+		return modelCycleDoneMsg{ok: ok, scoped: len(agent.scopedModels) > 0}
+	}
 }
 
 func (m *interactiveModel) bindSession(agent *AgentSession) {

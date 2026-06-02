@@ -450,6 +450,17 @@ func (a *AgentSession) SetModel(provider, modelID string) (ai.Model, error) {
 }
 
 func (a *AgentSession) CycleModel() (map[string]any, bool) {
+	return a.cycleModelInDirection(1)
+}
+
+// CycleModelBackward cycles to the previous available model, mirroring TS
+// session.cycleModel("backward") (interactive-mode.ts cycleModel) for the
+// Shift+Ctrl+P binding.
+func (a *AgentSession) CycleModelBackward() (map[string]any, bool) {
+	return a.cycleModelInDirection(-1)
+}
+
+func (a *AgentSession) cycleModelInDirection(step int) (map[string]any, bool) {
 	models := a.availableModels()
 	if len(models) <= 1 {
 		return nil, false
@@ -461,7 +472,8 @@ func (a *AgentSession) CycleModel() (map[string]any, bool) {
 			break
 		}
 	}
-	next := models[(idx+1)%len(models)]
+	// Euclidean modulo so a backward step from index 0 wraps to the last model.
+	next := models[((idx+step)%len(models)+len(models))%len(models)]
 	a.Model = next
 	_ = a.Session.AppendModelChange(next.Provider, next.ID)
 	// Persist the cycled model as the global default, mirroring
