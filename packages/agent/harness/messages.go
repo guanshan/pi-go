@@ -1,6 +1,7 @@
 package harness
 
 import (
+	"encoding/json"
 	"fmt"
 	"time"
 
@@ -203,12 +204,40 @@ func convertKnownHarnessMessage(message agent.AgentMessage) ([]ai.Message, bool)
 func customContentBlocks(content any) ([]ai.ContentBlock, bool) {
 	switch value := content.(type) {
 	case string:
+		// TS: typeof content === "string" ? [{type:"text", text: content}] : content.
 		return ai.TextBlocks(value), true
 	case []ai.ContentBlock:
 		return value, true
+	case nil:
+		// TS still emits a user message with the (empty/undefined) content array.
+		return nil, true
 	default:
-		return nil, false
+		// After reloading a session from JSONL, an array content field decodes to
+		// []interface{} (each element a map[string]any), not []ai.ContentBlock.
+		// TS passes m.content through unchanged; the Go equivalent re-encodes the
+		// decoded value and parses it into typed content blocks so text and image
+		// blocks survive. This mirrors how ai.UnmarshalMessageJSON parses content.
+		blocks, err := normalizeContentBlocks(value)
+		if err != nil {
+			return nil, false
+		}
+		return blocks, true
 	}
+}
+
+// normalizeContentBlocks converts a JSON-decoded content value (typically
+// []interface{} of map[string]any from a reloaded session) into typed
+// ai.ContentBlock values by round-tripping through JSON.
+func normalizeContentBlocks(value any) ([]ai.ContentBlock, error) {
+	raw, err := json.Marshal(value)
+	if err != nil {
+		return nil, err
+	}
+	var blocks []ai.ContentBlock
+	if err := json.Unmarshal(raw, &blocks); err != nil {
+		return nil, err
+	}
+	return blocks, nil
 }
 
 func CreateBranchSummaryMessage(summary, fromID, timestamp string) agent.AgentMessage {

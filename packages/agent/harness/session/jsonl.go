@@ -7,13 +7,17 @@ import (
 )
 
 type entryRecord struct {
-	Type             string          `json:"type"`
-	ID               string          `json:"id,omitempty"`
-	ParentID         *string         `json:"parentId"`
-	Timestamp        string          `json:"timestamp,omitempty"`
-	Message          ai.Message      `json:"message,omitempty"`
-	Summary          string          `json:"summary,omitempty"`
+	Type      string     `json:"type"`
+	ID        string     `json:"id,omitempty"`
+	ParentID  *string    `json:"parentId"`
+	Timestamp string     `json:"timestamp,omitempty"`
+	Message   ai.Message `json:"message,omitempty"`
+	// FromID precedes Summary so branch_summary entries serialize fields in the
+	// order TS writes them ({fromId, summary}; session.ts:260-261). Compaction
+	// entries leave FromID empty (omitempty), so their {summary, firstKeptEntryId,
+	// tokensBefore} order is unaffected.
 	FromID           string          `json:"fromId,omitempty"`
+	Summary          string          `json:"summary,omitempty"`
 	FirstKeptEntryID string          `json:"firstKeptEntryId,omitempty"`
 	TokensBefore     int             `json:"tokensBefore,omitempty"`
 	CustomType       string          `json:"customType,omitempty"`
@@ -48,7 +52,11 @@ type entryRecord struct {
 // JSON and the existing field order.
 func (r entryRecord) MarshalJSON() ([]byte, error) {
 	type alias entryRecord
-	data, err := json.Marshal(alias(r))
+	// Use the no-HTML-escape marshaller so <, >, and & survive in message
+	// content. json.Encoder passes through (does not un-escape) bytes returned by
+	// a MarshalJSON method, so escaping must be disabled here at the source rather
+	// than relying on the outer marshalJSONLine encoder.
+	data, err := marshalNoHTMLEscape(alias(r))
 	if err != nil {
 		return nil, err
 	}

@@ -2,6 +2,7 @@ package compaction
 
 import (
 	"context"
+	"encoding/json"
 	"strings"
 	"time"
 
@@ -220,11 +221,12 @@ func messagesToLLM(messages []agent.AgentMessage) ([]ai.Message, error) {
 func convertCompactionCustomMessage(custom ai.CustomMessage) []ai.Message {
 	switch custom.MessageRole() {
 	case "custom":
-		switch content := custom.Content.(type) {
-		case string:
-			return []ai.Message{ai.UserMessage{Role: "user", Content: ai.TextBlocks(content), TimestampMs: custom.Timestamp()}}
-		case []ai.ContentBlock:
-			return []ai.Message{ai.UserMessage{Role: "user", Content: content, TimestampMs: custom.Timestamp()}}
+		// TS getMessageFromEntry -> createCustomMessage -> convertToLlm always
+		// produces a user message for custom entries, passing array content through
+		// unchanged. After reloading a session from JSONL the content decodes to
+		// []interface{}, so normalize it to typed blocks rather than dropping it.
+		if blocks, ok := compactionCustomContentBlocks(custom.Content); ok {
+			return []ai.Message{ai.UserMessage{Role: "user", Content: blocks, TimestampMs: custom.Timestamp()}}
 		}
 	case "branchSummary":
 		return []ai.Message{ai.UserMessage{Role: "user", Content: ai.TextBlocks(branchSummaryPrefix + custom.Summary + branchSummarySuffix), TimestampMs: custom.Timestamp()}}
@@ -232,6 +234,33 @@ func convertCompactionCustomMessage(custom ai.CustomMessage) []ai.Message {
 		return []ai.Message{ai.UserMessage{Role: "user", Content: ai.TextBlocks(compactionSummaryPrefix + custom.Summary + compactionSummarySuffix), TimestampMs: custom.Timestamp()}}
 	}
 	return nil
+}
+
+// compactionCustomContentBlocks mirrors harness.customContentBlocks: it turns a
+// custom message's content (string, typed blocks, or the []interface{} shape
+// produced by reloading a session from JSONL) into typed content blocks. The
+// bool reports whether a user message should be emitted (always true except when
+// the content cannot be normalized at all), matching TS which never drops a
+// custom message.
+func compactionCustomContentBlocks(content any) ([]ai.ContentBlock, bool) {
+	switch value := content.(type) {
+	case string:
+		return ai.TextBlocks(value), true
+	case []ai.ContentBlock:
+		return value, true
+	case nil:
+		return nil, true
+	default:
+		raw, err := json.Marshal(value)
+		if err != nil {
+			return nil, false
+		}
+		var blocks []ai.ContentBlock
+		if err := json.Unmarshal(raw, &blocks); err != nil {
+			return nil, false
+		}
+		return blocks, true
+	}
 }
 
 func commonAncestorID(a, b []session.Entry) *string {
