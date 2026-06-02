@@ -73,6 +73,10 @@ type modelCycleDoneMsg struct {
 	scoped bool
 }
 
+type modelSelectDoneMsg struct {
+	Err error
+}
+
 type interactiveBusyKind string
 
 const (
@@ -112,6 +116,7 @@ type interactiveModel struct {
 	toolSlots          map[string]int
 	sessionUnsubscribe func()
 	commandCancel      context.CancelFunc
+	modelSelector      *modelSelectorOverlay
 }
 
 // beginCommand derives a per-command child context from m.ctx and records its
@@ -292,6 +297,11 @@ func (m *interactiveModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmd tea.Cmd
 	switch msg := msg.(type) {
 	case tea.KeyPressMsg:
+		if m.modelSelector != nil {
+			cmd = m.handleModelSelectorKey(msg.String())
+			m.refreshViewport()
+			return m, cmd
+		}
 		switch msg.String() {
 		case "ctrl+c":
 			cmd = m.handleCtrlC()
@@ -316,6 +326,10 @@ func (m *interactiveModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "end":
 			m.autoScroll = true
 			m.viewport.GotoBottom()
+			return m, nil
+		case "ctrl+l":
+			m.openModelSelector()
+			m.refreshViewport()
 			return m, nil
 		case "ctrl+p":
 			cmd = m.cycleModel(false)
@@ -426,6 +440,14 @@ func (m *interactiveModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.refreshViewport()
 		return m, nil
+	case modelSelectDoneMsg:
+		// Success feedback rides the ModelChangedEvent emitted by SetModel; only
+		// surface the failure path here.
+		if msg.Err != nil {
+			m.appendMessage(interactiveRoleError, msg.Err.Error())
+		}
+		m.refreshViewport()
+		return m, nil
 	}
 	m.input, cmd = m.input.Update(msg)
 	m.refreshViewport()
@@ -447,14 +469,21 @@ func (m *interactiveModel) View() tea.View {
 	width := max(1, m.width)
 	header := interactiveHeaderStyle.Render(m.header())
 	body := m.viewport.View()
-	suggestions := m.renderSuggestions()
-	input := interactiveInputStyle.Width(max(1, width-2)).Render(m.input.View())
 	footer := interactiveFooterStyle.Render(m.footer())
 	parts := []string{header, body}
-	if suggestions != "" {
-		parts = append(parts, suggestions)
+	if m.modelSelector != nil {
+		// While the selector is open, its rendered lines replace the input
+		// region (and suggestions), mirroring TS showModelSelector swapping the
+		// editor container for the selector component. Header/body/footer stay.
+		parts = append(parts, m.modelSelector.Render(width)...)
+	} else {
+		if suggestions := m.renderSuggestions(); suggestions != "" {
+			parts = append(parts, suggestions)
+		}
+		input := interactiveInputStyle.Width(max(1, width-2)).Render(m.input.View())
+		parts = append(parts, input)
 	}
-	parts = append(parts, input, footer)
+	parts = append(parts, footer)
 	view := tea.NewView(strings.Join(parts, "\n"))
 	view.KeyboardEnhancements.ReportEventTypes = true
 	view.KeyboardEnhancements.ReportAlternateKeys = true
@@ -469,6 +498,13 @@ func (m *interactiveModel) submitInputWithBehavior(behavior StreamingBehavior) t
 	}
 	m.input.Reset()
 	m.autoScroll = true
+	if !m.busy && text == "/model" {
+		// Bare `/model` opens the navigable selector overlay, mirroring TS
+		// interactive-mode showModelSelector. `/model provider/id` (with an
+		// argument) still routes to the slash handler -> SetModel below.
+		m.openModelSelector()
+		return nil
+	}
 	if m.busy {
 		return m.queueBusyInput(text, behavior)
 	}
@@ -1054,6 +1090,87 @@ func (m *interactiveModel) cycleModel(backward bool) tea.Cmd {
 			_, ok = agent.CycleModel()
 		}
 		return modelCycleDoneMsg{ok: ok, scoped: len(agent.scopedModels) > 0}
+	}
+}
+
+// openModelSelector opens the navigable /model overlay. Entry points are Ctrl+L
+// and a bare `/model` submission. It is suppressed mid-turn (m.busy) so the
+// switch can't race a streaming response, and reports when no models or only
+// one model are available rather than opening an empty/pointless picker.
+func (m *interactiveModel) openModelSelector() {
+	if m.modelSelector != nil {
+		return
+	}
+	if m.busy {
+		m.setStatus("Can't switch model while a response is streaming")
+		return
+	}
+	agent, err := runtimeAgent(m.runtime)
+	if err != nil {
+		m.setStatus(err.Error())
+		return
+	}
+	models := agent.availableModels()
+	overlay := newModelSelectorOverlay(models, agent.Model)
+	if overlay == nil {
+		m.setStatus("No models available")
+		return
+	}
+	if len(models) == 1 {
+		m.setStatus("Only one model available")
+		return
+	}
+	m.modelSelector = overlay
+}
+
+// handleModelSelectorKey routes a key to the open overlay and acts on the
+// result. Selecting closes the overlay and returns a tea.Cmd that performs the
+// model switch off the Update goroutine: SetModel emits ModelChangedEvent ->
+// m.post -> program.Send, which blocks on Bubble Tea's unbuffered msg channel
+// whose only reader is the Update goroutine, so a synchronous SetModel here
+// would deadlock (the same hazard slice 1's cycleModel guards against).
+// Success feedback rides the emitted ModelChangedEvent status line.
+func (m *interactiveModel) handleModelSelectorKey(key string) tea.Cmd {
+	if m.modelSelector == nil {
+		return nil
+	}
+	switch m.modelSelector.HandleKey(key) {
+	case modelSelectorSelect:
+		value, ok := m.modelSelector.SelectedValue()
+		m.modelSelector = nil
+		if !ok {
+			return nil
+		}
+		return m.applyModelSelection(value)
+	case modelSelectorCancel:
+		m.modelSelector = nil
+		m.setStatus("Model selection cancelled.")
+		return nil
+	default:
+		return nil
+	}
+}
+
+// applyModelSelection switches to the provider/id value chosen in the overlay.
+// It runs in the returned tea.Cmd goroutine (never inline on Update) for the
+// deadlock reason documented on handleModelSelectorKey. A no-op (already the
+// active model) skips SetModel to avoid an unnecessary session model-change
+// entry and event.
+func (m *interactiveModel) applyModelSelection(value string) tea.Cmd {
+	provider, id, ok := strings.Cut(value, "/")
+	if !ok {
+		return nil
+	}
+	return func() tea.Msg {
+		agent, err := runtimeAgent(m.runtime)
+		if err != nil {
+			return modelSelectDoneMsg{Err: err}
+		}
+		if agent.Model.Provider == provider && agent.Model.ID == id {
+			return modelSelectDoneMsg{}
+		}
+		_, err = agent.SetModel(provider, id)
+		return modelSelectDoneMsg{Err: err}
 	}
 }
 

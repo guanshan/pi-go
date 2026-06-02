@@ -157,21 +157,25 @@ driven by Bubble Tea, so the bulk of the library is **not wired** into any
 production path. To keep this distinction honest:
 
 - **Wired** (consumed by production code in `cmd/` + `packages/coding-agent`,
-  excluding tests): only five exported symbols are on a live path —
-  `TruncateToWidth`, `VisibleWidth`, `NewMarkdown`, `MarkdownTheme`, and
-  `FuzzyMatchString`. These are the allowlist enforced by
+  excluding tests): the exported symbols on a live path are
+  `TruncateToWidth`, `VisibleWidth`, `NewMarkdown`, `MarkdownTheme`,
+  `FuzzyMatchString`, and — added by interactive-TUI slice 2 — the SelectList
+  surface (`NewSelectList`, `SelectList`, `SelectItem`, `SelectListTheme`,
+  `SelectListLayoutOptions`). These are the allowlist enforced by
   `scripts/check_arch.go` (`wiredTUIComponents`): wiring an additional component
   requires adding it there and here, so dead code cannot silently become "live".
-  The only non-test importers are `core/interactive_tui.go`, `core/modes.go`,
-  and `cli/list_models.go`.
+  The non-test importers are `core/interactive_tui.go`,
+  `core/interactive_model_selector.go`, `core/modes.go`, and
+  `cli/list_models.go`.
 - **Ported but not wired**: everything else listed under "Implemented in Go"
-  below — Input, SelectList, SettingsList, EditorComponent, Loader/
+  below — Input, SettingsList, EditorComponent, Loader/
   CancellableLoader, Image, ProcessTerminal, keybindings/keys, autocomplete,
   stdin paste buffer, undo stack, kill ring, terminal image encoders/capability
   detection, native-modifier helpers, etc. They exist and are tested but have no
-  production consumer yet; the interactive selectors/autocomplete/inline images
-  remain TODO (parity review topic 5: P1-3 markdown caching, P1-4 selectors,
-  P1-5 autocomplete).
+  production consumer yet; remaining interactive autocomplete/inline images and
+  the settings selector stay TODO (parity review topic 5: P1-3 markdown caching,
+  P1-5 autocomplete). The SelectList-backed `/model` picker (P1-4 selectors) is
+  now wired via the interactive overlay (Ctrl+L / bare `/model`).
 - **Intentionally not ported (route A)**: the upstream `TUI` event loop and
   overlay machinery (see the dedicated subsection below).
 
