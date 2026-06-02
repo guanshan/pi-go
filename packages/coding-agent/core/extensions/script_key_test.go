@@ -98,20 +98,21 @@ export default function (pi) {
 	if err := os.WriteFile(ext, []byte(source), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	api := NewAPI()
-	errs := LoadScriptExtensions(context.Background(), api, []string{ext}, nil)
+	runtime := NewRunnerWithAPI(NewAPI())
+	t.Cleanup(func() { _ = runtime.Shutdown(context.Background()) })
+	errs := LoadScriptExtensions(context.Background(), runtime.API, []string{ext}, nil)
 	if len(errs) != 0 {
 		t.Fatalf("expected graceful load (no errors) from unsupported register* calls, got: %v", errs)
 	}
 	// The tool registered after the unsupported calls must survive.
 	found := false
-	for _, tool := range api.SnapshotTools() {
+	for _, tool := range runtime.API.SnapshotTools() {
 		if tool.Name == "survivor" {
 			found = true
 			break
 		}
 	}
 	if !found {
-		t.Fatalf("tool registered after unsupported register* calls was lost; tools=%v", api.SnapshotTools())
+		t.Fatalf("tool registered after unsupported register* calls was lost; tools=%v", runtime.API.SnapshotTools())
 	}
 }
