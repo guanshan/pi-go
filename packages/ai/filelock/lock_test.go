@@ -1,6 +1,7 @@
 package filelock
 
 import (
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -220,6 +221,40 @@ func TestRetryExhaustion(t *testing.T) {
 		!strings.Contains(err.Error(), lockPath) ||
 		!strings.Contains(err.Error(), "attempts") {
 		t.Fatalf("unexpected error message: %q", err.Error())
+	}
+}
+
+func TestWindowsPermissionDuringLockMkdirRetries(t *testing.T) {
+	withKnobs(t, time.Second, 100*time.Millisecond, time.Millisecond, 10)
+
+	origMkdir, origGOOS := mkdirLockDir, runtimeGOOS
+	var mkdirCalls int32
+	mkdirLockDir = func(path string, perm os.FileMode) error {
+		if strings.HasSuffix(path, ".lock") && atomic.AddInt32(&mkdirCalls, 1) == 1 {
+			return &fs.PathError{Op: "mkdir", Path: path, Err: fs.ErrPermission}
+		}
+		return origMkdir(path, perm)
+	}
+	runtimeGOOS = "windows"
+	t.Cleanup(func() {
+		mkdirLockDir = origMkdir
+		runtimeGOOS = origGOOS
+	})
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "auth.json")
+	ran := false
+	if err := WithLock(path, func() error {
+		ran = true
+		return nil
+	}); err != nil {
+		t.Fatalf("WithLock should retry transient Windows mkdir permission error, got: %v", err)
+	}
+	if !ran {
+		t.Fatal("fn never ran after retrying transient Windows mkdir permission error")
+	}
+	if got := atomic.LoadInt32(&mkdirCalls); got < 2 {
+		t.Fatalf("mkdir calls=%d, want at least 2", got)
 	}
 }
 

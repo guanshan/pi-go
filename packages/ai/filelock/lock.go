@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"time"
 )
 
@@ -25,6 +26,9 @@ var (
 	// operation under the lock (notably a network OAuth refresh) from being
 	// mistaken for an abandoned lock and stolen mid-flight.
 	heartbeat = 10 * time.Second
+
+	mkdirLockDir = os.Mkdir
+	runtimeGOOS  = runtime.GOOS
 )
 
 // WithLock serializes access to path across processes using an atomically
@@ -39,11 +43,11 @@ func WithLock(path string, fn func() error) error {
 	}
 	lockPath := path + ".lock"
 	for attempt := 0; ; attempt++ {
-		err := os.Mkdir(lockPath, 0o700)
+		err := mkdirLockDir(lockPath, 0o700)
 		if err == nil {
 			return withHeartbeat(lockPath, fn)
 		}
-		if !errors.Is(err, os.ErrExist) {
+		if !isLockContentionError(err, lockPath) {
 			return err
 		}
 		if info, statErr := os.Stat(lockPath); statErr == nil && time.Since(info.ModTime()) > staleAge {
@@ -56,6 +60,23 @@ func WithLock(path string, fn func() error) error {
 		}
 		time.Sleep(retryDelay)
 	}
+}
+
+func isLockContentionError(err error, lockPath string) bool {
+	if errors.Is(err, os.ErrExist) {
+		return true
+	}
+	if runtimeGOOS != "windows" || !os.IsPermission(err) {
+		return false
+	}
+	if _, statErr := os.Stat(lockPath); statErr == nil || os.IsPermission(statErr) {
+		return true
+	}
+	if probe, probeErr := os.MkdirTemp(filepath.Dir(lockPath), ".lock-probe-*"); probeErr == nil {
+		_ = os.Remove(probe)
+		return true
+	}
+	return false
 }
 
 // withHeartbeat runs fn while a background goroutine periodically refreshes the
