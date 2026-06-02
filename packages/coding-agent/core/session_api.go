@@ -261,11 +261,11 @@ func (a *AgentSession) promptWithRetry(ctx context.Context, text string, images 
 			_ = a.Session.SetLeaf(preLeaf)
 			retriesUsed++
 			delayMs := retryDelayMS(a.retryBaseDelayMS(), retriesUsed)
-			a.emitSessionEvent(AutoRetryStartEvent{Attempt: retriesUsed, MaxAttempts: a.maxAutoRetries(), DelayMs: delayMs, ErrorMessage: retryError})
 			retryCtx, cancel := context.WithCancel(ctx)
 			a.mu.Lock()
 			a.retryCancel = cancel
 			a.mu.Unlock()
+			a.emitSessionEvent(AutoRetryStartEvent{Attempt: retriesUsed, MaxAttempts: a.maxAutoRetries(), DelayMs: delayMs, ErrorMessage: retryError})
 			err := sleepContext(retryCtx, time.Duration(delayMs)*time.Millisecond)
 			a.mu.Lock()
 			a.retryCancel = nil

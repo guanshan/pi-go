@@ -405,6 +405,7 @@ func TestAgentSessionAbortRetryStopsBackoff(t *testing.T) {
 			case retryStarted <- struct{}{}:
 			default:
 			}
+			agent.AbortRetry()
 		}
 	})
 	defer unsubscribe()
@@ -419,7 +420,6 @@ func TestAgentSessionAbortRetryStopsBackoff(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for retry to start")
 	}
-	agent.AbortRetry()
 
 	select {
 	case err := <-done:
