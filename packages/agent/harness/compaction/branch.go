@@ -162,12 +162,18 @@ func GenerateBranchSummary(ctx context.Context, entries []session.Entry, options
 		}
 		return BranchSummary{}, &BranchSummaryError{Code: "summarization_failed", Msg: "Branch summary failed: " + msg}
 	}
-	// Mirror TS branch-summarization.ts:250-253: join text blocks with "\n".
-	summary = summaryTextContent(message)
-	if strings.TrimSpace(summary) == "" {
+	// Mirror TS branch-summarization.ts:250-262 exactly: join text blocks with
+	// "\n" (no trimming), prepend the preamble, append the file operations, then
+	// fall back to "No summary generated" only when the FULL built string is
+	// empty. Because branchSummaryPreamble is non-empty this fallback is
+	// effectively unreachable, but keeping the order identical preserves byte
+	// parity (the old Go code trimmed and applied the fallback to the raw text,
+	// which differs when the model returns leading/trailing whitespace).
+	summary = branchSummaryPreamble + summaryTextContent(message)
+	summary += FormatFileOperations(readFiles, modifiedFiles)
+	if summary == "" {
 		summary = "No summary generated"
 	}
-	summary = branchSummaryPreamble + strings.TrimSpace(summary) + FormatFileOperations(readFiles, modifiedFiles)
 	return BranchSummary{Summary: summary, ReadFiles: readFiles, ModifiedFiles: modifiedFiles}, nil
 }
 

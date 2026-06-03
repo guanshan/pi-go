@@ -105,12 +105,12 @@ func ThinkingBudgetWithBudgets(level string, budgets ThinkingBudgets) int {
 }
 
 // MarshalJSON serializes value the same way TypeScript's JSON.stringify does:
-// it does NOT escape the HTML-significant characters < > &. Go's standard
-// json.Marshal HTML-escapes these (producing <, >, &), which
-// diverges from the TS upstream wire bytes and can break prompt-cache hashing on
-// providers that hash the raw request body. Use this for every provider request
-// body that is serialized by our own code (the OpenAI Go SDK already disables
-// HTML escaping; Anthropic/Google paths rely on this helper or UnescapeJSONHTML).
+// it does NOT escape the HTML-significant characters < > &, nor U+2028/U+2029.
+// Go's standard json.Marshal escapes these, which diverges from the TS upstream
+// wire bytes and can break prompt-cache hashing on providers that hash the raw
+// request body. Use this for every provider request body that is serialized by
+// our own code (the OpenAI Go SDK already disables HTML escaping;
+// Anthropic/Google paths rely on this helper or UnescapeJSONHTML).
 //
 // Like encoding/json, this rejects values that cannot be marshalled. Unlike
 // Encoder.Encode it does not append a trailing newline, matching JSON.stringify.
@@ -127,7 +127,47 @@ func MarshalJSON(value any) ([]byte, error) {
 	if n := len(out); n > 0 && out[n-1] == '\n' {
 		out = out[:n-1]
 	}
-	return out, nil
+	return RestoreJSONStringifySeparators(out), nil
+}
+
+var (
+	jsonEscapeLineSeparator      = []byte(`\u2028`)
+	jsonEscapeParagraphSeparator = []byte(`\u2029`)
+	jsonLineSeparatorUTF8        = []byte{0xe2, 0x80, 0xa8}
+	jsonParagraphSeparatorUTF8   = []byte{0xe2, 0x80, 0xa9}
+)
+
+func RestoreJSONStringifySeparators(raw []byte) []byte {
+	if !bytes.Contains(raw, jsonEscapeLineSeparator) && !bytes.Contains(raw, jsonEscapeParagraphSeparator) {
+		return raw
+	}
+	out := make([]byte, 0, len(raw))
+	for i := 0; i < len(raw); {
+		switch {
+		case hasJSONEscapeAt(raw, i, jsonEscapeLineSeparator) && !jsonBackslashIsEscaped(raw, i):
+			out = append(out, jsonLineSeparatorUTF8...)
+			i += len(jsonEscapeLineSeparator)
+		case hasJSONEscapeAt(raw, i, jsonEscapeParagraphSeparator) && !jsonBackslashIsEscaped(raw, i):
+			out = append(out, jsonParagraphSeparatorUTF8...)
+			i += len(jsonEscapeParagraphSeparator)
+		default:
+			out = append(out, raw[i])
+			i++
+		}
+	}
+	return out
+}
+
+func hasJSONEscapeAt(raw []byte, offset int, escape []byte) bool {
+	return offset+len(escape) <= len(raw) && bytes.Equal(raw[offset:offset+len(escape)], escape)
+}
+
+func jsonBackslashIsEscaped(raw []byte, offset int) bool {
+	backslashes := 0
+	for i := offset - 1; i >= 0 && raw[i] == '\\'; i-- {
+		backslashes++
+	}
+	return backslashes%2 == 1
 }
 
 // UnescapeJSONHTML rewrites the <, > and & escape sequences that

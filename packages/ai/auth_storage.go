@@ -234,7 +234,33 @@ func (a *AuthStorage) AuthStatus(provider string) AuthStatus {
 			return AuthStatus{Source: "environment", Label: env}
 		}
 	}
+	// Ambient credential sources are not listed in ProviderEnvKeys (which only
+	// enumerates explicit API-key vars), so probe them separately to match TS
+	// getEnvApiKey in packages/ai/src/env-api-keys.ts. amazon-bedrock can
+	// authenticate via AWS_PROFILE / IAM keys / container or web-identity creds;
+	// google-vertex via Application Default Credentials.
+	if label, ok := ambientAuthLabel(provider); ok {
+		return AuthStatus{Configured: true, Source: "environment", Label: label}
+	}
 	return AuthStatus{}
+}
+
+// ambientAuthLabel reports whether a provider has ambient (non-API-key)
+// credentials available in the environment, mirroring the ambient sources that
+// TS getEnvApiKey resolves to "<authenticated>". The returned label is a short
+// human-readable hint for the auth-status display.
+func ambientAuthLabel(provider string) (string, bool) {
+	switch provider {
+	case "amazon-bedrock":
+		if _, _, ok := aiproviders.BedrockEnvCredentials(); ok {
+			return "AWS credentials", true
+		}
+	case "google-vertex":
+		if aiproviders.HasGoogleVertexADC() {
+			return "Application Default Credentials", true
+		}
+	}
+	return "", false
 }
 
 func (a *AuthStorage) CredentialType(provider string) string {

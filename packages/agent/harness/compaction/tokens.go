@@ -186,6 +186,24 @@ func messageEntryMessage(entry session.Entry) (agent.AgentMessage, bool) {
 	return messageEntry.Message, true
 }
 
+// utf16Len returns the number of UTF-16 code units in s, matching the
+// JavaScript String.length semantics that TS estimateTokens relies on: each
+// rune <= U+FFFF counts as one code unit and each rune above U+FFFF (encoded as
+// a surrogate pair in UTF-16) counts as two. Go's len() counts UTF-8 bytes,
+// which over-counts non-ASCII text, so the token heuristic must use this helper
+// to stay byte-for-byte identical with the TS port.
+func utf16Len(s string) int {
+	n := 0
+	for _, r := range s {
+		if r > 0xFFFF {
+			n += 2
+		} else {
+			n++
+		}
+	}
+	return n
+}
+
 func EstimateTokens(message agent.AgentMessage) int {
 	chars := 0
 	switch ai.MessageRole(message) {
@@ -195,22 +213,22 @@ func EstimateTokens(message agent.AgentMessage) int {
 		for _, block := range ai.MessageBlocks(message) {
 			switch block.Type {
 			case "text":
-				chars += len(block.Text)
+				chars += utf16Len(block.Text)
 			case "thinking":
-				chars += len(block.Thinking)
+				chars += utf16Len(block.Thinking)
 			case "toolCall":
-				chars += len(block.Name) + len(safeJSON(block.Arguments))
+				chars += utf16Len(block.Name) + utf16Len(safeJSON(block.Arguments))
 			}
 		}
 	case "bashExecution":
 		if custom, ok := ai.AsCustomMessage(message); ok {
-			chars = len(custom.Command) + len(custom.Output)
+			chars = utf16Len(custom.Command) + utf16Len(custom.Output)
 		}
 	case "branchSummary", "compactionSummary":
 		if custom, ok := ai.AsCustomMessage(message); ok {
-			chars = len(custom.Summary)
+			chars = utf16Len(custom.Summary)
 		} else {
-			chars = len(ai.MessageText(message))
+			chars = utf16Len(ai.MessageText(message))
 		}
 	default:
 		return 0
@@ -227,7 +245,7 @@ func estimateContentChars(blocks []ai.ContentBlock) int {
 	for _, block := range blocks {
 		switch block.Type {
 		case "text":
-			chars += len(block.Text)
+			chars += utf16Len(block.Text)
 		case "image":
 			chars += 4800
 		}

@@ -68,6 +68,9 @@ type Agent struct {
 	sessionID       string
 	thinkingBudgets *ai.ThinkingBudgets
 	transport       string
+	timeoutMs       int
+	idleTimeoutMs   int
+	maxRetries      int
 	maxRetryDelayMs int
 	onPayload       func(payload any, model ai.Model) (any, error)
 	onResponse      func(resp ai.ProviderResponse, model ai.Model) error
@@ -123,6 +126,9 @@ func NewAgent(opts AgentOptions) *Agent {
 		sessionID:           opts.SessionID,
 		thinkingBudgets:     opts.ThinkingBudgets,
 		transport:           opts.Transport,
+		timeoutMs:           opts.TimeoutMs,
+		idleTimeoutMs:       opts.IdleTimeoutMs,
+		maxRetries:          opts.MaxRetries,
 		maxRetryDelayMs:     opts.MaxRetryDelayMs,
 		onPayload:           opts.OnPayload,
 		onResponse:          opts.OnResponse,
@@ -512,6 +518,9 @@ func (a *Agent) loopConfig(skipInitialSteeringPoll bool) AgentLoopConfig {
 		SessionID:           a.sessionID,
 		Transport:           a.transport,
 		ThinkingBudgets:     a.thinkingBudgets,
+		TimeoutMs:           a.timeoutMs,
+		IdleTimeoutMs:       a.idleTimeoutMs,
+		MaxRetries:          a.maxRetries,
 		MaxRetryDelayMs:     a.maxRetryDelayMs,
 		ConvertToLLM:        a.convertToLLM,
 		TransformContext:    a.transformContext,

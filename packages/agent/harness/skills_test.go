@@ -98,6 +98,152 @@ func TestLoadSourcedSkillsPreservesDuplicatesSourcesAndDiagnostics(t *testing.T)
 	}
 }
 
+// TestLoadSkillsEmitsInvalidNameYamlAndLongNameDiagnostics converts the
+// diagnostics cases from coding-agent/test/skills.test.ts:57-161 (invalid name
+// characters, name >64 chars, consecutive hyphens, invalid YAML frontmatter).
+// The TS assertions use diagnostics.some(d => d.message.includes(...)), so we
+// mirror that with substring checks rather than exact equality.
+func TestLoadSkillsEmitsInvalidNameYamlAndLongNameDiagnostics(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	env, err := harnessenv.NewLocalExecutionEnv(root, "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Inline fixtures mirror coding-agent/test/fixtures/skills/* exactly: the
+	// SKILL.md parent directory name matches the TS fixture directory name and
+	// the frontmatter `name` matches the TS fixture frontmatter.
+	writeHarnessTestFile(t, filepath.Join(root, "skills", "invalid-name-chars", "SKILL.md"), `---
+name: Invalid_Name
+description: A skill with invalid characters in the name.
+---
+
+# Invalid Name
+
+This skill has uppercase and underscore in the name.
+`)
+	writeHarnessTestFile(t, filepath.Join(root, "skills", "long-name", "SKILL.md"), `---
+name: this-is-a-very-long-skill-name-that-exceeds-the-sixty-four-character-limit-set-by-the-standard
+description: A skill with a name that exceeds 64 characters.
+---
+
+# Long Name
+
+This skill's name is too long.
+`)
+	writeHarnessTestFile(t, filepath.Join(root, "skills", "consecutive-hyphens", "SKILL.md"), `---
+name: bad--name
+description: A skill with consecutive hyphens in the name.
+---
+
+# Consecutive Hyphens
+
+This skill has consecutive hyphens in its name.
+`)
+	writeHarnessTestFile(t, filepath.Join(root, "skills", "invalid-yaml", "SKILL.md"), `---
+name: invalid-yaml
+description: [unclosed bracket
+---
+
+# Invalid YAML Skill
+
+This skill has invalid YAML in the frontmatter.
+`)
+
+	loaded := LoadSkills(ctx, env, "skills")
+
+	// invalid-name-chars, long-name, consecutive-hyphens all have valid
+	// descriptions, so the skill is still loaded (with warnings). invalid-yaml
+	// fails to parse and is skipped, matching TS skills.length expectations.
+	loadedNames := skillNames(loaded.Skills)
+	for _, want := range []string{"Invalid_Name", "this-is-a-very-long-skill-name-that-exceeds-the-sixty-four-character-limit-set-by-the-standard", "bad--name"} {
+		if !containsString(loadedNames, want) {
+			t.Fatalf("expected skill %q to load; got skills=%v diagnostics=%#v", want, loadedNames, loaded.Diagnostics)
+		}
+	}
+	if containsString(loadedNames, "invalid-yaml") {
+		t.Fatalf("invalid-yaml skill should be skipped; got skills=%v", loadedNames)
+	}
+
+	// invalid characters (TS: "invalid characters", skills.test.ts:64)
+	if !hasSkillDiagnostic(loaded.Diagnostics, "invalid_metadata", "invalid characters") {
+		t.Fatalf("expected invalid-characters diagnostic; diagnostics=%#v", loaded.Diagnostics)
+	}
+	// name exceeds 64 characters (TS: "exceeds 64 characters", skills.test.ts:74)
+	if !hasSkillDiagnostic(loaded.Diagnostics, "invalid_metadata", "exceeds 64 characters") {
+		t.Fatalf("expected long-name diagnostic; diagnostics=%#v", loaded.Diagnostics)
+	}
+	// consecutive hyphens (TS: "consecutive hyphens", skills.test.ts:160)
+	if !hasSkillDiagnostic(loaded.Diagnostics, "invalid_metadata", "consecutive hyphens") {
+		t.Fatalf("expected consecutive-hyphens diagnostic; diagnostics=%#v", loaded.Diagnostics)
+	}
+	// invalid YAML frontmatter. TS asserts the message includes "at line"
+	// (skills.test.ts:138); Go's gopkg.in/yaml.v3 surfaces the parse failure as
+	// `parse_failed` with a "yaml: line N: ..." message, so we assert on the Go
+	// shape (code parse_failed, message mentions a line). See
+	// docs/TS_COMPATIBILITY.md for the message-format note.
+	if !hasSkillDiagnostic(loaded.Diagnostics, "parse_failed", "line") {
+		t.Fatalf("expected invalid-yaml parse_failed diagnostic; diagnostics=%#v", loaded.Diagnostics)
+	}
+}
+
+// TestFormatSkillsForSystemPromptEscapesXML converts the XML-escape case from
+// coding-agent/test/skills.test.ts:268 for FormatSkillsForSystemPrompt (the Go
+// equivalent of system_prompt.go formatSkillsForPrompt / escapeXML).
+func TestFormatSkillsForSystemPromptEscapesXML(t *testing.T) {
+	skills := []Skill{
+		{
+			Name:        "test-skill",
+			Description: `A skill with <special> & "characters".`,
+			FilePath:    "/path/to/skill/SKILL.md",
+		},
+	}
+
+	result := FormatSkillsForSystemPrompt(skills)
+
+	if !strings.Contains(result, "&lt;special&gt;") {
+		t.Fatalf("expected escaped angle brackets; result=%q", result)
+	}
+	if !strings.Contains(result, "&amp;") {
+		t.Fatalf("expected escaped ampersand; result=%q", result)
+	}
+	if !strings.Contains(result, "&quot;characters&quot;") {
+		t.Fatalf("expected escaped double quotes; result=%q", result)
+	}
+	// Guard against double-escaping: the raw characters must not survive in the
+	// emitted description line.
+	if strings.Contains(result, "<special>") || strings.Contains(result, `"characters"`) {
+		t.Fatalf("raw special characters leaked into output; result=%q", result)
+	}
+}
+
+func skillNames(skills []Skill) []string {
+	names := make([]string, 0, len(skills))
+	for _, skill := range skills {
+		names = append(names, skill.Name)
+	}
+	return names
+}
+
+func containsString(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
+}
+
+func hasSkillDiagnostic(diagnostics []SkillDiagnostic, code string, messageSubstring string) bool {
+	for _, diagnostic := range diagnostics {
+		if diagnostic.Code == code && strings.Contains(diagnostic.Message, messageSubstring) {
+			return true
+		}
+	}
+	return false
+}
+
 func TestFormatSkillInvocationMatchesTypeScript(t *testing.T) {
 	skill := Skill{
 		Name:        "inspect",

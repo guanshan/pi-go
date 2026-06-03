@@ -8,7 +8,7 @@ import (
 	"github.com/guanshan/pi-go/packages/ai"
 )
 
-// escLT, escGT, escAmp, and escLS are the JSON \u escape sequences that Go's
+// escLT, escGT, escAmp, escLS, and escPS are the JSON \u escape sequences that Go's
 // default json.Marshal emits but TS JSON.stringify does not (for < > &) / does
 // (for U+2028). They are built from runes so the test source carries no literal
 // special characters and no ambiguity about which bytes are present.
@@ -17,6 +17,7 @@ var (
 	escGT  = `\u00` + "3e" // > -> >
 	escAmp = `\u00` + "26" // & -> &
 	escLS  = `\u20` + "28" // U+2028 ->
+	escPS  = `\u20` + "29" // U+2029 ->
 )
 
 // TestSessionJSONLWriteGoldenNoHTMLEscape locks the byte-for-byte shape of the
@@ -194,9 +195,8 @@ func TestSessionJSONLRoundTripSpecialChars(t *testing.T) {
 	}
 }
 
-// TestMarshalNoHTMLEscapeMatchesTSStringify documents and locks the helper's
-// behavior against JSON.stringify for the affected characters, including the
-// known residual U+2028/U+2029 escaping difference that Go cannot disable.
+// TestMarshalNoHTMLEscapeMatchesTSStringify locks the helper's behavior against
+// JSON.stringify for the affected characters.
 func TestMarshalNoHTMLEscapeMatchesTSStringify(t *testing.T) {
 	// <, >, & are left literal (matches JSON.stringify exactly).
 	got, err := marshalNoHTMLEscape(map[string]string{"v": "a<b>c&d"})
@@ -215,22 +215,25 @@ func TestMarshalNoHTMLEscapeMatchesTSStringify(t *testing.T) {
 		t.Fatalf("marshalNoHTMLEscape must not append a trailing newline: %q", got)
 	}
 
-	// Residual known difference vs TS: U+2028/U+2029 are still escaped by Go's
-	// encoder (no public off switch). They remain semantically equivalent.
-	input := "line" + string(rune(0x2028)) + "break"
+	input := "line" + string(rune(0x2028)) + "break" + string(rune(0x2029)) + ` literal \u2028`
 	sep, err := marshalNoHTMLEscape(map[string]string{"v": input})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(sep), escLS) {
-		t.Fatalf("expected Go to escape U+2028 (known residual difference), got %s", sep)
+	if strings.Contains(string(sep), `"v":"line`+escLS) || strings.Contains(string(sep), "break"+escPS) {
+		t.Fatalf("must not escape real U+2028/U+2029: %s", sep)
 	}
-	// It still decodes back to the original character.
+	if !strings.Contains(string(sep), string(rune(0x2028))) || !strings.Contains(string(sep), string(rune(0x2029))) {
+		t.Fatalf("expected literal U+2028/U+2029, got %s", sep)
+	}
+	if !strings.Contains(string(sep), `\\u2028`) {
+		t.Fatalf("literal backslash-u text should stay escaped as JSON text, got %s", sep)
+	}
 	var decoded map[string]string
 	if err := json.Unmarshal(sep, &decoded); err != nil {
 		t.Fatal(err)
 	}
 	if decoded["v"] != input {
-		t.Fatalf("U+2028 must decode back to the same character, got %q", decoded["v"])
+		t.Fatalf("U+2028/U+2029 must decode back to the same character, got %q", decoded["v"])
 	}
 }

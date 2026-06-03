@@ -54,7 +54,12 @@ type GrepTool struct {
 	// falling back to PATH. Empty consults PATH only.
 	BinDir string
 }
-type FindTool struct{ CWD string }
+type FindTool struct {
+	CWD string
+	// BinDir is the agent bin directory searched for a vendored fd binary before
+	// falling back to PATH. When fd is unavailable the tool uses the Go fallback.
+	BinDir string
+}
 type LsTool struct{ CWD string }
 
 type BuiltinToolOptions struct {

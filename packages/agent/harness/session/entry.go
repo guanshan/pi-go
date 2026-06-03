@@ -124,8 +124,15 @@ type LeafEntry struct {
 
 func (LeafEntry) EntryType() string { return "leaf" }
 
+// iso8601Millis matches JavaScript Date.prototype.toISOString(): UTC with
+// exactly three fractional (millisecond) digits and a trailing "Z". Go's
+// time.RFC3339Nano trims trailing zeros and can emit up to nanosecond
+// precision, so it must not be used for timestamps that need to round-trip
+// against the TS port.
+const iso8601Millis = "2006-01-02T15:04:05.000Z07:00"
+
 func CreateTimestamp() string {
-	return time.Now().UTC().Format(time.RFC3339Nano)
+	return time.Now().UTC().Format(iso8601Millis)
 }
 
 func cloneStringPtr(value *string) *string {

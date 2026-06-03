@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	anthropicoption "github.com/anthropics/anthropic-sdk-go/option"
@@ -21,6 +22,7 @@ type ProviderResponse struct {
 
 type RequestOptions struct {
 	TimeoutMs       int
+	IdleTimeoutMs   int
 	MaxRetries      int
 	UseMaxRetries   bool
 	MaxRetryDelayMs int
@@ -32,7 +34,84 @@ func NewHTTPClient() *http.Client {
 }
 
 func NewHTTPClientWithOptions(options RequestOptions) *http.Client {
-	return &http.Client{Timeout: RequestTimeout(options)}
+	client := &http.Client{Timeout: RequestTimeout(options)}
+	// IdleTimeoutMs is a per-read (stream-idle) deadline distinct from the total
+	// request Timeout; see docs/AI_PROVIDER_PARITY.md (P1-08).
+	if options.IdleTimeoutMs > 0 {
+		client.Transport = &idleTimeoutTransport{
+			base: http.DefaultTransport,
+			idle: time.Duration(options.IdleTimeoutMs) * time.Millisecond,
+		}
+	}
+	return client
+}
+
+// idleTimeoutTransport wraps a RoundTripper so each response body is governed by
+// a per-read idle deadline; the total-request Timeout still applies via the
+// owning http.Client.
+type idleTimeoutTransport struct {
+	base http.RoundTripper
+	idle time.Duration
+}
+
+func (t *idleTimeoutTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	base := t.base
+	if base == nil {
+		base = http.DefaultTransport
+	}
+	resp, err := base.RoundTrip(req)
+	if err != nil || resp == nil || resp.Body == nil || t.idle <= 0 {
+		return resp, err
+	}
+	resp.Body = newIdleTimeoutReader(resp.Body, t.idle)
+	return resp, nil
+}
+
+// idleTimeoutReader fails a Read that blocks longer than the idle window: a timer
+// armed around each Read closes the body on fire, unblocking the stalled Read.
+type idleTimeoutReader struct {
+	body io.ReadCloser
+	idle time.Duration
+
+	mu       sync.Mutex
+	closed   bool
+	timedOut bool
+}
+
+func newIdleTimeoutReader(body io.ReadCloser, idle time.Duration) *idleTimeoutReader {
+	return &idleTimeoutReader{body: body, idle: idle}
+}
+
+func (r *idleTimeoutReader) Read(p []byte) (int, error) {
+	timer := time.AfterFunc(r.idle, func() {
+		r.mu.Lock()
+		r.timedOut = true
+		body := r.body
+		r.mu.Unlock()
+		// Closing the underlying body unblocks a stalled Read on the connection.
+		_ = body.Close()
+	})
+	n, err := r.body.Read(p)
+	timer.Stop()
+	r.mu.Lock()
+	timedOut := r.timedOut
+	r.mu.Unlock()
+	if timedOut && (err != nil || n == 0) {
+		return n, fmt.Errorf("stream idle timeout after %s", r.idle)
+	}
+	return n, err
+}
+
+func (r *idleTimeoutReader) Close() error {
+	r.mu.Lock()
+	if r.closed {
+		r.mu.Unlock()
+		return nil
+	}
+	r.closed = true
+	body := r.body
+	r.mu.Unlock()
+	return body.Close()
 }
 
 func RequestTimeout(options RequestOptions) time.Duration {

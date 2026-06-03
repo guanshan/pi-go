@@ -50,7 +50,7 @@ func (h *AgentHarness) NavigateTree(ctx context.Context, targetID string, opts N
 		OldLeafID:           cloneStringPtr(oldLeaf),
 		CommonAncestorID:    collected.CommonAncestorID,
 		EntriesToSummarize:  collected.Entries,
-		UserWantsSummary:    opts.UserWantsSummary || opts.Summary != "" || opts.CustomInstructions != "",
+		UserWantsSummary:    opts.UserWantsSummary,
 		CustomInstructions:  opts.CustomInstructions,
 		ReplaceInstructions: opts.ReplaceInstructions,
 		Label:               opts.Label,
@@ -63,29 +63,38 @@ func (h *AgentHarness) NavigateTree(ctx context.Context, targetID string, opts N
 		return NavigateTreeResult{OldLeafID: oldLeafID, NewLeafID: oldLeafID, Canceled: true}, nil
 	}
 
-	summary := opts.Summary
-	summaryDetails := opts.Details
+	// Mirror TS agent-harness.ts navigateTree: the hook's summary object (if any)
+	// becomes the summary; its customInstructions/replaceInstructions are NOT a
+	// literal summary, they override the inputs fed to generateBranchSummary. So
+	// a hook that returns only customInstructions must still trigger generation
+	// when summarize is set, using the overridden instructions.
+	var summary string
+	var summaryDetails any
 	fromHook := opts.GeneratedFromHook
-	if before != nil {
-		if before.Summary != nil {
-			summary = before.Summary.Summary
-			if len(before.Summary.ReadFiles) > 0 || len(before.Summary.ModifiedFiles) > 0 {
-				summaryDetails = branchSummaryDetails(before.Summary.ReadFiles, before.Summary.ModifiedFiles)
-			}
-			fromHook = true
+	if before != nil && before.Summary != nil {
+		summary = before.Summary.Summary
+		if len(before.Summary.ReadFiles) > 0 || len(before.Summary.ModifiedFiles) > 0 {
+			summaryDetails = branchSummaryDetails(before.Summary.ReadFiles, before.Summary.ModifiedFiles)
 		}
+		// fromHook is "hookResult?.summary !== undefined" in TS.
+		fromHook = true
+	}
+	customInstructions := prep.CustomInstructions
+	replaceInstructions := prep.ReplaceInstructions
+	if before != nil {
 		if before.CustomInstructions != "" {
-			if summary == "" || before.ReplaceInstructions != nil && *before.ReplaceInstructions {
-				summary = before.CustomInstructions
-			} else {
-				summary = strings.TrimSpace(summary) + "\n\n" + strings.TrimSpace(before.CustomInstructions)
-			}
+			customInstructions = before.CustomInstructions
+		}
+		if before.ReplaceInstructions != nil {
+			replaceInstructions = *before.ReplaceInstructions
 		}
 		if before.Label != nil {
 			opts.Label = *before.Label
 		}
 	}
-	if !opts.SkipSummary && summary == "" && prep.UserWantsSummary {
+	// TS gate: !summaryText && options.summarize && entries.length > 0. SkipSummary
+	// is a Go-only opt-out that defaults to false, so the default path matches TS.
+	if !opts.SkipSummary && summary == "" && prep.UserWantsSummary && len(prep.EntriesToSummarize) > 0 {
 		model, _, apiKey, headers, err := h.compactionAuth(ctx)
 		if err != nil {
 			return NavigateTreeResult{}, err
@@ -94,8 +103,8 @@ func (h *AgentHarness) NavigateTree(ctx context.Context, targetID string, opts N
 			Model:               model,
 			APIKey:              apiKey,
 			Headers:             headers,
-			CustomInstructions:  prep.CustomInstructions,
-			ReplaceInstructions: prep.ReplaceInstructions,
+			CustomInstructions:  customInstructions,
+			ReplaceInstructions: replaceInstructions,
 			Registry:            h.registry,
 		})
 		if err != nil {

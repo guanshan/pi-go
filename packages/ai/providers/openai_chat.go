@@ -204,7 +204,15 @@ func OpenAIChatMessages(options OpenAIChatRequestOptions) []map[string]any {
 		case "user":
 			out = append(out, map[string]any{"role": "user", "content": openAIChatContent(msg)})
 		case "assistant":
-			m := map[string]any{"role": "assistant", "content": ""}
+			// Default content mirrors TS openai-completions.ts: some providers reject
+			// null content, so use "" when an assistant turn is forcibly inserted after
+			// a tool result; otherwise default to JSON null. The default is overwritten
+			// only when there is actual text/thinking content (see below).
+			var defaultContent any
+			if options.RequiresAssistantAfterToolResult {
+				defaultContent = ""
+			}
+			m := map[string]any{"role": "assistant", "content": defaultContent}
 			var toolCalls []map[string]any
 			text := ""
 			var textParts []map[string]any
@@ -247,7 +255,11 @@ func OpenAIChatMessages(options OpenAIChatRequestOptions) []map[string]any {
 				content := []map[string]any{{"type": "text", "text": strings.Join(thinkingTexts, "\n\n")}}
 				content = append(content, textParts...)
 				m["content"] = content
-			} else {
+			} else if text != "" {
+				// Match TS: only overwrite the default content (null / "") when there is
+				// real text. An empty assistant turn keeps its null/"" default so that
+				// providers which reject null vs. those which require it both behave as
+				// in the TypeScript provider.
 				m["content"] = text
 			}
 			if !options.RequiresThinkingAsText && replayThinkingSignature != "" && len(replayThinkingTexts) > 0 {

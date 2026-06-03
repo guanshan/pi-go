@@ -37,18 +37,24 @@ func ProcessFileArguments(cwd string, fileArgs []string, options ...ProcessFileO
 	var result ProcessedFiles
 	for _, fileArg := range fileArgs {
 		path := ResolveReadPath(cwd, fileArg)
-		data, err := os.ReadFile(path)
-		if err != nil {
-			return ProcessedFiles{}, err
-		}
-		if len(data) == 0 {
-			continue
-		}
 		abs, err := filepath.Abs(path)
 		if err != nil {
 			abs = path
 		}
 		abs = filepath.Clean(abs)
+		data, err := os.ReadFile(path)
+		if err != nil {
+			// Mirror file-processor.ts wording: a missing file reports "File not
+			// found: <path>"; any other read failure reports "Could not read file:
+			// <path>". The absolute, cleaned path is used (matching TS resolve()).
+			if os.IsNotExist(err) {
+				return ProcessedFiles{}, fmt.Errorf("File not found: %s", abs) //nolint:staticcheck // TS-compatible user-facing message.
+			}
+			return ProcessedFiles{}, fmt.Errorf("Could not read file: %s", abs) //nolint:staticcheck // TS-compatible user-facing message.
+		}
+		if len(data) == 0 {
+			continue
+		}
 		if mimeType := detectSupportedImageMime(data); mimeType != "" {
 			if !autoResize {
 				result.Images = append(result.Images, ai.ContentBlock{Type: "image", Data: base64.StdEncoding.EncodeToString(data), MimeType: mimeType})
@@ -117,7 +123,9 @@ func normalizePathInput(path string, stripAtPrefix bool) string {
 			return r
 		}
 	}, path)
-	if strings.HasPrefix(path, "file:") {
+	// Only a genuine `file://` URL is decoded (TS paths.ts: /^file:\/\//). A bare
+	// `file:foo` is treated as a plain relative path, not a URL.
+	if strings.HasPrefix(path, "file://") {
 		if decoded, ok := fileURLPath(path); ok {
 			path = decoded
 		}

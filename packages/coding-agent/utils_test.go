@@ -69,6 +69,20 @@ func TestHTMLAndANSIUtilities(t *testing.T) {
 	}
 }
 
+// TestNormalizePathFileURLPrefix verifies NormalizePath only treats a genuine
+// file:// URL as a URL (TS paths.ts: /^file:\/\//). A bare "file:foo" is a plain
+// relative path that must pass through unchanged.
+func TestNormalizePathFileURLPrefix(t *testing.T) {
+	// file:foo (no //) is a plain path, returned verbatim.
+	if got := NormalizePath("file:foo", PathInputOptions{}); got != "file:foo" {
+		t.Fatalf("file:foo should be a plain path, got %q", got)
+	}
+	// file:///abs is a URL, decoded to the native absolute path.
+	if got := NormalizePath("file:///tmp/abs.txt", PathInputOptions{}); got != filepath.FromSlash("/tmp/abs.txt") {
+		t.Fatalf("file:///abs should decode to the path, got %q", got)
+	}
+}
+
 func TestPathAndShellUtilities(t *testing.T) {
 	home := t.TempDir()
 	expanded := NormalizePath("@~/x\u00a0y", PathInputOptions{
@@ -98,5 +112,23 @@ func TestSleepAndSanitize(t *testing.T) {
 	}
 	if got := SanitizeBinaryOutput("a\x00b\tc\ufffad"); got != "ab\tcd" {
 		t.Fatalf("sanitized=%q", got)
+	}
+}
+
+// TestSanitizeBinaryOutputPreservesReplacementChar verifies the fix: a legitimate
+// U+FFFD (valid EF BF BD) is preserved, while genuinely invalid bytes are still
+// stripped.
+func TestSanitizeBinaryOutputPreservesReplacementChar(t *testing.T) {
+	// Valid U+FFFD survives (it is real text content, not a decode error).
+	if got := SanitizeBinaryOutput("x\ufffdy"); got != "x\ufffdy" {
+		t.Fatalf("real U+FFFD must be preserved, got %q", got)
+	}
+	// A lone invalid byte (0xFF) is dropped, surrounding text preserved.
+	if got := SanitizeBinaryOutput("x\xffy"); got != "xy" {
+		t.Fatalf("invalid byte must be dropped, got %q", got)
+	}
+	// Control chars are still stripped except tab/newline/carriage-return.
+	if got := SanitizeBinaryOutput("a\x00\x07b\n"); got != "ab\n" {
+		t.Fatalf("control stripping changed, got %q", got)
 	}
 }

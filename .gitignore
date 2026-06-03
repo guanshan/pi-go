@@ -19,6 +19,7 @@ coverage.html
 .idea/
 .zed/
 .workspace/
+.review/
 .claude/
 *.swp
 *.swo

@@ -167,7 +167,7 @@ func anthropicApplyStreamEvent(event anthropic.MessageStreamEventUnion, partial 
 		}
 	case "message_delta":
 		partial.Usage = anthropicUsage(aiproviders.AnthropicUsageFromDeltaUsage(event.Usage))
-		stopReason, errorMessage := aiproviders.AnthropicStopReason(string(event.Delta.StopReason), hasToolCallBlock(*blocks))
+		stopReason, errorMessage := aiproviders.AnthropicStopReason(string(event.Delta.StopReason))
 		partial.StopReason = stopReason
 		partial.ErrorMessage = errorMessage
 	}

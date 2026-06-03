@@ -312,3 +312,124 @@ func TestFauxStreamMultipleToolCalls(t *testing.T) {
 		t.Fatalf("toolcall starts=%d ends=%d want 2/2", starts, ends)
 	}
 }
+
+// TestFauxTwoInstancesIsolated proves two RegisterFauxProvider instances script
+// independent queues with no crosstalk, and that per-instance traffic does not
+// touch the shared default instance behind the package-level shims.
+func TestFauxTwoInstancesIsolated(t *testing.T) {
+	ResetFauxResponses()
+	defer ResetFauxResponses()
+
+	dir := t.TempDir()
+	registry := NewModelRegistry(dir, NewAuthStorage(dir))
+
+	a := RegisterFauxProvider(NewFauxText("alpha answer"))
+	defer a.Unregister()
+	b := RegisterFauxProvider(NewFauxText("beta answer"))
+	defer b.Unregister()
+
+	if a.Model.API == b.Model.API {
+		t.Fatalf("instances share API %q", a.Model.API)
+	}
+	if a.Model.Provider != "faux" || b.Model.Provider != "faux" {
+		t.Fatalf("instance Provider not faux: %q %q", a.Model.Provider, b.Model.Provider)
+	}
+
+	ctx := Context{Messages: []Message{NewUserMessage("hi", nil)}}
+	ra, err := registry.Complete(context.Background(), a.Model, ctx, StreamOptions{})
+	if err != nil {
+		t.Fatalf("a complete: %v", err)
+	}
+	rb, err := registry.Complete(context.Background(), b.Model, ctx, StreamOptions{})
+	if err != nil {
+		t.Fatalf("b complete: %v", err)
+	}
+
+	if got := MessageText(ra); got != "alpha answer" {
+		t.Fatalf("a text=%q want %q", got, "alpha answer")
+	}
+	if got := MessageText(rb); got != "beta answer" {
+		t.Fatalf("b text=%q want %q", got, "beta answer")
+	}
+	if a.Provider.CallCount() != 1 || b.Provider.CallCount() != 1 {
+		t.Fatalf("callCounts a=%d b=%d want 1/1", a.Provider.CallCount(), b.Provider.CallCount())
+	}
+	if a.Provider.PendingResponseCount() != 0 || b.Provider.PendingResponseCount() != 0 {
+		t.Fatalf("pending a=%d b=%d want 0/0", a.Provider.PendingResponseCount(), b.Provider.PendingResponseCount())
+	}
+	// The shared default instance must be untouched by per-instance traffic.
+	if FauxCallCount() != 0 {
+		t.Fatalf("default instance callCount=%d want 0 (per-instance traffic leaked into the default)", FauxCallCount())
+	}
+}
+
+// TestFauxParallelSubtestsNoCrosstalk exercises the per-instance path from
+// t.Parallel() subtests: each owns its own RegisterFauxProvider instance and
+// unique API, so concurrent scripting is race-free (the global shims are never
+// used here).
+func TestFauxParallelSubtestsNoCrosstalk(t *testing.T) {
+	cases := []struct{ name, answer string }{
+		{"one", "answer-one"},
+		{"two", "answer-two"},
+		{"three", "answer-three"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			dir := t.TempDir()
+			registry := NewModelRegistry(dir, NewAuthStorage(dir))
+			reg := RegisterFauxProvider()
+			t.Cleanup(reg.Unregister)
+			reg.Provider.SetResponses([]FauxResponse{NewFauxText(tc.answer)})
+
+			ctx := Context{Messages: []Message{NewUserMessage("hi "+tc.name, nil)}}
+			resp, err := registry.Complete(context.Background(), reg.Model, ctx, StreamOptions{})
+			if err != nil {
+				t.Fatalf("complete: %v", err)
+			}
+			if got := MessageText(resp); got != tc.answer {
+				t.Fatalf("text=%q want %q", got, tc.answer)
+			}
+			if reg.Provider.CallCount() != 1 {
+				t.Fatalf("callCount=%d want 1", reg.Provider.CallCount())
+			}
+		})
+	}
+}
+
+// TestFauxDefaultInstanceShimsStillWork is a regression guard that the
+// package-level Set/Append/Reset/Pending/FauxCallCount shims still drive the
+// shared default instance behind the builtin "faux" model exactly as before.
+func TestFauxDefaultInstanceShimsStillWork(t *testing.T) {
+	ResetFauxResponses()
+	defer ResetFauxResponses()
+	registry, model := fauxTestModel(t)
+
+	SetFauxResponses([]FauxResponse{NewFauxText("first")})
+	AppendFauxResponses([]FauxResponse{NewFauxText("second")})
+	if PendingFauxResponseCount() != 2 {
+		t.Fatalf("pending=%d want 2", PendingFauxResponseCount())
+	}
+
+	ctx := Context{Messages: []Message{NewUserMessage("hi", nil)}}
+	r1, err := registry.Complete(context.Background(), model, ctx, StreamOptions{})
+	if err != nil {
+		t.Fatalf("complete 1: %v", err)
+	}
+	if got := MessageText(r1); got != "first" {
+		t.Fatalf("r1=%q want first", got)
+	}
+	r2, err := registry.Complete(context.Background(), model, ctx, StreamOptions{})
+	if err != nil {
+		t.Fatalf("complete 2: %v", err)
+	}
+	if got := MessageText(r2); got != "second" {
+		t.Fatalf("r2=%q want second", got)
+	}
+	if FauxCallCount() != 2 {
+		t.Fatalf("callCount=%d want 2", FauxCallCount())
+	}
+	if PendingFauxResponseCount() != 0 {
+		t.Fatalf("pending=%d want 0", PendingFauxResponseCount())
+	}
+}

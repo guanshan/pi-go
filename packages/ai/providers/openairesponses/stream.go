@@ -65,8 +65,11 @@ func (s *StreamState) Apply(event map[string]any) []StreamUpdate {
 		if response, ok := aiproviders.ResponseObjectFromEvent(event["response"]); ok {
 			s.applyResponseMetadata(response)
 		}
-	case "response.completed", "response.incomplete", "response.failed":
+	case "response.completed", "response.done", "response.incomplete", "response.failed":
 		if response, ok := aiproviders.ResponseObjectFromEvent(event["response"]); ok {
+			for index, item := range response.Output {
+				s.setBlock(int64(index), item)
+			}
 			s.applyResponseMetadata(response)
 			s.usage = aiproviders.ResponseUsageToUsage(response.Usage)
 			stopReason, errorMessage := aiproviders.ResponsesStopReasonResult(response.Status)

@@ -70,7 +70,9 @@ func normalizePathInput(path string, stripAtPrefix bool) string {
 			return r
 		}
 	}, path)
-	if strings.HasPrefix(path, "file:") {
+	// Only a genuine `file://` URL is decoded (TS paths.ts: /^file:\/\//). A bare
+	// `file:foo` is treated as a plain relative path, not a URL.
+	if strings.HasPrefix(path, "file://") {
 		if decoded, ok := FileURLToPath(path); ok {
 			path = decoded
 		}

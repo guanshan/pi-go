@@ -190,8 +190,14 @@ func GetShellConfig(customShellPath ...string) (ShellConfig, error) {
 
 func SanitizeBinaryOutput(value string) string {
 	var builder strings.Builder
-	for _, r := range value {
-		if r == utf8.RuneError {
+	// Iterate byte-wise via DecodeRuneInString so a legitimate U+FFFD (valid
+	// EF BF BD, decoded with size 3) is preserved, while only genuinely invalid
+	// bytes -- which Go decodes as utf8.RuneError with size 1 -- are dropped.
+	// Mirrors SanitizeShellBinaryOutput in packages/agent/harness/utils.
+	for i := 0; i < len(value); {
+		r, size := utf8.DecodeRuneInString(value[i:])
+		i += size
+		if r == utf8.RuneError && size == 1 {
 			continue
 		}
 		if r == '\t' || r == '\n' || r == '\r' {
@@ -261,7 +267,9 @@ func NormalizePath(input string, options PathInputOptions) string {
 			return filepath.Join(home, normalized[2:])
 		}
 	}
-	if strings.HasPrefix(normalized, "file:") {
+	// Only a genuine `file://` URL is decoded (TS paths.ts: /^file:\/\//). A bare
+	// `file:foo` is treated as a plain relative path, not a URL.
+	if strings.HasPrefix(normalized, "file://") {
 		if path, ok := catools.FileURLToPath(normalized); ok {
 			return path
 		}

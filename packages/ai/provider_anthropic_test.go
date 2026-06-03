@@ -709,7 +709,10 @@ func TestAnthropicChatStreamSensitiveStopReasonEmitsError(t *testing.T) {
 		}
 	}
 	message := stream.Result()
-	if !sawError || message.StopReason != "error" || !strings.Contains(message.ErrorMessage, "sensitive") {
+	// Parity with TS mapStopReason: a "sensitive" stop_reason maps to "error" with
+	// no reason-specific text; the stream surfaces the generic provider error
+	// message rather than echoing the raw stop_reason word.
+	if !sawError || message.StopReason != "error" || message.ErrorMessage == "" {
 		t.Fatalf("message=%#v sawError=%v", message, sawError)
 	}
 }

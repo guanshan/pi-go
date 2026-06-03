@@ -6,6 +6,7 @@ func streamOptionsFromAI(opts ai.StreamOptions) StreamOptions {
 	return StreamOptions{
 		Transport:       opts.Transport,
 		TimeoutMs:       opts.TimeoutMs,
+		IdleTimeoutMs:   opts.IdleTimeoutMs,
 		MaxRetries:      opts.MaxRetries,
 		MaxRetryDelayMs: opts.MaxRetryDelayMs,
 		Headers:         mergeStringMaps(opts.Headers),
@@ -17,6 +18,7 @@ func streamOptionsFromAI(opts ai.StreamOptions) StreamOptions {
 func applyStreamOptionsToAI(opts *ai.StreamOptions, source StreamOptions) {
 	opts.Transport = source.Transport
 	opts.TimeoutMs = source.TimeoutMs
+	opts.IdleTimeoutMs = source.IdleTimeoutMs
 	opts.MaxRetries = source.MaxRetries
 	opts.MaxRetryDelayMs = source.MaxRetryDelayMs
 	opts.CacheRetention = source.CacheRetention
@@ -34,6 +36,9 @@ func ApplyStreamOptionsPatch(opts StreamOptions, patch *StreamOptionsPatch) Stre
 	}
 	if patch.TimeoutMs != nil {
 		out.TimeoutMs = *patch.TimeoutMs
+	}
+	if patch.IdleTimeoutMs != nil {
+		out.IdleTimeoutMs = *patch.IdleTimeoutMs
 	}
 	if patch.MaxRetries != nil {
 		out.MaxRetries = *patch.MaxRetries

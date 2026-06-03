@@ -152,7 +152,7 @@ func CreateAgentSessionFromServices(ctx context.Context, options CreateAgentSess
 		}
 	}
 	tools := toolSetFromServiceOptions(services.Cwd, services.SettingsManager, options.NoTools, options.Tools, options.ExcludeTools, services.ExtensionRuntime, options.CustomTools)
-	systemPrompt := services.ResourceLoader.BuildSystemPrompt(cli.Args{}, AllToolDescriptions(tools))
+	systemPrompt := services.ResourceLoader.BuildSystemPrompt(cli.Args{}, ToolPromptInfoFor(tools))
 	agentSession := NewAgentSession(session, services.SettingsManager, services.ModelRegistry, services.ResourceLoader, model, thinking, tools, systemPrompt)
 	agentSession.extensionRuntime = services.ExtensionRuntime
 	agentSession.ResourceLoaderOptions = services.ResourceLoaderOptions

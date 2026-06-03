@@ -40,7 +40,8 @@ func LoginGitHubCopilot(callbacks OAuthLoginCallbacks) (OAuthCredentials, error)
 		domain = gitHubCopilotDefaultDomain
 	}
 
-	device, err := startGitHubCopilotDeviceFlow(ctx, domain, http.DefaultClient)
+	httpClient := callbacks.httpClient()
+	device, err := startGitHubCopilotDeviceFlow(ctx, domain, httpClient)
 	if err != nil {
 		return OAuthCredentials{}, err
 	}
@@ -52,19 +53,19 @@ func LoginGitHubCopilot(callbacks OAuthLoginCallbacks) (OAuthCredentials, error)
 			ExpiresInSeconds: device.ExpiresInSeconds,
 		})
 	}
-	githubAccessToken, err := pollForGitHubCopilotAccessToken(ctx, domain, device, http.DefaultClient)
+	githubAccessToken, err := pollForGitHubCopilotAccessToken(ctx, domain, device, httpClient)
 	if err != nil {
 		return OAuthCredentials{}, err
 	}
 	endpoints := gitHubCopilotEndpointFactory(domain)
-	credentials, err := RefreshGitHubCopilotToken(ctx, githubAccessToken, enterpriseDomain, OAuthHTTPOptions{TokenURL: endpoints.CopilotTokenURL})
+	credentials, err := RefreshGitHubCopilotToken(ctx, githubAccessToken, enterpriseDomain, OAuthHTTPOptions{Client: httpClient, TokenURL: endpoints.CopilotTokenURL})
 	if err != nil {
 		return OAuthCredentials{}, err
 	}
 	if callbacks.OnProgress != nil {
 		callbacks.OnProgress("Enabling models...")
 	}
-	enableAllGitHubCopilotModelsFunc(ctx, credentials.Access, enterpriseDomain, http.DefaultClient, callbacks.OnProgress)
+	enableAllGitHubCopilotModelsFunc(ctx, credentials.Access, enterpriseDomain, httpClient, callbacks.OnProgress)
 	return credentials, nil
 }
 

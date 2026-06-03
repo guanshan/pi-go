@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"net/http"
 	"net/url"
 
 	"github.com/guanshan/pi-go/packages/ai/openaicodexauth"
@@ -74,7 +73,7 @@ func loginOpenAICodexBrowser(callbacks OAuthLoginCallbacks) (OAuthCredentials, e
 	if code == "" {
 		return OAuthCredentials{}, errors.New("missing authorization code")
 	}
-	credentials, err := exchangeOpenAICodexAuthorizationCode(ctx, code, pkce.Verifier, redirectURI)
+	credentials, err := exchangeOpenAICodexAuthorizationCode(ctx, code, pkce.Verifier, redirectURI, OAuthHTTPOptions{Client: callbacks.httpClient()})
 	if err != nil {
 		return OAuthCredentials{}, err
 	}
@@ -86,7 +85,8 @@ func loginOpenAICodexBrowser(callbacks OAuthLoginCallbacks) (OAuthCredentials, e
 
 func LoginOpenAICodexDeviceCode(callbacks OAuthLoginCallbacks) (OAuthCredentials, error) {
 	ctx := callbacks.ctx()
-	device, err := openaicodexauth.Start(ctx, http.DefaultClient, openAICodexOAuthClientID, openAICodexDeviceEndpoints)
+	httpClient := callbacks.httpClient()
+	device, err := openaicodexauth.Start(ctx, httpClient, openAICodexOAuthClientID, openAICodexDeviceEndpoints)
 	if err != nil {
 		return OAuthCredentials{}, err
 	}
@@ -98,11 +98,11 @@ func LoginOpenAICodexDeviceCode(callbacks OAuthLoginCallbacks) (OAuthCredentials
 			ExpiresInSeconds: openaicodexauth.DefaultTimeoutSeconds,
 		})
 	}
-	code, verifier, err := openaicodexauth.Poll(ctx, http.DefaultClient, device, openAICodexDeviceEndpoints, openaicodexauth.DefaultTimeoutSeconds)
+	code, verifier, err := openaicodexauth.Poll(ctx, httpClient, device, openAICodexDeviceEndpoints, openaicodexauth.DefaultTimeoutSeconds)
 	if err != nil {
 		return OAuthCredentials{}, err
 	}
-	return exchangeOpenAICodexAuthorizationCode(ctx, code, verifier, openaicodexauth.DefaultRedirectURI)
+	return exchangeOpenAICodexAuthorizationCode(ctx, code, verifier, openaicodexauth.DefaultRedirectURI, OAuthHTTPOptions{Client: httpClient})
 }
 func openAICodexAuthorizeURL(pkce PKCEPair, state, redirectURI string) (string, error) {
 	authURL, err := url.Parse(openAICodexOAuthAuthorizeURL)
@@ -123,7 +123,7 @@ func openAICodexAuthorizeURL(pkce PKCEPair, state, redirectURI string) (string, 
 	authURL.RawQuery = values.Encode()
 	return authURL.String(), nil
 }
-func exchangeOpenAICodexAuthorizationCode(ctx context.Context, code, verifier, redirectURI string) (OAuthCredentials, error) {
+func exchangeOpenAICodexAuthorizationCode(ctx context.Context, code, verifier, redirectURI string, opts ...OAuthHTTPOptions) (OAuthCredentials, error) {
 	body := url.Values{
 		"grant_type":    {"authorization_code"},
 		"client_id":     {openAICodexOAuthClientID},
@@ -131,7 +131,7 @@ func exchangeOpenAICodexAuthorizationCode(ctx context.Context, code, verifier, r
 		"code_verifier": {verifier},
 		"redirect_uri":  {redirectURI},
 	}
-	credentials, err := aioauth.RequestFormToken(ctx, openAICodexOAuthTokenURL, body, 0, OAuthHTTPOptions{})
+	credentials, err := aioauth.RequestFormToken(ctx, openAICodexOAuthTokenURL, body, 0, aioauth.MergeHTTPOptions(opts...))
 	if err != nil {
 		return OAuthCredentials{}, err
 	}

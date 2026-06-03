@@ -86,8 +86,17 @@ func skipOSC(value string, index int) int {
 // sanitizeBinaryOutput.
 func SanitizeBinaryOutput(value string) string {
 	var builder strings.Builder
-	for _, r := range value {
-		if r == utf8.RuneError {
+	// Iterate byte-wise via DecodeRuneInString so a legitimate U+FFFD (valid
+	// EF BF BD, decoded with size 3) is preserved, while only genuinely invalid
+	// bytes -- which Go decodes as utf8.RuneError with size 1 -- are dropped.
+	// TS iterates code points (Array.from + codePointAt), which never yields a
+	// replacement char for valid input; matching that requires the size check.
+	// Kept in sync with SanitizeBinaryOutput in packages/coding-agent/utils.go
+	// and SanitizeShellBinaryOutput in packages/agent/harness/utils.
+	for i := 0; i < len(value); {
+		r, size := utf8.DecodeRuneInString(value[i:])
+		i += size
+		if r == utf8.RuneError && size == 1 {
 			continue
 		}
 		if r == '\t' || r == '\n' || r == '\r' {

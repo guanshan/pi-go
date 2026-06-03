@@ -246,15 +246,29 @@ func (m *DefaultPackageManager) Install(source string, local bool, progress Prog
 	return record, nil
 }
 
-// npmInstallArgs builds the `install <spec> --prefix <root>` invocation. Mirrors
-// getNpmInstallArgs in package-manager.ts (~1707): the default npm path adds
-// --legacy-peer-deps; a custom command (pnpm/bun/mise-wrapped) gets a bare
-// install so it does not reject npm-specific flags.
+// npmInstallArgs builds the managed install invocation, mirroring
+// getNpmInstallArgs in package-manager.ts (~1707). Extension packages run inside
+// pi and resolve pi APIs through loader aliases/virtual modules, so peer
+// dependency resolution is disabled per manager so stale auto-installed
+// @earendil-works/pi-* peers cannot block updates:
+//   - bun:  install <spec> --cwd <root> --omit=peer
+//   - pnpm: install <spec> --prefix <root> --config.auto-install-peers=false
+//     --config.strict-peer-dependencies=false --config.strict-dep-builds=false
+//   - npm (default): install <spec> --prefix <root> --legacy-peer-deps
 func (m *DefaultPackageManager) npmInstallArgs(spec, installRoot string) []string {
-	if m.hasCustomNpmCommand() {
-		return []string{"install", spec, "--prefix", installRoot}
+	switch m.packageManagerName() {
+	case "bun":
+		return []string{"install", spec, "--cwd", installRoot, "--omit=peer"}
+	case "pnpm":
+		return []string{
+			"install", spec, "--prefix", installRoot,
+			"--config.auto-install-peers=false",
+			"--config.strict-peer-dependencies=false",
+			"--config.strict-dep-builds=false",
+		}
+	default:
+		return []string{"install", spec, "--prefix", installRoot, "--legacy-peer-deps"}
 	}
-	return []string{"install", spec, "--prefix", installRoot, "--legacy-peer-deps"}
 }
 
 func (m *DefaultPackageManager) InstallAndPersist(source string, options ...PackageManagerOperationOptions) error {
@@ -595,6 +609,35 @@ func (m *DefaultPackageManager) hasCustomNpmCommand() bool {
 	return m.Settings != nil && len(m.Settings.NPMCommand()) > 0 && m.Settings.NPMCommand()[0] != ""
 }
 
+// packageManagerName derives the underlying package-manager binary name from the
+// configured npm command, mirroring getPackageManagerName() in
+// src/core/package-manager.ts: it takes the token after the LAST "--" separator
+// (so "mise exec -- pnpm" resolves to "pnpm"), else the command itself, then
+// basenames it and strips a trailing .cmd/.exe (Windows shims).
+func (m *DefaultPackageManager) packageManagerName() string {
+	command, args := m.npmCommand()
+	parts := append([]string{command}, args...)
+	sep := -1
+	for i, p := range parts {
+		if p == "--" {
+			sep = i
+		}
+	}
+	name := command
+	if sep >= 0 && sep+1 < len(parts) {
+		name = parts[sep+1]
+	}
+	if name == "" {
+		return ""
+	}
+	name = filepath.Base(name)
+	lower := strings.ToLower(name)
+	if strings.HasSuffix(lower, ".cmd") || strings.HasSuffix(lower, ".exe") {
+		name = name[:len(name)-4]
+	}
+	return name
+}
+
 // runNpm runs the configured package manager with the given subcommand args,
 // honoring any prefix such as "mise exec -- npm".
 func (m *DefaultPackageManager) runNpm(dir string, args ...string) error {
@@ -607,13 +650,21 @@ func (m *DefaultPackageManager) installPackageDependencies(dir string) error {
 	if err != nil || !needsInstall {
 		return err
 	}
-	// A custom package manager (pnpm/bun/mise-wrapped) rejects npm-specific
-	// flags, so pass a bare "install" — matching getGitDependencyInstallArgs in
-	// src/core/package-manager.ts. Only the default npm path gets npm flags.
+	return m.runNpm(dir, m.gitDependencyInstallArgs()...)
+}
+
+// gitDependencyInstallArgs mirrors getGitDependencyInstallArgs in
+// src/core/package-manager.ts exactly: a custom package manager
+// (pnpm/bun/mise-wrapped) gets a bare "install"; the default npm path gets only
+// "install --omit=dev". TS deliberately omits --ignore-scripts/--no-audit/
+// --no-fund so a git dependency's postinstall and prepare scripts (e.g. building
+// the package) still run; suppressing them here diverged from TS and could leave
+// a git dep unbuilt.
+func (m *DefaultPackageManager) gitDependencyInstallArgs() []string {
 	if m.hasCustomNpmCommand() {
-		return m.runNpm(dir, "install")
+		return []string{"install"}
 	}
-	return m.runNpm(dir, "install", "--omit=dev", "--ignore-scripts", "--no-audit", "--no-fund")
+	return []string{"install", "--omit=dev"}
 }
 
 func packageNeedsInstall(dir string) (bool, error) {

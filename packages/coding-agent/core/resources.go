@@ -121,22 +121,18 @@ func LoadResources(cwd, agentDir string, args cli.Args, settings *SettingsManage
 	return loader
 }
 
-func (r ResourceLoader) BuildSystemPrompt(args cli.Args, toolDescriptions []string) string {
+func (r ResourceLoader) BuildSystemPrompt(args cli.Args, tools ToolPromptInfo) string {
 	var b strings.Builder
 	if args.SystemPrompt != "" {
 		b.WriteString(readTextArg(r.CWD, args.SystemPrompt))
 	} else if r.SystemPrompt != "" {
 		b.WriteString(r.SystemPrompt)
 	} else {
-		b.WriteString(defaultSystemPrompt())
-	}
-	if len(toolDescriptions) > 0 {
-		b.WriteString("\n\n## Available Tools\n")
-		for _, desc := range toolDescriptions {
-			b.WriteString("- ")
-			b.WriteString(desc)
-			b.WriteByte('\n')
-		}
+		// Default prompt: lead paragraph + an "Available tools:" list of one-line
+		// snippets + a deduped "Guidelines:" section + a "Pi documentation:" block,
+		// mirroring TS buildSystemPrompt (system-prompt.ts:130-147). A custom prompt
+		// (args.SystemPrompt or r.SystemPrompt) replaces all three sections.
+		b.WriteString(defaultPromptBody(tools))
 	}
 	if !args.NoContextFiles && len(r.ContextFiles) > 0 {
 		// Project context files are injected as a <project_context> XML block with
@@ -163,7 +159,7 @@ func (r ResourceLoader) BuildSystemPrompt(args cli.Args, toolDescriptions []stri
 	// block uses the <available_skills> XML shape from TS formatSkillsForPrompt
 	// (skills.ts) rather than a markdown list. Skills live in a map, so names are
 	// sorted for deterministic output (TS iterates an ordered slice).
-	if len(r.Skills) > 0 && toolDescriptionsHaveRead(toolDescriptions) {
+	if len(r.Skills) > 0 && tools.Has("read") {
 		names := make([]string, 0, len(r.Skills))
 		for name := range r.Skills {
 			names = append(names, name)
@@ -214,21 +210,6 @@ func escapeXML(value string) string {
 		"'", "&apos;",
 	)
 	return replacer.Replace(value)
-}
-
-// toolDescriptionsHaveRead reports whether the "read" tool is present in the
-// provided "name: description" tool descriptions.
-func toolDescriptionsHaveRead(toolDescriptions []string) bool {
-	for _, desc := range toolDescriptions {
-		name := desc
-		if idx := strings.IndexByte(desc, ':'); idx >= 0 {
-			name = desc[:idx]
-		}
-		if strings.TrimSpace(name) == "read" {
-			return true
-		}
-	}
-	return false
 }
 
 func (r ResourceLoader) ExpandInput(input string) (string, bool) {
@@ -884,10 +865,65 @@ func extractSkillDescription(content string) string {
 	return ""
 }
 
-func defaultSystemPrompt() string {
-	return `You are Pi, a terminal coding agent.
+// defaultPromptBody builds the default system-prompt header — lead paragraph,
+// "Available tools:" snippet list, deduped "Guidelines:" section, and the "Pi
+// documentation:" block — byte-for-byte matching TS buildSystemPrompt
+// (system-prompt.ts:88-147).
+func defaultPromptBody(tools ToolPromptInfo) string {
+	// Available tools: only tools that expose a one-line snippet, in registration
+	// order (system-prompt.ts:90-93).
+	var toolLines []string
+	for _, name := range tools.OrderedNames {
+		if snippet := tools.Snippets[name]; snippet != "" {
+			toolLines = append(toolLines, "- "+name+": "+snippet)
+		}
+	}
+	toolsList := "(none)"
+	if len(toolLines) > 0 {
+		toolsList = strings.Join(toolLines, "\n")
+	}
 
-You help the user inspect, edit, run, and explain code in the current workspace. Be concise, verify work with tools when useful, and preserve user changes. Prefer the dedicated file tools over shell commands for reading and editing files.`
+	// Guidelines: the bash-only-file-ops rule first (only when bash is the sole
+	// file-exploration tool), then each per-tool guideline (deduped, in tool
+	// order), then the two always-on bullets last (system-prompt.ts:96-128).
+	var guidelines []string
+	seen := map[string]bool{}
+	add := func(g string) {
+		if g == "" || seen[g] {
+			return
+		}
+		seen[g] = true
+		guidelines = append(guidelines, g)
+	}
+	if tools.Has("bash") && !tools.Has("grep") && !tools.Has("find") && !tools.Has("ls") {
+		add("Use bash for file operations like ls, rg, find")
+	}
+	for _, g := range tools.Guidelines {
+		add(strings.TrimSpace(g))
+	}
+	add("Be concise in your responses")
+	add("Show file paths clearly when working with files")
+	var gb strings.Builder
+	for i, g := range guidelines {
+		if i > 0 {
+			gb.WriteByte('\n')
+		}
+		gb.WriteString("- ")
+		gb.WriteString(g)
+	}
+
+	return "You are an expert coding assistant operating inside pi, a coding agent harness. You help users by reading files, executing commands, editing code, and writing new files.\n\n" +
+		"Available tools:\n" + toolsList + "\n\n" +
+		"In addition to the tools above, you may have access to other custom tools depending on the project.\n\n" +
+		"Guidelines:\n" + gb.String() + "\n\n" +
+		"Pi documentation (read only when the user asks about pi itself, its SDK, extensions, themes, skills, or TUI):\n" +
+		"- Main documentation: " + ReadmePath() + "\n" +
+		"- Additional docs: " + DocsPath() + "\n" +
+		"- Examples: " + ExamplesPath() + " (extensions, custom tools, SDK)\n" +
+		"- When reading pi docs or examples, resolve docs/... under Additional docs and examples/... under Examples, not the current working directory\n" +
+		"- When asked about: extensions (docs/extensions.md, examples/extensions/), themes (docs/themes.md), skills (docs/skills.md), prompt templates (docs/prompt-templates.md), TUI components (docs/tui.md), keybindings (docs/keybindings.md), SDK integrations (docs/sdk.md), custom providers (docs/custom-provider.md), adding models (docs/models.md), pi packages (docs/packages.md)\n" +
+		"- When working on pi topics, read the docs and examples, and follow .md cross-references before implementing\n" +
+		"- Always read pi .md files completely and follow links to related docs (e.g., tui.md for TUI API details)"
 }
 
 func readTextArg(cwd, value string) string {

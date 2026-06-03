@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/guanshan/pi-go/packages/ai"
@@ -69,5 +70,61 @@ func TestParseArgsNameRequiresValue(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("expected --name requires a value diagnostic, got %#v", args.Diagnostics)
+	}
+}
+
+// TestParseArgsKnownFlagMissingValueIsPermissive mirrors TS args.ts: a known
+// value-flag at the end of argv (no value) is NOT an error; it falls through to
+// the unknown-flag handler and is recorded as a boolean true in UnknownFlags.
+// Only --name errors. No "Missing value for X" diagnostic is emitted.
+func TestParseArgsKnownFlagMissingValueIsPermissive(t *testing.T) {
+	args := ParseArgs([]string{"--provider"})
+	for _, d := range args.Diagnostics {
+		if d.Type == "error" {
+			t.Fatalf("known flag missing value should not error, got %q", d.Message)
+		}
+	}
+	if v, ok := args.UnknownFlags["provider"]; !ok || v != true {
+		t.Fatalf("trailing --provider should be a boolean unknown flag, got %#v", args.UnknownFlags)
+	}
+	if args.Provider != "" {
+		t.Fatalf("provider should be unset when no value follows, got %q", args.Provider)
+	}
+}
+
+// TestParseArgsUnknownFlagCapturesFollowingValue mirrors TS: an unknown --flag
+// followed by a non-flag value captures that value; otherwise it is a boolean.
+func TestParseArgsUnknownFlagCapturesFollowingValue(t *testing.T) {
+	args := ParseArgs([]string{"--mystery", "captured", "--solo"})
+	if v, ok := args.UnknownFlags["mystery"]; !ok || v != "captured" {
+		t.Fatalf("unknown flag should capture following value, got %#v", args.UnknownFlags)
+	}
+	if v, ok := args.UnknownFlags["solo"]; !ok || v != true {
+		t.Fatalf("trailing unknown flag should be boolean true, got %#v", args.UnknownFlags)
+	}
+}
+
+// TestPrintHelpIncludesExamplesAndEnvDescriptions verifies the help output is on
+// par with TS args.ts: it includes the Examples block, descriptioned environment
+// variables, and the Built-in Tool Names section.
+func TestPrintHelpIncludesExamplesAndEnvDescriptions(t *testing.T) {
+	var out strings.Builder
+	PrintHelp(&out, nil)
+	got := out.String()
+	for _, want := range []string{
+		"Examples:",
+		"# Interactive mode with initial prompt",
+		`pi --model openai/gpt-4o "Help me refactor this code"`,
+		`pi --export session.jsonl output.html`,
+		"Environment Variables:",
+		"ANTHROPIC_API_KEY                - Anthropic Claude API key",
+		"AWS_REGION                       - AWS region for Amazon Bedrock",
+		"Built-in Tool Names:",
+		"read   - Read file contents",
+		"ls     - List directory contents (read-only, off by default)",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("help output missing %q", want)
+		}
 	}
 }

@@ -1,6 +1,7 @@
 package compaction
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"sort"
@@ -95,7 +96,9 @@ func SerializeConversation(messages []ai.Message) string {
 	for _, message := range messages {
 		switch message.(type) {
 		case ai.UserMessage, *ai.UserMessage:
-			if text := ai.MessageText(message); text != "" {
+			// TS joins user text blocks with "" (not "\n"); mirror that exactly
+			// so the serialized prompt is byte-for-byte identical.
+			if text := joinTextBlocks(ai.MessageBlocks(message)); text != "" {
 				parts = append(parts, "[User]: "+text)
 			}
 		case ai.AssistantMessage, *ai.AssistantMessage:
@@ -120,7 +123,8 @@ func SerializeConversation(messages []ai.Message) string {
 				parts = append(parts, "[Assistant tool calls]: "+strings.Join(toolCalls, "; "))
 			}
 		case ai.ToolResultMessage, *ai.ToolResultMessage:
-			if text := ai.MessageText(message); text != "" {
+			// TS joins tool-result text blocks with "" as well.
+			if text := joinTextBlocks(ai.MessageBlocks(message)); text != "" {
 				parts = append(parts, "[Tool result]: "+truncateForSummary(text, 2000))
 			}
 		}
@@ -128,32 +132,145 @@ func SerializeConversation(messages []ai.Message) string {
 	return strings.Join(parts, "\n\n")
 }
 
+// joinTextBlocks concatenates the text of every text block with no separator,
+// matching the TS serializeConversation user/toolResult content handling
+// (`content.filter(...).map((c) => c.text).join("")`).
+func joinTextBlocks(blocks []ai.ContentBlock) string {
+	var b strings.Builder
+	for _, block := range blocks {
+		if block.Type == "text" {
+			b.WriteString(block.Text)
+		}
+	}
+	return b.String()
+}
+
+// formatToolCallArgs serializes a tool call's arguments as `k=<json>` pairs
+// joined by ", ". TS uses `Object.entries(args)` which preserves the JSON
+// object's key insertion order, so we walk the raw JSON tokens in order rather
+// than decoding into a Go map (which would lose ordering). Values are encoded
+// with JSON.stringify semantics: no HTML escaping and "[unserializable]" on
+// failure.
 func formatToolCallArgs(raw json.RawMessage) string {
-	var args map[string]any
-	if err := json.Unmarshal(raw, &args); err != nil {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
+	tok, err := dec.Token()
+	if err != nil {
 		return string(raw)
 	}
-	keys := make([]string, 0, len(args))
-	for key := range args {
-		keys = append(keys, key)
+	delim, ok := tok.(json.Delim)
+	if !ok || delim != '{' {
+		return string(raw)
 	}
-	sort.Strings(keys)
-	parts := make([]string, 0, len(keys))
-	for _, key := range keys {
-		encoded, err := json.Marshal(args[key])
+	var parts []string
+	for dec.More() {
+		keyTok, err := dec.Token()
 		if err != nil {
-			encoded = []byte("[unserializable]")
+			return string(raw)
 		}
-		parts = append(parts, key+"="+string(encoded))
+		key, ok := keyTok.(string)
+		if !ok {
+			return string(raw)
+		}
+		var value json.RawMessage
+		if err := dec.Decode(&value); err != nil {
+			return string(raw)
+		}
+		parts = append(parts, key+"="+safeJSONStringify(value))
 	}
 	return strings.Join(parts, ", ")
 }
 
+// safeJSONStringify mirrors TS safeJsonStringify: it re-encodes the value with
+// JSON.stringify semantics (compact, no HTML escaping) and falls back to
+// "[unserializable]" when encoding fails.
+func safeJSONStringify(raw json.RawMessage) string {
+	var value any
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
+	if err := dec.Decode(&value); err != nil {
+		return "[unserializable]"
+	}
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(value); err != nil {
+		return "[unserializable]"
+	}
+	encoded := bytes.TrimSuffix(buf.Bytes(), []byte{'\n'})
+	return string(restoreJSONStringifySeparators(encoded))
+}
+
+var (
+	jsonEscapeLineSeparator      = []byte(`\u2028`)
+	jsonEscapeParagraphSeparator = []byte(`\u2029`)
+	jsonLineSeparatorUTF8        = []byte{0xe2, 0x80, 0xa8}
+	jsonParagraphSeparatorUTF8   = []byte{0xe2, 0x80, 0xa9}
+)
+
+func restoreJSONStringifySeparators(raw []byte) []byte {
+	if !bytes.Contains(raw, jsonEscapeLineSeparator) && !bytes.Contains(raw, jsonEscapeParagraphSeparator) {
+		return raw
+	}
+	out := make([]byte, 0, len(raw))
+	for i := 0; i < len(raw); {
+		switch {
+		case hasJSONEscapeAt(raw, i, jsonEscapeLineSeparator) && !jsonBackslashIsEscaped(raw, i):
+			out = append(out, jsonLineSeparatorUTF8...)
+			i += len(jsonEscapeLineSeparator)
+		case hasJSONEscapeAt(raw, i, jsonEscapeParagraphSeparator) && !jsonBackslashIsEscaped(raw, i):
+			out = append(out, jsonParagraphSeparatorUTF8...)
+			i += len(jsonEscapeParagraphSeparator)
+		default:
+			out = append(out, raw[i])
+			i++
+		}
+	}
+	return out
+}
+
+func hasJSONEscapeAt(raw []byte, offset int, escape []byte) bool {
+	return offset+len(escape) <= len(raw) && bytes.Equal(raw[offset:offset+len(escape)], escape)
+}
+
+func jsonBackslashIsEscaped(raw []byte, offset int) bool {
+	backslashes := 0
+	for i := offset - 1; i >= 0 && raw[i] == '\\'; i-- {
+		backslashes++
+	}
+	return backslashes%2 == 1
+}
+
+// truncateForSummary mirrors TS truncateForSummary, which measures and slices in
+// UTF-16 code units (text.length / text.slice). Slicing on UTF-16 boundaries can
+// split an astral rune mid-surrogate in JS; in Go we never split a rune, so we
+// cut at the last whole rune that stays within the maxChars UTF-16 budget. The
+// reported "more characters truncated" count is computed in UTF-16 units to
+// match the TS message.
 func truncateForSummary(text string, maxChars int) string {
-	if len(text) <= maxChars {
+	total := utf16Len(text)
+	if total <= maxChars {
 		return text
 	}
-	return fmt.Sprintf("%s\n\n[... %d more characters truncated]", text[:maxChars], len(text)-maxChars)
+	head, headUnits := utf16Prefix(text, maxChars)
+	return fmt.Sprintf("%s\n\n[... %d more characters truncated]", head, total-headUnits)
+}
+
+// utf16Prefix returns the longest rune-aligned prefix of s whose UTF-16 length
+// does not exceed maxUnits, along with that prefix's UTF-16 length.
+func utf16Prefix(s string, maxUnits int) (string, int) {
+	units := 0
+	for i, r := range s {
+		w := 1
+		if r > 0xFFFF {
+			w = 2
+		}
+		if units+w > maxUnits {
+			return s[:i], units
+		}
+		units += w
+	}
+	return s, units
 }
 
 func ensureFileOps(fileOps *FileOperations) {

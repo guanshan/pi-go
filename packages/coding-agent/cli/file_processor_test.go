@@ -64,6 +64,22 @@ func TestProcessFileArgumentsTextImageAndReadPathVariants(t *testing.T) {
 	}
 }
 
+// TestProcessFileArgumentsMissingFileWording matches file-processor.ts: a
+// missing @file/--file reports "File not found: <path>" (not the raw os error).
+func TestProcessFileArgumentsMissingFileWording(t *testing.T) {
+	cwd := t.TempDir()
+	_, err := ProcessFileArguments(cwd, []string{"does-not-exist.txt"})
+	if err == nil {
+		t.Fatal("expected error for missing file")
+	}
+	if !strings.HasPrefix(err.Error(), "File not found: ") {
+		t.Fatalf("error = %q, want prefix %q", err.Error(), "File not found: ")
+	}
+	if !strings.Contains(err.Error(), "does-not-exist.txt") {
+		t.Fatalf("error should include the path, got %q", err.Error())
+	}
+}
+
 func TestFileURLPathHandlesWindowsDriveForms(t *testing.T) {
 	for _, raw := range []string{
 		"file:///C:/work/from%20url.txt",

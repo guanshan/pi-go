@@ -548,7 +548,7 @@ func (h *AgentHarness) emitSessionCompact(ctx context.Context, ev SessionCompact
 			return err
 		}
 	}
-	return nil
+	return h.emitHarness(ctx, ev)
 }
 
 func (h *AgentHarness) emitSessionBeforeTree(ctx context.Context, ev SessionBeforeTreeEvent) (*SessionBeforeTreeResult, error) {
@@ -610,7 +610,7 @@ func (h *AgentHarness) emitSessionTree(ctx context.Context, ev SessionTreeEvent)
 			return err
 		}
 	}
-	return nil
+	return h.emitHarness(ctx, ev)
 }
 
 func (h *AgentHarness) emitModelSelect(ctx context.Context, ev ModelSelectEvent) error {
@@ -625,7 +625,7 @@ func (h *AgentHarness) emitModelSelect(ctx context.Context, ev ModelSelectEvent)
 			return err
 		}
 	}
-	return nil
+	return h.emitHarness(ctx, ev)
 }
 
 func (h *AgentHarness) emitThinkingLevelSelect(ctx context.Context, ev ThinkingLevelSelectEvent) error {
@@ -640,7 +640,7 @@ func (h *AgentHarness) emitThinkingLevelSelect(ctx context.Context, ev ThinkingL
 			return err
 		}
 	}
-	return nil
+	return h.emitHarness(ctx, ev)
 }
 
 func (h *AgentHarness) emitResourcesUpdate(ctx context.Context, ev ResourcesUpdateEvent) error {
@@ -659,7 +659,7 @@ func (h *AgentHarness) emitResourcesUpdate(ctx context.Context, ev ResourcesUpda
 			return err
 		}
 	}
-	return nil
+	return h.emitHarness(ctx, event)
 }
 
 func (h *AgentHarness) emitToolsUpdate(ctx context.Context, ev ToolsUpdateEvent) error {

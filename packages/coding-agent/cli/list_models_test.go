@@ -38,6 +38,63 @@ func TestPrintModelsMatchesTypeScriptColumns(t *testing.T) {
 	}
 }
 
+// TestPrintModelsThinkingAndMaxOutMatchTS verifies two TS-parity fixes:
+//   - the thinking column uses only model.Reasoning (TS `m.reasoning ? ...`), so
+//     a model with multiple ThinkingLevels but reasoning=false shows "no";
+//   - formatTokenCount(0) renders "0" (TS count.toString()), not "-".
+func TestPrintModelsThinkingAndMaxOutMatchTS(t *testing.T) {
+	var out bytes.Buffer
+	PrintModels(&out, fakeModelLister{
+		{
+			Provider:       "openai",
+			ID:             "zero-out",
+			ContextWindow:  0,
+			MaxOutput:      0,
+			Reasoning:      false,
+			ThinkingLevels: []ai.ThinkingLevel{"off", "low", "high"},
+			Input:          []string{"text"},
+		},
+	}, "")
+	lines := strings.Split(strings.TrimSpace(out.String()), "\n")
+	var row string
+	for _, l := range lines {
+		if strings.Contains(l, "zero-out") {
+			row = l
+		}
+	}
+	if row == "" {
+		t.Fatalf("model row not found:\n%s", out.String())
+	}
+	fields := strings.Fields(row)
+	// columns: provider model context max-out thinking images
+	if len(fields) < 6 {
+		t.Fatalf("unexpected row columns: %q", row)
+	}
+	if fields[2] != "0" || fields[3] != "0" {
+		t.Fatalf("context/max-out should be 0 0, got %q %q (row %q)", fields[2], fields[3], row)
+	}
+	if fields[4] != "no" {
+		t.Fatalf("thinking should be 'no' when reasoning=false despite ThinkingLevels, got %q (row %q)", fields[4], row)
+	}
+}
+
+func TestFormatTokenCountMatchesTS(t *testing.T) {
+	cases := map[int]string{
+		0:         "0",
+		500:       "500",
+		1_000:     "1K",
+		1_500:     "1.5K",
+		200_000:   "200K",
+		1_000_000: "1M",
+		1_500_000: "1.5M",
+	}
+	for count, want := range cases {
+		if got := formatTokenCount(count); got != want {
+			t.Errorf("formatTokenCount(%d)=%q, want %q", count, got, want)
+		}
+	}
+}
+
 func TestPrintModelsNoMatches(t *testing.T) {
 	var out bytes.Buffer
 	PrintModels(&out, fakeModelLister{{Provider: "openai", ID: "gpt-4.1"}}, "zzz")

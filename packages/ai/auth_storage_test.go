@@ -150,6 +150,42 @@ func TestAuthStorageListStatusHasAuthAndDelete(t *testing.T) {
 	}
 }
 
+// TestAuthStatusBedrockAmbientCredentials covers P2-02c: ambient AWS auth
+// (AWS_PROFILE / IAM keys / container / web-identity) must report bedrock as
+// configured via an "environment" source, matching TS getEnvApiKey/getAuthStatus
+// which resolves these sources to "<authenticated>".
+func TestAuthStatusBedrockAmbientCredentials(t *testing.T) {
+	// Clear every ambient AWS source so the test starts from a clean slate.
+	for _, env := range []string{
+		"AWS_BEARER_TOKEN_BEDROCK", "AWS_PROFILE", "AWS_ACCESS_KEY_ID",
+		"AWS_SECRET_ACCESS_KEY", "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+		"AWS_CONTAINER_CREDENTIALS_FULL_URI", "AWS_WEB_IDENTITY_TOKEN_FILE",
+	} {
+		t.Setenv(env, "")
+		os.Unsetenv(env)
+	}
+
+	auth := NewAuthStorage(t.TempDir())
+	if got := auth.AuthStatus("amazon-bedrock"); got.Configured || got.Source != "" {
+		t.Fatalf("expected unconfigured bedrock with no ambient creds, got %#v", got)
+	}
+
+	// AWS_PROFILE alone is enough ambient auth for bedrock.
+	t.Setenv("AWS_PROFILE", "my-profile")
+	got := auth.AuthStatus("amazon-bedrock")
+	if !got.Configured || got.Source != "environment" || got.Label == "" {
+		t.Fatalf("expected bedrock configured via ambient AWS_PROFILE, got %#v", got)
+	}
+
+	// IAM access+secret keys also count as ambient auth.
+	os.Unsetenv("AWS_PROFILE")
+	t.Setenv("AWS_ACCESS_KEY_ID", "AKIAFAKE")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "secret")
+	if got := auth.AuthStatus("amazon-bedrock"); !got.Configured || got.Source != "environment" {
+		t.Fatalf("expected bedrock configured via ambient IAM keys, got %#v", got)
+	}
+}
+
 func TestProviderEnvKeysDefaultFallback(t *testing.T) {
 	if got := ProviderEnvKeys("anthropic"); len(got) != 2 || got[0] != "ANTHROPIC_OAUTH_TOKEN" || got[1] != "ANTHROPIC_API_KEY" {
 		t.Fatalf("anthropic env keys=%#v", got)

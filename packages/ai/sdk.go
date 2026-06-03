@@ -65,6 +65,7 @@ type StreamOptions struct {
 	OnPayload       func(payload any, model Model) (any, error)    `json:"-"`
 	OnResponse      func(resp ProviderResponse, model Model) error `json:"-"`
 	TimeoutMs       int                                            `json:"timeoutMs,omitempty"`
+	IdleTimeoutMs   int                                            `json:"idleTimeoutMs,omitempty"`
 	MaxRetries      int                                            `json:"maxRetries,omitempty"`
 	MaxRetryDelayMs int                                            `json:"maxRetryDelayMs,omitempty"`
 	ToolChoice      any                                            `json:"toolChoice,omitempty"`
@@ -383,6 +384,7 @@ func chatRequestFromOptions(model Model, llmContext Context, options StreamOptio
 		OnPayload:       options.OnPayload,
 		OnResponse:      options.OnResponse,
 		TimeoutMs:       options.TimeoutMs,
+		IdleTimeoutMs:   options.IdleTimeoutMs,
 		MaxRetries:      options.MaxRetries,
 		MaxRetryDelayMs: options.MaxRetryDelayMs,
 		ToolChoice:      options.ToolChoice,

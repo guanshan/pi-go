@@ -45,10 +45,35 @@ func (e AbortedError) Error() string {
 	return "aborted"
 }
 
+// utf16Len returns the number of UTF-16 code units in s, matching JavaScript's
+// String.length. TS shell-output.ts tracks the in-memory buffer size using
+// text.length (UTF-16 code units), not byte length, so the tail-trimming budget
+// must be measured the same way to stay byte-for-byte identical.
+func utf16Len(s string) int {
+	n := 0
+	for _, r := range s {
+		if r > 0xFFFF {
+			n += 2
+		} else {
+			n++
+		}
+	}
+	return n
+}
+
+// SanitizeShellBinaryOutput strips control bytes and genuinely invalid UTF-8
+// from shell output, mirroring TS sanitizeBinaryOutput. TS iterates over code
+// points (Array.from + codePointAt), so a real U+FFFD that was encoded in the
+// input (the valid bytes EF BF BD) is preserved; only truly invalid byte
+// sequences -- which Go decodes as utf8.RuneError with a width of 1 -- are
+// dropped.
 func SanitizeShellBinaryOutput(str string) string {
 	var builder strings.Builder
-	for _, r := range str {
-		if r == utf8.RuneError {
+	for i := 0; i < len(str); {
+		r, size := utf8.DecodeRuneInString(str[i:])
+		i += size
+		if r == utf8.RuneError && size == 1 {
+			// Genuinely invalid byte: TS's codePointAt never yields this, so drop it.
 			continue
 		}
 		if r == '\t' || r == '\n' || r == '\r' {
@@ -101,11 +126,13 @@ func ExecuteShellWithCapture(ctx context.Context, env ShellExecutionEnv, command
 			return err
 		}
 		outputChunks = append(outputChunks, text)
-		outputBytes += len(text)
+		// TS measures outputBytes with text.length (UTF-16 code units), not the
+		// encoded byte length, so the tail buffer is trimmed identically.
+		outputBytes += utf16Len(text)
 		for outputBytes > maxOutputBytes && len(outputChunks) > 1 {
 			removed := outputChunks[0]
 			outputChunks = outputChunks[1:]
-			outputBytes -= len(removed)
+			outputBytes -= utf16Len(removed)
 		}
 		if opts.OnChunk != nil {
 			opts.OnChunk(text)

@@ -9,7 +9,10 @@ const (
 	AppName               = "pi"
 	ConfigDirName         = ".pi"
 	CurrentSessionVersion = 3
-	Version               = "0.75.5-go"
+	// Version is the coding-agent version. It is derived from the single source of
+	// truth in packages/ai (ai.Version) so the two never drift; ai does not import
+	// coding-agent, so there is no import cycle.
+	Version = ai.Version
 )
 
 func InitialModel(registry *ai.ModelRegistry, args cli.Args, settings *SettingsManager) (ai.Model, bool, string) {

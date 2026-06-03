@@ -42,6 +42,19 @@ func (a *AgentSession) BindExtensions(ctx context.Context, bindings ExtensionBin
 	return nil
 }
 
+func (a *AgentSession) SetExtensionUIHandler(handler coreext.UIRequestHandler) {
+	if a == nil {
+		return
+	}
+	a.mu.Lock()
+	runtime := a.extensionRuntime
+	a.mu.Unlock()
+	if runtime == nil || runtime.API == nil {
+		return
+	}
+	runtime.API.SetUIHandler(handler)
+}
+
 func (a *AgentSession) HasExtensionHandlers(eventType string) bool {
 	if a == nil {
 		return false
@@ -87,7 +100,7 @@ func (a *AgentSession) Reload(ctx context.Context) error {
 	applyResourceLoaderOverrides(&resources, a.Session.CWD(), a.ResourceLoaderOptions)
 	a.mu.Lock()
 	a.Resources = resources
-	a.SystemPrompt = resources.BuildSystemPrompt(args, AllToolDescriptions(a.Tools))
+	a.SystemPrompt = resources.BuildSystemPrompt(args, ToolPromptInfoFor(a.Tools))
 	a.mu.Unlock()
 	a.emitExtensionSessionStart(coreext.SessionStartReload, "")
 	return nil

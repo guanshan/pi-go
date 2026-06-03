@@ -46,11 +46,12 @@ Implemented in Go:
   `mistral-conversations` API name, including message/image/tool conversion,
   deterministic Mistral tool-call ID normalization, reasoning mode fields,
   `x-affinity` session header support, and usage/tool-call response parsing
-- OpenAI Responses, Azure OpenAI Responses, and OpenAI Codex Responses basic
+- OpenAI Responses, Azure OpenAI Responses, and OpenAI Codex Responses
   transports, including Responses input/tool conversion, prompt-cache/session
   headers, Azure deployment/API-version resolution, Codex account headers,
-  Codex SSE parsing, reasoning/include fields, text/thinking signatures, and
-  usage/tool-call response parsing
+  Codex SSE and native WebSocket parsing, websocket-cached input delta/reuse
+  stats, reasoning/include fields, text/thinking signatures, and usage/tool-call
+  response parsing
 - Google Vertex basic REST transport with project/location endpoint resolution,
   API-key auth, Gemini content/image/tool conversion, thinking config,
   thought-signature preservation, and usage/tool-call parsing
@@ -84,7 +85,7 @@ Implemented in Go:
 Still incomplete versus TS:
 
 - advanced OpenAI Responses/Codex Responses transport parity, including
-  streaming event emission details, Codex WebSocket reuse/fallback, retry
+  streaming event emission details, live Codex WebSocket probe coverage, retry
   policy, service-tier pricing, and provider-specific dynamic headers
 - Bedrock Converse streaming/SDK edge-case parity and Google Vertex ADC/SDK
   streaming parity
@@ -373,9 +374,10 @@ Partial versus TS:
 - executable TypeScript extension loading: a minimal Node JSONL bridge
   (`core/extensions/script_runtime.go`) loads `.ts`/`.js`/`.mjs` extensions and
   registers/executes simple custom tools, declares CLI flags, dispatches basic
-  slash commands, subscribes to events/hooks, and returns mutation/cancel
-  results from before-hooks; settings, rich `ctx.ui`, message renderers, and
-  provider/model registration are not yet implemented
+	  slash commands, subscribes to events/hooks, returns mutation/cancel results
+	  from before-hooks, and forwards basic `ctx.ui` notify/select/confirm/input
+	  prompts to line/Bubble/RPC hosts; settings, custom/rich `ctx.ui`, message
+	  renderers, and provider/model registration are not yet implemented
 
 Now wired (previously ported-but-dead helpers):
 
@@ -424,15 +426,31 @@ Intentional behavioral divergences (safer or platform-specific; documented rathe
 - **`write` byte count**: "Successfully wrote N bytes" reports the raw UTF-8 byte
   length in Go vs the JS UTF-16 code-unit length in TS, so N differs for non-ASCII
   content (parity review topic 4 P2-5).
-- **System prompt shape (partial)**: project context files and skills are now
+- **System prompt shape (full parity)**: project context files and skills are now
   injected with the TS XML shapes — `<project_context>` /
   `<project_instructions path="...">` (system-prompt.ts:58-67) and
   `<available_skills>` with `<name>/<description>/<location>` and the TS
   `escapeXml` entities (skills.ts `formatSkillsForPrompt`) — replacing the old
-  markdown headings. Still partial vs TS: the built-in tool list is injected as a
-  `## Available Tools` markdown section of full tool descriptions rather than the
-  TS one-line `toolSnippets` + `Guidelines:` + `Pi documentation:` option-driven
-  default-prompt structure (`core/resources.go BuildSystemPrompt`).
+  markdown headings. One small message-format divergence: invalid YAML
+  frontmatter in a SKILL.md surfaces as a `parse_failed` diagnostic whose message
+  comes from `gopkg.in/yaml.v3` (e.g. `yaml: line 1: did not find expected ',' or
+  ']'`), whereas the TS loader emits a message containing `at line`. The
+  diagnostic is still emitted and the skill is still skipped, so behavior matches;
+  only the exact wording differs (asserted via the "line" substring in
+  `skills_test.go TestLoadSkillsEmitsInvalidNameYamlAndLongNameDiagnostics`).
+  The default-prompt structure now matches TS buildSystemPrompt
+  (system-prompt.ts:130-147): the lead paragraph, a one-line `Available tools:`
+  list built from per-tool `toolSnippets`, a deduped `Guidelines:` section
+  (bash-only-file-ops rule first, then per-tool `promptGuidelines` in registration
+  order `read,bash,edit,write,grep,find,ls`, then the two always-on bullets), and
+  a `Pi documentation:` block with absolute README/docs/examples paths
+  (`core.ReadmePath`/`DocsPath`/`ExamplesPath`). A custom prompt
+  (`--system-prompt` or a loaded `SYSTEM.md`) replaces all three sections, as in
+  TS. Per-tool snippets/guidelines live on the tools via
+  `core/tools.PromptMetadata`; the builder (`core/tools.go ToolPromptInfoFor` →
+  `core/resources.go BuildSystemPrompt`/`defaultPromptBody`) preserves
+  registration order rather than sorting. Byte-shape is locked by
+  `TestBuildSystemPromptDefaultGoldenShape`.
 - **`grep` engine**: the grep tool now prefers a local `rg` binary (agent bin dir
   then PATH), shelling out with the same flags as the TypeScript tool
   (`--json --line-number --color=never --hidden`) so traversal/ignore semantics
@@ -444,6 +462,100 @@ Intentional behavioral divergences (safer or platform-specific; documented rathe
   so that earlier "advanced regex works in TS" note was inaccurate. The Go path
   also always excludes `.git` via `--glob '!.git'` (ripgrep 14 does not skip it
   under `--hidden`), matching the RE2 fallback and never surfacing git internals.
+- **`find` engine**: the find tool now prefers a local `fd` binary (agent bin dir,
+  PATH `fd`, then PATH `fdfind`) with TS-style hidden/glob output and a Go
+  `walkFiltered` fallback when `fd` is unavailable or errors. Covered by
+  `TestFindUsesFdWhenAvailable`.
+
+## Accepted Intentional Divergences
+
+These are deliberate, tested differences from the TypeScript source. They are not
+bugs and should not be "fixed" toward TS without a corresponding decision.
+
+- **`SanitizeBinaryOutput` preserves a real U+FFFD**: a legitimate U+FFFD
+  (REPLACEMENT CHARACTER, valid `EF BF BD`) in tool output is preserved; only
+  genuinely invalid bytes — which Go decodes as `utf8.RuneError` with size 1 — are
+  dropped. All three implementations decode byte-wise (`utf8.DecodeRuneInString`
+  plus a `size == 1` check) and are kept in sync: `utils.go`,
+  `core/tools/bash_executor.go` (the path `ExecuteBash` actually uses), and
+  `packages/agent/harness/utils` `SanitizeShellBinaryOutput`. Regression test:
+  `core/tools/bash_executor_test.go` `TestSanitizeBinaryOutputPreservesRealReplacementChar`.
+
+- **Multibyte-rune reassembly lives in the execution env, not in
+  `ExecuteShellWithCapture` (matches TS)**: a multibyte rune split across raw
+  byte chunks is reassembled by `LocalExecutionEnv`'s `executionStreamWriter`
+  (`splitTrailingPartialRune` + `flush` in `packages/agent/harness/env/local.go`),
+  which buffers a trailing partial rune so the `OnStdout`/`OnStderr` callback
+  never observes a split rune. This mirrors the TS NodeJS env reading stdout with
+  `setEncoding("utf8")` (a `StringDecoder` that buffers incomplete multibyte
+  sequences), so TS's `executeShellWithCapture.onChunk` likewise only ever sees
+  whole code points. Neither TS `executeShellWithCapture` nor Go
+  `ExecuteShellWithCapture` reassembles runes itself — both rely on the env's
+  decoder, so this is parity, not a divergence. If a caller bypasses the env
+  decoder and feeds raw split fragments straight into `OnStdout`, each fragment is
+  sanitized independently: the lead and continuation bytes each decode as
+  `utf8.RuneError` (size 1) and are dropped by `SanitizeShellBinaryOutput`, so the
+  rune is lost (it is not surfaced as U+FFFD). Covered at the env layer by
+  `packages/agent/harness/env/local_test.go`
+  `TestExecutionStreamWriterReassemblesSplitRune`/`TestSplitTrailingPartialRune`,
+  and at the capture-boundary layer by `packages/agent/harness/utils`
+  `TestExecuteShellWithCaptureHandlesMultibyteSplitAcrossChunks`.
+
+- **Faux provider supports per-registration state (matches TS)**: the faux
+  provider (`provider_faux.go`) carries its scripted response queue and call
+  counter per instance, mirroring the TS `registerFauxProvider` per-registration
+  state. `ai.RegisterFauxProvider()` mints a private instance under a unique API
+  (with `Provider` kept as `"faux"` so the always-available auth/availability
+  gates still apply) and returns a handle exposing `SetResponses`/`AppendResponses`/
+  `ResetResponses`/`CallCount`/`PendingResponseCount` plus `Unregister`; this is
+  the path for `t.Parallel()` subtests and multiple concurrent scripts, with no
+  crosstalk (`provider_faux_test.go` `TestFauxTwoInstancesIsolated`,
+  `TestFauxParallelSubtestsNoCrosstalk`). The package-level
+  `ai.SetFauxResponses`/`AppendFauxResponses`/`ResetFauxResponses`/
+  `PendingFauxResponseCount`/`FauxCallCount` functions remain as thin shims over a
+  shared process-wide default instance (the builtin `faux/faux` model) for serial
+  tests that script the builtin without a registry handle; those still isolate
+  with `defer ai.ResetFauxResponses()` (`TestFauxDefaultInstanceShimsStillWork`).
+
+- **Compaction `SummaryMaxChars` is a Go-only safety truncation**: the TS
+  `CompactionSettings` has no summary-length cap; the Go harness adds a defensive
+  rune-safe truncation of the generated summary (`SummaryMaxChars`) so a runaway
+  summary cannot blow up the context. The truncation is rune-aware (never splits a
+  multi-byte rune). This field has no TS counterpart by design.
+
+- **Anthropic malformed `input_json_delta` repair is delta-level, not
+  accumulator-level**: the TS port parses raw Anthropic SSE through its own
+  `iterateAnthropicEvents`, so a malformed streamed tool-call argument (e.g. an
+  invalid `\H` string escape or a raw tab inside `partial_json`) is repaired at
+  finalize and surfaces as a valid `toolUse` result. The Go port consumes
+  Anthropic streams through the official `anthropic-sdk-go` accumulator
+  (`provider_anthropic.go` `accumulated.Accumulate(event)`), which re-marshals the
+  accumulated `Message` and rejects an invalid escape before the port's own repair
+  code runs — so an end-to-end stream carrying that exact malformed delta fails
+  with a marshal error rather than returning a repaired `toolUse`. The repair the
+  Go port owns lives in the streamed-delta path: `applyAnthropicDelta`
+  (`provider_anthropic.go:202`) feeds each `input_json_delta` through
+  `StreamingToolArguments` -> `ParseStreamingJSON` -> `RepairJSON`
+  (`utils/json_parse.go`), which does repair `\H`/raw-tab into
+  `{"path":"A\\H","text":"col1\tcol2"}`. The "ignore unknown events after
+  `message_stop`" behavior matches TS (the SDK stops iterating at `message_stop`).
+  Both halves are locked by `provider_anthropic_sse_parsing_test.go`
+  `TestAnthropicRawSSEMalformedJSONRepairAndPostStop` (the repair subtest drives
+  `applyAnthropicDelta` directly; the post-stop subtest drives a full fake SSE
+  body).
+
+- **Harness hook dispatch is chain/merge, not last-wins**: for the emitHook-class
+  hooks (`context`, `tool_call` [short-circuits on a block result], `tool_result`,
+  `before_agent_start`, `session_before_compact`, `session_before_tree`) the Go
+  harness runs every registered handler and chains/merges their results, an
+  intentional and tested Go design. This differs from TS, where "the last
+  non-undefined result wins". The Go behavior lets multiple security/transform
+  extensions cooperate on the same event rather than silently clobbering each
+  other. Locked by golden tests in `packages/agent/harness/hooks_test.go`:
+  `TestHarnessBeforeAgentStartHooksChainAndAppend` (SystemPrompt last-non-empty,
+  Messages appended in order), `TestHarnessToolResultHooksChainPatches` (patch
+  chaining), and `TestHarnessToolCallHookShortCircuitsOnBlock` (block
+  short-circuits remaining handlers).
 
 ## Verification Commands
 

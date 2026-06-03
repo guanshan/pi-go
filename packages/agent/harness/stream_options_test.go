@@ -5,6 +5,7 @@ import "testing"
 func TestApplyStreamOptionsPatch(t *testing.T) {
 	transport := "http"
 	timeout := 42
+	idleTimeout := 84
 	header := "next"
 	meta := AnyValue{V: nil}
 	opts := StreamOptions{
@@ -13,8 +14,9 @@ func TestApplyStreamOptionsPatch(t *testing.T) {
 		Metadata:  map[string]any{"keep": "yes", "drop": "old"},
 	}
 	patched := ApplyStreamOptionsPatch(opts, &StreamOptionsPatch{
-		Transport: &transport,
-		TimeoutMs: &timeout,
+		Transport:     &transport,
+		TimeoutMs:     &timeout,
+		IdleTimeoutMs: &idleTimeout,
 		Headers: map[string]*string{
 			"drop": nil,
 			"new":  &header,
@@ -24,7 +26,7 @@ func TestApplyStreamOptionsPatch(t *testing.T) {
 			"nil":  &meta,
 		},
 	})
-	if patched.Transport != "http" || patched.TimeoutMs != 42 {
+	if patched.Transport != "http" || patched.TimeoutMs != 42 || patched.IdleTimeoutMs != 84 {
 		t.Fatalf("patched=%#v", patched)
 	}
 	if patched.Headers["keep"] != "yes" || patched.Headers["new"] != "next" {

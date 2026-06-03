@@ -5,6 +5,7 @@ package tools
 import (
 	"context"
 	"os"
+	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
@@ -24,6 +25,21 @@ func TestBashToolBasicOutput(t *testing.T) {
 	}
 	if got := strings.TrimSpace(toolText(result.Content)); got != "hello" {
 		t.Fatalf("output=%q", got)
+	}
+}
+
+// TestBashToolMissingCWD verifies the use-time precheck: when the working
+// directory does not exist, the bash tool returns the exact bash.ts message.
+func TestBashToolMissingCWD(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "gone")
+	tool := BashTool{CWD: missing}
+	result := tool.Execute(context.Background(), raw(map[string]any{"command": "echo hi"}), nil)
+	if !result.IsError {
+		t.Fatalf("expected error for missing cwd, got success: %s", toolText(result.Content))
+	}
+	want := "Working directory does not exist: " + missing + "\nCannot execute bash commands."
+	if got := toolText(result.Content); got != want {
+		t.Fatalf("message = %q, want %q", got, want)
 	}
 }
 

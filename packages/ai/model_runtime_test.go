@@ -1,6 +1,25 @@
 package ai
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
+
+// TestVersionSourceOfTruth pins UpstreamVersion to the upstream TS
+// packages/ai/package.json version (0.78.0) and verifies Version derives from it
+// with the "-go" suffix. coding-agent/core derives its version from ai.Version,
+// so this is the single source of truth (P1-09).
+func TestVersionSourceOfTruth(t *testing.T) {
+	if UpstreamVersion != "0.78.0" {
+		t.Fatalf("UpstreamVersion=%q, want 0.78.0 (TS packages/ai/package.json)", UpstreamVersion)
+	}
+	if Version != UpstreamVersion+"-go" {
+		t.Fatalf("Version=%q, want %q", Version, UpstreamVersion+"-go")
+	}
+	if !strings.HasSuffix(Version, "-go") {
+		t.Fatalf("Version=%q must carry the -go suffix", Version)
+	}
+}
 
 func TestInitialModelPrefersAuthenticatedRealModelOverFaux(t *testing.T) {
 	t.Setenv("OPENAI_API_KEY", "test-key")

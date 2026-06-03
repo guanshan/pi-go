@@ -90,7 +90,7 @@ var providerSDKHTTPClient = aiproviders.NewHTTPClient()
 const streamScannerMaxLineBytes = 8 * 1024 * 1024
 
 func providerHTTPClient(req ChatRequest) *http.Client {
-	if req.TimeoutMs > 0 {
+	if req.TimeoutMs > 0 || req.IdleTimeoutMs > 0 {
 		return aiproviders.NewHTTPClientWithOptions(providerRequestOptions(req))
 	}
 	return providerSDKHTTPClient
@@ -99,6 +99,7 @@ func providerHTTPClient(req ChatRequest) *http.Client {
 func providerRequestOptions(req ChatRequest) aiproviders.RequestOptions {
 	options := aiproviders.RequestOptions{
 		TimeoutMs:       req.TimeoutMs,
+		IdleTimeoutMs:   req.IdleTimeoutMs,
 		MaxRetries:      req.MaxRetries,
 		UseMaxRetries:   true,
 		MaxRetryDelayMs: req.MaxRetryDelayMs,

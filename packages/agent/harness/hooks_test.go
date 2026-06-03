@@ -129,3 +129,73 @@ func TestHarnessEventSubscriptionUnsubscribeAndError(t *testing.T) {
 		t.Fatalf("err=%v removedCalled=%v", err, removedCalled)
 	}
 }
+
+// TestHarnessBeforeAgentStartHooksChainAndAppend locks the documented intentional
+// divergence (docs/TS_COMPATIBILITY.md "Harness hook dispatch is chain/merge, not
+// last-wins"): the Go harness runs every before_agent_start handler, chaining the
+// accumulated SystemPrompt into each handler's event, taking the last non-empty
+// SystemPrompt, and appending every handler's Messages in order. TS instead lets
+// "the last non-undefined result win".
+func TestHarnessBeforeAgentStartHooksChainAndAppend(t *testing.T) {
+	ctx := context.Background()
+	h, err := New(Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var secondSawFirstSystemPrompt bool
+	h.OnBeforeAgentStart(func(ctx context.Context, ev BeforeAgentStartEvent) (*BeforeAgentStartResult, error) {
+		return &BeforeAgentStartResult{
+			SystemPrompt: "FIRST",
+			Messages:     []agent.AgentMessage{ai.NewUserMessage("m1", nil)},
+		}, nil
+	})
+	h.OnBeforeAgentStart(func(ctx context.Context, ev BeforeAgentStartEvent) (*BeforeAgentStartResult, error) {
+		secondSawFirstSystemPrompt = ev.SystemPrompt == "FIRST"
+		return &BeforeAgentStartResult{
+			SystemPrompt: "SECOND",
+			Messages:     []agent.AgentMessage{ai.NewUserMessage("m2", nil)},
+		}, nil
+	})
+	out, err := h.emitBeforeAgentStart(ctx, BeforeAgentStartEvent{Prompt: "go"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out == nil || !secondSawFirstSystemPrompt {
+		t.Fatalf("out=%#v secondSawFirstSystemPrompt=%v", out, secondSawFirstSystemPrompt)
+	}
+	if out.SystemPrompt != "SECOND" {
+		t.Fatalf("SystemPrompt = %q, want last-non-empty SECOND", out.SystemPrompt)
+	}
+	if len(out.Messages) != 2 || ai.MessageText(out.Messages[0]) != "m1" || ai.MessageText(out.Messages[1]) != "m2" {
+		t.Fatalf("Messages = %#v, want appended [m1 m2]", out.Messages)
+	}
+}
+
+// TestHarnessToolCallHookShortCircuitsOnBlock locks the documented intentional
+// divergence: a blocking tool_call result short-circuits the remaining handlers
+// rather than continuing to a "last result wins" merge.
+func TestHarnessToolCallHookShortCircuitsOnBlock(t *testing.T) {
+	ctx := context.Background()
+	h, err := New(Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var secondCalled bool
+	h.OnToolCall(func(ctx context.Context, ev ToolCallEvent) (*ToolCallResult, error) {
+		return &ToolCallResult{Block: true, Reason: "denied"}, nil
+	})
+	h.OnToolCall(func(ctx context.Context, ev ToolCallEvent) (*ToolCallResult, error) {
+		secondCalled = true
+		return nil, nil
+	})
+	result, err := h.emitToolCall(ctx, ToolCallEvent{ToolCallID: "c1", ToolName: "bash"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result == nil || !result.Block || result.Reason != "denied" {
+		t.Fatalf("result=%#v, want Block with reason denied", result)
+	}
+	if secondCalled {
+		t.Fatal("second tool_call handler should not run after a block")
+	}
+}

@@ -4,6 +4,7 @@ import (
 	"context"
 	"math"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/guanshan/pi-go/packages/agent"
 	"github.com/guanshan/pi-go/packages/agent/harness/session"
@@ -200,8 +201,12 @@ func Compact(ctx context.Context, prep *Preparation, model ai.Model, apiKey stri
 		summary = generated
 	}
 
+	// SummaryMaxChars is a Go-only safety net (TS CompactionSettings has no such
+	// field and never truncates the generated summary). We keep it as a guard but
+	// slice on a rune boundary so a multibyte rune is never split. See the
+	// TS_COMPATIBILITY note about this intentional divergence.
 	if limit := settings.SummaryMaxChars; limit > 0 && len(summary) > limit {
-		summary = summary[:limit] + "\n[summary truncated]"
+		summary = truncateBytesOnRuneBoundary(summary, limit) + "\n[summary truncated]"
 	}
 	readFiles, modifiedFiles := ComputeFileLists(prep.FileOps)
 	summary += FormatFileOperations(readFiles, modifiedFiles)
@@ -309,6 +314,23 @@ func runSummarization(ctx context.Context, model ai.Model, maxTokens int, prompt
 
 // summaryTextContent joins the text blocks of a completion with newlines,
 // mirroring TS `response.content.filter(text).map(text).join("\n")`.
+// truncateBytesOnRuneBoundary returns the longest prefix of s whose byte length
+// does not exceed maxBytes and that ends on a UTF-8 rune boundary, so a
+// multibyte rune is never split.
+func truncateBytesOnRuneBoundary(s string, maxBytes int) string {
+	if maxBytes <= 0 {
+		return ""
+	}
+	if len(s) <= maxBytes {
+		return s
+	}
+	cut := maxBytes
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut]
+}
+
 func summaryTextContent(message ai.AssistantMessage) string {
 	var texts []string
 	for _, block := range message.Content {

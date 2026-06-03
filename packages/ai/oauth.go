@@ -3,6 +3,7 @@ package ai
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"sync"
 	"time"
 
@@ -97,6 +98,10 @@ type OAuthLoginCallbacks struct {
 	OnProgress        func(string)
 	OnManualCodeInput func() (string, error)
 	OnSelect          func(OAuthSelectPrompt) (string, bool, error)
+	// HTTPClient optionally overrides the *http.Client used by the OAuth login
+	// flows. When nil, http.DefaultClient is used. This exists so tests can inject
+	// a fake transport; production callers leave it unset.
+	HTTPClient *http.Client
 }
 
 func (c OAuthLoginCallbacks) ctx() context.Context {
@@ -104,6 +109,15 @@ func (c OAuthLoginCallbacks) ctx() context.Context {
 		return c.Context
 	}
 	return context.Background()
+}
+
+// httpClient returns the injected client, or http.DefaultClient when none was
+// provided.
+func (c OAuthLoginCallbacks) httpClient() *http.Client {
+	if c.HTTPClient != nil {
+		return c.HTTPClient
+	}
+	return http.DefaultClient
 }
 
 type OAuthProviderInfo struct {

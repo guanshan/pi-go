@@ -820,12 +820,17 @@ func ResolveSessionPath(arg, cwd, sessionDir string) (string, error) {
 	return resolved.Path, nil
 }
 
+// writeJSONLine serializes a single session JSONL record without HTML-escaping
+// `<`, `>`, `&`. TS persists session entries via `JSON.stringify`, which does not
+// escape those characters; Go's default json.Marshal does, which would make the
+// on-disk session bytes diverge for common code payloads (HTML, `&&`,
+// `List<String>`). Mirrors writeRPCJSONLine on the RPC path.
 func writeJSONLine(w io.Writer, value any) error {
-	data, err := json.Marshal(value)
+	raw, err := marshalJSONStringifyLine(value)
 	if err != nil {
 		return err
 	}
-	_, err = w.Write(append(data, '\n'))
+	_, err = w.Write(raw)
 	return err
 }
 

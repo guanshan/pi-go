@@ -38,13 +38,10 @@ func NewLocalExecutionEnv(cwd string, shellPath string, shellEnv map[string]stri
 	if err != nil {
 		return nil, &FileError{Code: FileErrInvalid, Path: cwd, Err: err}
 	}
-	info, err := os.Stat(abs)
-	if err != nil {
-		return nil, toFileError(err, abs)
-	}
-	if !info.IsDir() {
-		return nil, &FileError{Code: FileErrNotDirectory, Path: abs, Err: fmt.Errorf("%s is not a directory", abs)}
-	}
+	// TS NodejsExecutionEnv's constructor only stores the cwd; it never stats or
+	// validates it. Existence/kind validation happens at use-time (read, exec,
+	// etc.), so constructing an env for a not-yet-created directory must succeed
+	// to match the TS port.
 	return &LocalExecutionEnv{cwd: abs, shellPath: shellPath, shellEnv: cloneStringMap(shellEnv)}, nil
 }
 
@@ -313,22 +310,95 @@ type executionStreamWriter struct {
 	buffer   *bytes.Buffer
 	callback func(string)
 	sink     *callbackErrorSink
+	// pending holds the bytes of a trailing rune that was split across Write
+	// calls. TS reads stdout/stderr with setEncoding("utf8"), whose internal
+	// StringDecoder buffers an incomplete multibyte sequence until the rest of
+	// the rune arrives, so a callback never observes a U+FFFD from a chunk
+	// boundary. We mirror that by deferring undecodable trailing bytes.
+	pending []byte
 }
 
 func (w *executionStreamWriter) Write(p []byte) (int, error) {
 	if len(p) == 0 {
 		return 0, nil
 	}
-	text := string(p)
+	n := len(p)
 	w.mu.Lock()
 	if w.buffer != nil {
 		_, _ = w.buffer.Write(p)
 	}
-	w.mu.Unlock()
-	if w.callback != nil {
-		w.invokeCallback(text)
+	combined := p
+	if len(w.pending) > 0 {
+		joined := make([]byte, 0, len(w.pending)+len(p))
+		joined = append(joined, w.pending...)
+		joined = append(joined, p...)
+		combined = joined
+		w.pending = nil
 	}
-	return len(p), nil
+	emit, pending := splitTrailingPartialRune(combined)
+	if len(pending) > 0 {
+		w.pending = append([]byte(nil), pending...)
+	}
+	w.mu.Unlock()
+	if w.callback != nil && len(emit) > 0 {
+		w.invokeCallback(string(emit))
+	}
+	return n, nil
+}
+
+// flush emits any buffered trailing bytes once the stream is closed. Bytes that
+// never completed into a valid rune are emitted as-is so no output is lost; the
+// downstream sanitizer (SanitizeShellBinaryOutput) drops genuinely invalid
+// bytes, matching how TS surfaces the final decoder state.
+func (w *executionStreamWriter) flush() {
+	w.mu.Lock()
+	pending := w.pending
+	w.pending = nil
+	w.mu.Unlock()
+	if w.callback != nil && len(pending) > 0 {
+		w.invokeCallback(string(pending))
+	}
+}
+
+// splitTrailingPartialRune returns the prefix of p that ends on a UTF-8 rune
+// boundary plus the trailing bytes (if any) that form the start of an
+// incomplete multibyte rune. A trailing byte sequence is only withheld when it
+// is a valid prefix of a longer rune; genuinely invalid bytes are emitted
+// immediately so they are not buffered indefinitely.
+func splitTrailingPartialRune(p []byte) (emit, pending []byte) {
+	if len(p) == 0 {
+		return nil, nil
+	}
+	// Scan back over continuation bytes (10xxxxxx) to find the last lead byte.
+	i := len(p) - 1
+	for i >= 0 && p[i]&0xC0 == 0x80 {
+		i--
+	}
+	if i < 0 {
+		// All continuation bytes with no lead: not a valid rune start, emit all.
+		return p, nil
+	}
+	lead := p[i]
+	var runeLen int
+	switch {
+	case lead&0x80 == 0x00:
+		runeLen = 1
+	case lead&0xE0 == 0xC0:
+		runeLen = 2
+	case lead&0xF0 == 0xE0:
+		runeLen = 3
+	case lead&0xF8 == 0xF0:
+		runeLen = 4
+	default:
+		// Invalid lead byte; nothing to defer.
+		return p, nil
+	}
+	have := len(p) - i
+	if have < runeLen {
+		// The final rune is incomplete: defer it until the rest arrives.
+		return p[:i], p[i:]
+	}
+	return p, nil
 }
 
 // invokeCallback runs the user callback, converting any panic into a stored
@@ -386,12 +456,19 @@ func (e *LocalExecutionEnv) Exec(ctx context.Context, command string, opts ExecO
 	cmd.WaitDelay = 2 * time.Second
 	sink := &callbackErrorSink{cancel: cancel}
 	var stdoutBuf, stderrBuf bytes.Buffer
-	cmd.Stdout = &executionStreamWriter{buffer: &stdoutBuf, callback: opts.OnStdout, sink: sink}
-	cmd.Stderr = &executionStreamWriter{buffer: &stderrBuf, callback: opts.OnStderr, sink: sink}
+	stdoutWriter := &executionStreamWriter{buffer: &stdoutBuf, callback: opts.OnStdout, sink: sink}
+	stderrWriter := &executionStreamWriter{buffer: &stderrBuf, callback: opts.OnStderr, sink: sink}
+	cmd.Stdout = stdoutWriter
+	cmd.Stderr = stderrWriter
 	if err := cmd.Start(); err != nil {
 		return ExecResult{}, &ExecutionError{Code: ExecErrSpawn, Err: err}
 	}
 	waitErr := cmd.Wait()
+	// Emit any trailing partial-rune bytes that were withheld at a chunk
+	// boundary so no output is dropped (mirrors the StringDecoder flush TS gets
+	// from setEncoding("utf8")).
+	stdoutWriter.flush()
+	stderrWriter.flush()
 	// A callback panic takes precedence over timeout/abort, matching the TS
 	// close handler order in nodejs.ts.
 	if cbErr := sink.get(); cbErr != nil {

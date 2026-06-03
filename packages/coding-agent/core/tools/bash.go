@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
 	"sync"
 	"sync/atomic"
@@ -46,6 +47,16 @@ func (t BashTool) Execute(ctx context.Context, raw json.RawMessage, onUpdate Too
 	shellConfig, err := ResolveShellConfig(t.ShellPath)
 	if err != nil {
 		return toolError(err.Error())
+	}
+
+	// Use-time precheck that the working directory still exists, matching
+	// createLocalBashOperations in src/core/tools/bash.ts (fsAccess(cwd) before
+	// spawn). The harness no longer stats cwd at construct time, so this is the
+	// correct place. The message wording is byte-for-byte from bash.ts.
+	if t.CWD != "" {
+		if info, statErr := os.Stat(t.CWD); statErr != nil || !info.IsDir() {
+			return toolError(fmt.Sprintf("Working directory does not exist: %s\nCannot execute bash commands.", t.CWD))
+		}
 	}
 
 	// The command runs in its own process group so that on abort/timeout the

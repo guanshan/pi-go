@@ -853,6 +853,7 @@ func (h *AgentHarness) streamForTurn(getState func() turnState) agent.StreamFn {
 		state := getState()
 		opts.Transport = firstString(opts.Transport, state.streamOptions.Transport)
 		opts.TimeoutMs = firstInt(opts.TimeoutMs, state.streamOptions.TimeoutMs)
+		opts.IdleTimeoutMs = firstInt(opts.IdleTimeoutMs, state.streamOptions.IdleTimeoutMs)
 		opts.MaxRetries = firstInt(opts.MaxRetries, state.streamOptions.MaxRetries)
 		opts.MaxRetryDelayMs = firstInt(opts.MaxRetryDelayMs, state.streamOptions.MaxRetryDelayMs)
 		opts.CacheRetention = firstString(opts.CacheRetention, state.streamOptions.CacheRetention)

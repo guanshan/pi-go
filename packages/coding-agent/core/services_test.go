@@ -57,7 +57,7 @@ func TestCreateAgentSessionServicesLoadsResourcesAndDiagnostics(t *testing.T) {
 	if _, ok := services.ResourceLoader.PromptTemplates["hello"]; !ok {
 		t.Fatalf("prompt templates=%#v", services.ResourceLoader.PromptTemplates)
 	}
-	systemPrompt := services.ResourceLoader.BuildSystemPrompt(cliArgsForTest(), nil)
+	systemPrompt := services.ResourceLoader.BuildSystemPrompt(cliArgsForTest(), ToolPromptInfo{})
 	if !strings.Contains(systemPrompt, "overridden system prompt") || !strings.Contains(systemPrompt, "append prompt") {
 		t.Fatalf("system prompt=%q", systemPrompt)
 	}

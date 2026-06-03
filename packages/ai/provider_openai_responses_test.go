@@ -4,12 +4,14 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"math"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 
+	"github.com/gorilla/websocket"
 	aiproviders "github.com/guanshan/pi-go/packages/ai/providers"
 )
 
@@ -18,6 +20,10 @@ func TestOpenAIResponsesPayloadAndParse(t *testing.T) {
 	var headers http.Header
 	var path string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if websocket.IsWebSocketUpgrade(r) {
+			http.Error(w, "websocket unavailable", http.StatusBadGateway)
+			return
+		}
 		headers = r.Header.Clone()
 		path = r.URL.Path
 		if err := json.NewDecoder(r.Body).Decode(&captured); err != nil {
@@ -614,6 +620,10 @@ func TestOpenAICodexResponsesStreamEmitsDeltas(t *testing.T) {
 	var captured map[string]any
 	var path string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if websocket.IsWebSocketUpgrade(r) {
+			http.Error(w, "websocket unavailable", http.StatusBadGateway)
+			return
+		}
 		path = r.URL.Path
 		if err := json.NewDecoder(r.Body).Decode(&captured); err != nil {
 			t.Fatal(err)
@@ -660,7 +670,7 @@ func TestOpenAICodexResponsesStreamEmitsDeltas(t *testing.T) {
 	if strings.Join(deltas, "") != "codex" || MessageText(message) != "codex" || message.ResponseID != "resp_codex_stream" {
 		t.Fatalf("deltas=%#v message=%#v", deltas, message)
 	}
-	if len(message.Diagnostics) != 1 || message.Diagnostics[0].Type != "provider_transport_fallback" || message.Diagnostics[0].Details["fallbackTransport"] != "sse" {
+	if len(message.Diagnostics) != 1 || message.Diagnostics[0].Type != "provider_transport_failure" || message.Diagnostics[0].Details["fallbackTransport"] != "sse" {
 		t.Fatalf("diagnostics=%#v", message.Diagnostics)
 	}
 }
@@ -688,6 +698,10 @@ func TestValidateOpenAICodexResponsesTransport(t *testing.T) {
 func TestOpenAICodexResponsesWebSocketTransportFallsBackToSSE(t *testing.T) {
 	var called bool
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if websocket.IsWebSocketUpgrade(r) {
+			http.Error(w, "websocket unavailable", http.StatusBadGateway)
+			return
+		}
 		called = true
 		w.Header().Set("Content-Type", "text/event-stream")
 		_, _ = w.Write([]byte(
@@ -721,8 +735,204 @@ func TestOpenAICodexResponsesWebSocketTransportFallsBackToSSE(t *testing.T) {
 	if event.Type != "done" || message.StopReason != "stop" || MessageText(message) != "fallback" {
 		t.Fatalf("event=%#v message=%#v", event, message)
 	}
-	if len(message.Diagnostics) != 1 || message.Diagnostics[0].Details["configuredTransport"] != "websocket-cached" || message.Diagnostics[0].Details["fallbackTransport"] != "sse" {
+	if len(message.Diagnostics) != 1 || message.Diagnostics[0].Type != "provider_transport_failure" || message.Diagnostics[0].Details["configuredTransport"] != "websocket-cached" || message.Diagnostics[0].Details["fallbackTransport"] != "sse" {
 		t.Fatalf("diagnostics=%#v", message.Diagnostics)
+	}
+}
+
+func TestOpenAICodexResponsesWebSocketTransportStreams(t *testing.T) {
+	ResetOpenAICodexWebSocketDebugStats("ws-session")
+	CloseOpenAICodexWebSocketSessions("ws-session")
+	t.Cleanup(func() {
+		CloseOpenAICodexWebSocketSessions("ws-session")
+		ResetOpenAICodexWebSocketDebugStats("ws-session")
+	})
+
+	var captured map[string]any
+	var headers http.Header
+	var path string
+	var fallbackCalled bool
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !websocket.IsWebSocketUpgrade(r) {
+			fallbackCalled = true
+			http.Error(w, "unexpected fallback", http.StatusInternalServerError)
+			return
+		}
+		headers = r.Header.Clone()
+		path = r.URL.Path
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		defer conn.Close()
+		_, raw, err := conn.ReadMessage()
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		if err := json.Unmarshal(raw, &captured); err != nil {
+			t.Error(err)
+			return
+		}
+		for _, event := range []string{
+			`{"type":"response.created","response":{"id":"resp_ws_stream","status":"in_progress"}}`,
+			`{"type":"response.output_item.added","output_index":0,"item":{"type":"message","id":"msg_ws_stream","role":"assistant","status":"in_progress","content":[]}}`,
+			`{"type":"response.output_text.delta","item_id":"msg_ws_stream","output_index":0,"delta":"web"}`,
+			`{"type":"response.output_text.delta","item_id":"msg_ws_stream","output_index":0,"delta":"socket"}`,
+			`{"type":"response.output_item.done","output_index":0,"item":{"type":"message","id":"msg_ws_stream","role":"assistant","status":"completed","content":[{"type":"output_text","text":"websocket"}]}}`,
+			`{"type":"response.completed","response":{"id":"resp_ws_stream","status":"completed","usage":{"input_tokens":3,"output_tokens":4,"total_tokens":7}}}`,
+		} {
+			if err := conn.WriteMessage(websocket.TextMessage, []byte(event)); err != nil {
+				t.Error(err)
+				return
+			}
+		}
+	}))
+	defer server.Close()
+
+	registry := NewModelRegistry(t.TempDir(), NewAuthStorage(t.TempDir()))
+	registry.Auth.SetRuntime("openai-codex", codexTestJWT("acct-123"))
+	stream := registry.StreamChat(context.Background(), ChatRequest{
+		Model: Model{
+			Provider: "openai-codex",
+			ID:       "gpt-5-codex",
+			API:      "openai-codex-responses",
+			BaseURL:  server.URL + "/backend-api",
+			Input:    []string{"text"},
+		},
+		Messages:  []Message{NewUserMessage("hi", nil)},
+		Transport: "websocket",
+		SessionID: "ws-session",
+	})
+	var deltas []string
+	for event := range stream.Events() {
+		if event.Type == "text_delta" {
+			deltas = append(deltas, event.Delta)
+		}
+	}
+	message := stream.Result()
+	if fallbackCalled {
+		t.Fatal("SSE fallback should not be called")
+	}
+	if path != "/backend-api/codex/responses" {
+		t.Fatalf("path=%q", path)
+	}
+	if headers.Get("session-id") != "ws-session" || headers.Get("x-client-request-id") != "ws-session" || headers.Get("chatgpt-account-id") != "acct-123" {
+		t.Fatalf("headers=%#v", headers)
+	}
+	if headers.Get("OpenAI-Beta") != "" || headers.Get("Content-Type") != "" {
+		t.Fatalf("websocket headers should omit SSE-only headers: %#v", headers)
+	}
+	if captured["type"] != "response.create" || captured["stream"] != true {
+		t.Fatalf("captured=%#v", captured)
+	}
+	if strings.Join(deltas, "") != "websocket" || MessageText(message) != "websocket" || message.ResponseID != "resp_ws_stream" {
+		t.Fatalf("deltas=%#v message=%#v", deltas, message)
+	}
+	if len(message.Diagnostics) != 0 {
+		t.Fatalf("diagnostics=%#v", message.Diagnostics)
+	}
+	stats, ok := GetOpenAICodexWebSocketDebugStats("ws-session")
+	if !ok || stats.Requests != 1 || stats.ConnectionsCreated != 1 || stats.FullContextRequests != 1 {
+		t.Fatalf("stats=%#v ok=%v", stats, ok)
+	}
+}
+
+func TestOpenAICodexResponsesWebSocketCachedSendsInputDelta(t *testing.T) {
+	ResetOpenAICodexWebSocketDebugStats("session-1")
+	CloseOpenAICodexWebSocketSessions("session-1")
+	t.Cleanup(func() {
+		CloseOpenAICodexWebSocketSessions("session-1")
+		ResetOpenAICodexWebSocketDebugStats("session-1")
+	})
+
+	var requests []map[string]any
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !websocket.IsWebSocketUpgrade(r) {
+			http.Error(w, "unexpected fallback", http.StatusInternalServerError)
+			return
+		}
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		defer conn.Close()
+		responses := []struct {
+			responseID string
+			messageID  string
+			text       string
+		}{
+			{responseID: "resp_1", messageID: "msg_1", text: "first answer"},
+			{responseID: "resp_2", messageID: "msg_2", text: "second answer"},
+		}
+		for _, response := range responses {
+			_, raw, err := conn.ReadMessage()
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			var request map[string]any
+			if err := json.Unmarshal(raw, &request); err != nil {
+				t.Error(err)
+				return
+			}
+			requests = append(requests, request)
+			done := fmt.Sprintf(`{"type":"response.completed","response":{"id":%q,"status":"completed","output":[{"type":"message","id":%q,"role":"assistant","status":"completed","content":[{"type":"output_text","text":%q}]}],"usage":{"input_tokens":2,"output_tokens":2,"total_tokens":4}}}`, response.responseID, response.messageID, response.text)
+			if err := conn.WriteMessage(websocket.TextMessage, []byte(done)); err != nil {
+				t.Error(err)
+				return
+			}
+		}
+	}))
+	defer server.Close()
+
+	registry := NewModelRegistry(t.TempDir(), NewAuthStorage(t.TempDir()))
+	registry.Auth.SetRuntime("openai-codex", codexTestJWT("acct-123"))
+	model := Model{
+		Provider: "openai-codex",
+		ID:       "gpt-5-codex",
+		API:      "openai-codex-responses",
+		BaseURL:  server.URL + "/backend-api",
+		Input:    []string{"text"},
+	}
+	first := registry.StreamChat(context.Background(), ChatRequest{
+		Model:     model,
+		Messages:  []Message{NewUserMessage("first", nil)},
+		Transport: "websocket-cached",
+		SessionID: "session-1",
+	}).Result()
+	second := registry.StreamChat(context.Background(), ChatRequest{
+		Model:     model,
+		Messages:  []Message{NewUserMessage("first", nil), first, NewUserMessage("second", nil)},
+		Transport: "websocket-cached",
+		SessionID: "session-1",
+	}).Result()
+	if MessageText(first) != "first answer" || MessageText(second) != "second answer" {
+		t.Fatalf("first=%#v second=%#v", first, second)
+	}
+	if len(requests) != 2 {
+		t.Fatalf("requests=%#v", requests)
+	}
+	if requests[0]["previous_response_id"] != nil {
+		t.Fatalf("first request should be full context: %#v", requests[0])
+	}
+	if requests[1]["previous_response_id"] != "resp_1" {
+		t.Fatalf("second request should reference previous response: %#v", requests[1])
+	}
+	input, ok := requests[1]["input"].([]any)
+	if !ok || len(input) != 1 {
+		t.Fatalf("delta input=%#v", requests[1]["input"])
+	}
+	stats, ok := GetOpenAICodexWebSocketDebugStats("session-1")
+	if !ok || stats.Requests != 2 || stats.ConnectionsCreated != 1 || stats.ConnectionsReused != 1 || stats.DeltaRequests != 1 || stats.LastPreviousResponseID != "resp_1" {
+		t.Fatalf("stats=%#v ok=%v", stats, ok)
+	}
+	if stats.LastDeltaInputItems == nil || *stats.LastDeltaInputItems != 1 {
+		t.Fatalf("last delta input items=%#v", stats.LastDeltaInputItems)
 	}
 }
 
@@ -762,6 +972,7 @@ func TestOpenAICodexResponsesSSE(t *testing.T) {
 		ThinkingLevel:  ThinkingMedium,
 		CacheRetention: "none",
 		SessionID:      "codex-session",
+		Transport:      "sse",
 		Metadata:       map[string]any{"textVerbosity": "medium"},
 	})
 	if err != nil {

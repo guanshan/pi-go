@@ -82,6 +82,8 @@ type API struct {
 	Events           *EventBus
 	shutdownHandlers []func(context.Context) error
 	eventHandlers    map[string]int
+	uiHandler        UIRequestHandler
+	uiListeners      []func(bool)
 }
 
 func NewAPI() *API {

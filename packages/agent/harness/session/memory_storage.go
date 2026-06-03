@@ -109,6 +109,10 @@ func (s *MemoryStorage) PathToRoot(ctx context.Context, leafID *string) ([]Entry
 	var path []Entry
 	seen := map[string]bool{}
 	currentID := *leafID
+	// TS getPathToRoot distinguishes a missing leaf ("not_found") from a missing
+	// parent in the chain ("invalid_session"). The first lookup is the leaf; any
+	// subsequent missing entry is a broken parent link.
+	isLeaf := true
 	for currentID != "" {
 		if seen[currentID] {
 			return nil, &SessionError{Code: "invalid_session", Msg: fmt.Sprintf("cycle detected at entry %s", currentID)}
@@ -116,8 +120,12 @@ func (s *MemoryStorage) PathToRoot(ctx context.Context, leafID *string) ([]Entry
 		seen[currentID] = true
 		entry := s.byID[currentID]
 		if entry == nil {
-			return nil, &SessionError{Code: "not_found", Msg: fmt.Sprintf("entry %s not found", currentID)}
+			if isLeaf {
+				return nil, &SessionError{Code: "not_found", Msg: fmt.Sprintf("entry %s not found", currentID)}
+			}
+			return nil, &SessionError{Code: "invalid_session", Msg: fmt.Sprintf("entry %s not found", currentID)}
 		}
+		isLeaf = false
 		path = append(path, entry)
 		parent := entry.EntryParentID()
 		if parent == nil {

@@ -28,6 +28,9 @@ type ProxyStreamOptions struct {
 	Transport       string              `json:"transport,omitempty"`
 	Metadata        map[string]any      `json:"metadata,omitempty"`
 	ThinkingBudgets *ai.ThinkingBudgets `json:"thinkingBudgets,omitempty"`
+	TimeoutMs       int                 `json:"timeoutMs,omitempty"`
+	IdleTimeoutMs   int                 `json:"idleTimeoutMs,omitempty"`
+	MaxRetries      int                 `json:"maxRetries,omitempty"`
 	MaxRetryDelayMs int                 `json:"maxRetryDelayMs,omitempty"`
 	Extra           map[string]any      `json:"-"`
 	HTTPClient      *http.Client        `json:"-"`
@@ -151,6 +154,15 @@ func buildProxyRequestOptions(options ProxyStreamOptions) map[string]any {
 	if options.ThinkingBudgets != nil {
 		out["thinkingBudgets"] = options.ThinkingBudgets
 	}
+	if options.TimeoutMs > 0 {
+		out["timeoutMs"] = options.TimeoutMs
+	}
+	if options.IdleTimeoutMs > 0 {
+		out["idleTimeoutMs"] = options.IdleTimeoutMs
+	}
+	if options.MaxRetries > 0 {
+		out["maxRetries"] = options.MaxRetries
+	}
 	if options.MaxRetryDelayMs > 0 {
 		out["maxRetryDelayMs"] = options.MaxRetryDelayMs
 	}
@@ -188,6 +200,15 @@ func mergeProxyStreamOptions(base ProxyStreamOptions, stream ai.StreamOptions) P
 	if stream.ThinkingBudgets != (ai.ThinkingBudgets{}) {
 		budgets := stream.ThinkingBudgets
 		base.ThinkingBudgets = &budgets
+	}
+	if stream.TimeoutMs > 0 {
+		base.TimeoutMs = stream.TimeoutMs
+	}
+	if stream.IdleTimeoutMs > 0 {
+		base.IdleTimeoutMs = stream.IdleTimeoutMs
+	}
+	if stream.MaxRetries > 0 {
+		base.MaxRetries = stream.MaxRetries
 	}
 	if stream.MaxRetryDelayMs > 0 {
 		base.MaxRetryDelayMs = stream.MaxRetryDelayMs

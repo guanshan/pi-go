@@ -2,7 +2,6 @@ package core
 
 import (
 	"bufio"
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -35,15 +34,11 @@ func (w *rpcWriter) writeLine(value any) {
 // make the RPC wire bytes diverge for common code payloads (HTML, `&&`,
 // `List<String>`). Scoped to the RPC output path only.
 func writeRPCJSONLine(w io.Writer, value any) error {
-	var buf bytes.Buffer
-	enc := json.NewEncoder(&buf)
-	enc.SetEscapeHTML(false)
-	if err := enc.Encode(value); err != nil {
+	raw, err := marshalJSONStringifyLine(value)
+	if err != nil {
 		return err
 	}
-	// json.Encoder.Encode already appends a trailing newline, matching the
-	// `\n` framing of TS serializeJsonLine.
-	_, err := w.Write(buf.Bytes())
+	_, err = w.Write(raw)
 	return err
 }
 
@@ -83,6 +78,80 @@ type rpcCommand struct {
 	ExcludeFromContext bool              `json:"excludeFromContext,omitempty"`
 	OutputPath         string            `json:"outputPath,omitempty"`
 	EntryID            string            `json:"entryId,omitempty"`
+	UIID               string            `json:"uiId,omitempty"`
+	Success            *bool             `json:"success,omitempty"`
+	Data               json.RawMessage   `json:"data,omitempty"`
+	Error              string            `json:"error,omitempty"`
+}
+
+type rpcUIBroker struct {
+	mu      sync.Mutex
+	nextID  uint64
+	pending map[string]chan extensionUIResult
+	writer  *rpcWriter
+}
+
+func newRPCUIBroker(writer *rpcWriter) *rpcUIBroker {
+	return &rpcUIBroker{pending: map[string]chan extensionUIResult{}, writer: writer}
+}
+
+func (b *rpcUIBroker) handle(ctx context.Context, method string, params json.RawMessage) (json.RawMessage, error) {
+	if b == nil || b.writer == nil {
+		return nil, fmt.Errorf("pi.ui.%s requires an RPC host, which is not available", method)
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	b.mu.Lock()
+	b.nextID++
+	uiID := fmt.Sprintf("ui-%d", b.nextID)
+	var ch chan extensionUIResult
+	if method != "notify" {
+		ch = make(chan extensionUIResult, 1)
+		b.pending[uiID] = ch
+	}
+	b.mu.Unlock()
+
+	payload := map[string]any{
+		"type":   "ui_request",
+		"uiId":   uiID,
+		"method": method,
+		"params": json.RawMessage(params),
+	}
+	if len(params) == 0 {
+		payload["params"] = map[string]any{}
+	}
+	b.writer.writeLine(payload)
+	if method == "notify" {
+		return json.RawMessage("null"), nil
+	}
+
+	select {
+	case result := <-ch:
+		return result.Result, result.Err
+	case <-ctx.Done():
+		b.mu.Lock()
+		delete(b.pending, uiID)
+		b.mu.Unlock()
+		return nil, ctx.Err()
+	}
+}
+
+func (b *rpcUIBroker) respond(uiID string, result json.RawMessage, err error) bool {
+	if b == nil {
+		return false
+	}
+	b.mu.Lock()
+	ch, ok := b.pending[uiID]
+	if ok {
+		delete(b.pending, uiID)
+	}
+	b.mu.Unlock()
+	if !ok {
+		return false
+	}
+	ch <- extensionUIResult{Result: result, Err: err}
+	return true
 }
 
 func RunRPC(ctx context.Context, runtime *AgentSessionRuntime, in io.Reader, out io.Writer) error {
@@ -91,37 +160,82 @@ func RunRPC(ctx context.Context, runtime *AgentSessionRuntime, in io.Reader, out
 		return err
 	}
 	w := &rpcWriter{out: out}
+	uiBroker := newRPCUIBroker(w)
+	bindRuntimeExtensionUI(runtime, uiBroker.handle)
+	defer clearRuntimeExtensionUI(runtime)
 	w.writeLine(current.Session.Header)
 	var wg sync.WaitGroup
-	scanner := bufio.NewScanner(in)
-	scanner.Buffer(make([]byte, 64*1024), 10*1024*1024)
-	for scanner.Scan() {
-		line := strings.TrimSuffix(scanner.Text(), "\r")
-		if strings.TrimSpace(line) == "" {
-			continue
-		}
+	// Use a bufio.Reader (not bufio.Scanner) so a single RPC command line larger
+	// than the previous 10MB scanner buffer cap does not abort the stream. TS
+	// reads stdin line-by-line via readline with no size limit; large pasted
+	// payloads (e.g. base64 images, big diffs) must survive intact.
+	readErr := readJSONLLines(in, func(trimmed string) {
 		var cmd rpcCommand
-		if err := json.Unmarshal([]byte(line), &cmd); err != nil {
+		if err := json.Unmarshal([]byte(trimmed), &cmd); err != nil {
 			w.response(nil, "unknown", false, nil, err.Error())
-			continue
-		}
-		if err := handleRPCCommand(ctx, runtime, cmd, w, &wg); err != nil {
+		} else if err := handleRPCCommand(ctx, runtime, cmd, w, &wg, uiBroker); err != nil {
 			w.response(cmd.ID, cmd.Type, false, nil, err.Error())
 		}
-	}
+	})
 	// Wait for any in-flight prompt goroutines to finish so their events and
 	// responses are flushed before we return / the stream closes.
 	wg.Wait()
-	return scanner.Err()
+	if readErr == io.EOF {
+		return nil
+	}
+	return readErr
 }
 
-func handleRPCCommand(ctx context.Context, runtime *AgentSessionRuntime, cmd rpcCommand, w *rpcWriter, wg *sync.WaitGroup) error {
+// readJSONLLines reads newline-framed lines from in, stripping the trailing "\n"
+// and any "\r" (CRLF) — on the EOF-partial final line as well as complete lines —
+// and invokes onLine for each non-blank line. It returns the terminating read
+// error (io.EOF on a clean end). This is the JSONL framing the RPC reader uses;
+// keeping it in one place lets tests exercise the real framing rather than a copy.
+func readJSONLLines(in io.Reader, onLine func(string)) error {
+	reader := bufio.NewReader(in)
+	for {
+		line, readErr := reader.ReadString('\n')
+		trimmed := strings.TrimSuffix(line, "\n")
+		trimmed = strings.TrimSuffix(trimmed, "\r")
+		if strings.TrimSpace(trimmed) != "" {
+			onLine(trimmed)
+		}
+		if readErr != nil {
+			return readErr
+		}
+	}
+}
+
+func handleRPCCommand(ctx context.Context, runtime *AgentSessionRuntime, cmd rpcCommand, w *rpcWriter, wg *sync.WaitGroup, uiBroker *rpcUIBroker) error {
 	agent, err := runtimeAgent(runtime)
 	if err != nil {
 		return err
 	}
 	sink := func(event ai.Event) { w.writeLine(event) }
 	switch cmd.Type {
+	case "ui_response":
+		if strings.TrimSpace(cmd.UIID) == "" {
+			return fmt.Errorf("uiId is required")
+		}
+		success := true
+		if cmd.Success != nil {
+			success = *cmd.Success
+		}
+		result := cmd.Data
+		if len(result) == 0 {
+			result = json.RawMessage("null")
+		}
+		var responseErr error
+		if !success || strings.TrimSpace(cmd.Error) != "" {
+			responseErr = fmt.Errorf("%s", firstNonEmpty(strings.TrimSpace(cmd.Error), "ui_response failed"))
+		}
+		if !uiBroker.respond(cmd.UIID, result, responseErr) {
+			return fmt.Errorf("unknown uiId: %s", cmd.UIID)
+		}
+		if cmd.ID != nil {
+			w.response(cmd.ID, "ui_response", true, nil, "")
+		}
+		return nil
 	case "prompt":
 		if cmd.Message == "" {
 			return fmt.Errorf("message is required")

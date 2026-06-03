@@ -53,13 +53,36 @@ type scriptResponseMessage struct {
 }
 
 type scriptRuntime struct {
-	path    string
-	cmd     *exec.Cmd
-	stdin   io.WriteCloser
-	scanner *bufio.Scanner
-	stderr  *syncBuffer
-	mu      sync.Mutex
-	nextID  int64
+	path   string
+	cmd    *exec.Cmd
+	stdin  io.WriteCloser
+	stderr *syncBuffer
+	nextID int64
+
+	// writeMu serializes concurrent stdin writes (each request emits one JSON
+	// line). It is held only for the duration of the write, never across the
+	// blocking wait for a response, so a slow/blocked extension never serializes
+	// unrelated requests or blocks cancellation.
+	writeMu sync.Mutex
+
+	// A single background reader goroutine (readLoop) owns the scanner and
+	// dispatches each response to the per-request channel registered in pending,
+	// keyed by request id. request() selects on {response, ctx.Done(), readDone}
+	// so a cancelled context unblocks it without depending on the extension.
+	pendingMu sync.Mutex
+	pending   map[int64]chan scriptResponseMessage
+	readDone  chan struct{}
+	readErr   error // protected by pendingMu; set once before readDone closes
+
+	// ctx is the session-scoped context; cancel tears down the runtime so the
+	// event callback and any in-flight requests stop after cancellation.
+	ctx    context.Context
+	cancel context.CancelFunc
+
+	// uiHandler resolves the host's server-initiated UI request handler at request
+	// time (so a handler bound after load — e.g. by the TUI — is still seen). nil
+	// when the host wired none.
+	uiHandler func() UIRequestHandler
 }
 
 func LoadScriptExtensions(ctx context.Context, api *API, paths []string, flagValues map[string]any) []error {
@@ -82,10 +105,14 @@ func LoadScriptExtensions(ctx context.Context, api *API, paths []string, flagVal
 }
 
 func loadScriptExtension(ctx context.Context, api *API, path string, flagValues map[string]any) error {
-	runtime, ready, err := startScriptRuntime(ctx, path, flagValues)
+	// ctx.hasUI mirrors whether a UI handler is bound (TS model). It may be bound
+	// before load (reflected in the spawn env) or after (pushed via set_has_ui).
+	runtime, ready, err := startScriptRuntime(ctx, path, flagValues, api.UIHandler() != nil, api.UIHandler)
 	if err != nil {
 		return err
 	}
+	// Forward later handler binds/unbinds so the extension's ctx.hasUI stays live.
+	api.registerUIListener(runtime.sendSetHasUI)
 	for _, flag := range ready.Flags {
 		if flag.Name == "" {
 			continue
@@ -124,7 +151,13 @@ func loadScriptExtension(ctx context.Context, api *API, path string, flagValues 
 			continue
 		}
 		api.On(event, func(payload any) {
-			result, err := runtime.Emit(context.Background(), event, payload)
+			// Use the session-scoped context (not context.Background) so that once
+			// the runtime is cancelled/shut down, the event callback declines fast
+			// instead of dispatching to a torn-down extension process.
+			if runtime.ctx.Err() != nil {
+				return
+			}
+			result, err := runtime.Emit(runtime.ctx, event, payload)
 			if err == nil {
 				applyScriptEventResult(event, payload, result)
 			}
@@ -134,21 +167,28 @@ func loadScriptExtension(ctx context.Context, api *API, path string, flagValues 
 	return nil
 }
 
-func startScriptRuntime(ctx context.Context, path string, flagValues map[string]any) (*scriptRuntime, scriptReadyMessage, error) {
+func startScriptRuntime(ctx context.Context, path string, flagValues map[string]any, hasUI bool, uiHandler func() UIRequestHandler) (*scriptRuntime, scriptReadyMessage, error) {
 	node, err := exec.LookPath("node")
 	if err != nil {
 		return nil, scriptReadyMessage{}, fmt.Errorf("%s: node executable is required to load script extensions", path)
 	}
 	cmd := exec.CommandContext(ctx, node, "--input-type=module", "--eval", scriptRuntimeBridge, "--", path)
 	cmd.Dir = filepath.Dir(path)
+	env := os.Environ()
 	// Seed extension CLI flag values before the factory runs so getFlag resolves
 	// command-line values (the host does not yet know which flags the extension
 	// declares, so it forwards all unknown flags; the bridge gates by name).
 	if len(flagValues) > 0 {
 		if encoded, err := json.Marshal(flagValues); err == nil {
-			cmd.Env = append(os.Environ(), "PI_EXTENSION_FLAG_VALUES="+string(encoded))
+			env = append(env, "PI_EXTENSION_FLAG_VALUES="+string(encoded))
 		}
 	}
+	// Tell the bridge whether the host can answer ctx.ui requests so ctx.hasUI is
+	// accurate (UI-gated extensions check it before prompting).
+	if hasUI {
+		env = append(env, "PI_EXTENSION_HAS_UI=1")
+	}
+	cmd.Env = env
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		return nil, scriptReadyMessage{}, fmt.Errorf("%s: %w", path, err)
@@ -179,7 +219,78 @@ func startScriptRuntime(ctx context.Context, path string, flagValues map[string]
 		_ = cmd.Wait()
 		return nil, scriptReadyMessage{}, fmt.Errorf("%s: %s%s", path, firstNonEmpty(ready.Error, "extension failed to load"), scriptStderrSuffix(stderr))
 	}
-	return &scriptRuntime{path: path, cmd: cmd, stdin: stdin, scanner: scanner, stderr: stderr}, ready, nil
+	// Derive a session-scoped context so cancelling the parent (or Shutdown)
+	// propagates to in-flight requests and the event callback.
+	runtimeCtx, cancel := context.WithCancel(ctx)
+	r := &scriptRuntime{
+		path:      path,
+		cmd:       cmd,
+		stdin:     stdin,
+		stderr:    stderr,
+		pending:   make(map[int64]chan scriptResponseMessage),
+		readDone:  make(chan struct{}),
+		ctx:       runtimeCtx,
+		cancel:    cancel,
+		uiHandler: uiHandler,
+	}
+	// uiHandler is set above, before the reader goroutine starts, so the
+	// readLoop-spawned handleUIRequest never races the assignment.
+	// The ready message was already consumed above; the reader goroutine takes
+	// over the scanner for all subsequent response lines.
+	go r.readLoop(scanner)
+	return r, ready, nil
+}
+
+// readLoop is the single owner of the stdout scanner. It dispatches each
+// response to the per-request channel keyed by id, and on EOF/scan error records
+// the terminal error and wakes every pending request (and future ones) so none
+// block forever on a dead process.
+func (r *scriptRuntime) readLoop(scanner *bufio.Scanner) {
+	for scanner.Scan() {
+		line := scanner.Bytes()
+		// A server-initiated UI request from the extension (ctx.ui.*) carries
+		// type:"ui_request" and a string uiId, distinct from the integer-id
+		// responses to host-initiated requests. Dispatch it on its own goroutine so
+		// a handler that blocks on interactive input never stalls this reader.
+		var probe struct {
+			Type string `json:"type"`
+			UIID string `json:"uiId"`
+		}
+		if json.Unmarshal(line, &probe) == nil && probe.Type == "ui_request" {
+			var req uiRequestMessage
+			if err := json.Unmarshal(line, &req); err != nil {
+				// Improbable (the probe parsed): reject so the extension's awaiting
+				// ctx.ui promise doesn't hang forever on a dropped request.
+				go r.writeUIResponse(uiResponseMessage{Type: "ui_response", UIID: probe.UIID, Error: "malformed ui_request"})
+			} else {
+				go r.handleUIRequest(req)
+			}
+			continue
+		}
+		var response scriptResponseMessage
+		if err := json.Unmarshal(line, &response); err != nil {
+			// A malformed line is not addressable to a request id; skip it rather
+			// than tear down the runtime (mirrors ignoring non-response chatter).
+			continue
+		}
+		r.pendingMu.Lock()
+		ch, ok := r.pending[response.ID]
+		if ok {
+			delete(r.pending, response.ID)
+		}
+		r.pendingMu.Unlock()
+		if ok {
+			ch <- response
+		}
+	}
+	loopErr := scanner.Err()
+	if loopErr == nil {
+		loopErr = io.EOF
+	}
+	r.pendingMu.Lock()
+	r.readErr = loopErr
+	close(r.readDone)
+	r.pendingMu.Unlock()
 }
 
 func (r *scriptRuntime) ExecuteTool(ctx context.Context, toolName string, raw []byte) (ai.ToolResult, error) {
@@ -262,6 +373,11 @@ func (r *scriptRuntime) Shutdown(ctx context.Context) error {
 		return nil
 	}
 	_, err := r.request(ctx, map[string]any{"type": "shutdown"})
+	// Cancel the session context so the event callback and any in-flight requests
+	// stop after shutdown, then tear down the process and reader goroutine.
+	if r.cancel != nil {
+		r.cancel()
+	}
 	_ = r.stdin.Close()
 	if r.cmd != nil && r.cmd.Process != nil {
 		_ = r.cmd.Process.Kill()
@@ -279,38 +395,84 @@ func (r *scriptRuntime) request(ctx context.Context, payload map[string]any) (sc
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	// Honor both the caller's context and the runtime's session context, so
+	// cancelling either unblocks the request.
 	if err := ctx.Err(); err != nil {
 		return scriptResponseMessage{}, err
 	}
-	r.mu.Lock()
-	defer r.mu.Unlock()
+	if r.ctx != nil {
+		if err := r.ctx.Err(); err != nil {
+			return scriptResponseMessage{}, err
+		}
+	}
+
 	id := atomic.AddInt64(&r.nextID, 1)
 	payload["id"] = id
 	line, err := json.Marshal(payload)
 	if err != nil {
 		return scriptResponseMessage{}, err
 	}
-	if _, err := r.stdin.Write(append(line, '\n')); err != nil {
-		return scriptResponseMessage{}, fmt.Errorf("%s: failed to write extension request: %w%s", r.path, err, scriptStderrSuffix(r.stderr))
+
+	// Register the response channel BEFORE writing, so a fast reply cannot race
+	// ahead of the registration. Buffered so the reader never blocks delivering.
+	respCh := make(chan scriptResponseMessage, 1)
+	r.pendingMu.Lock()
+	// If the reader already terminated, fail fast instead of blocking forever.
+	if r.readErr != nil {
+		readErr := r.readErr
+		r.pendingMu.Unlock()
+		return scriptResponseMessage{}, fmt.Errorf("%s: extension runtime stopped: %w%s", r.path, readErr, scriptStderrSuffix(r.stderr))
 	}
-	if !r.scanner.Scan() {
-		err := r.scanner.Err()
-		if err == nil {
-			err = io.EOF
+	r.pending[id] = respCh
+	r.pendingMu.Unlock()
+
+	cleanup := func() {
+		r.pendingMu.Lock()
+		delete(r.pending, id)
+		r.pendingMu.Unlock()
+	}
+
+	// Serialize only the stdin write; never hold the lock across the wait below.
+	r.writeMu.Lock()
+	_, writeErr := r.stdin.Write(append(line, '\n'))
+	r.writeMu.Unlock()
+	if writeErr != nil {
+		cleanup()
+		return scriptResponseMessage{}, fmt.Errorf("%s: failed to write extension request: %w%s", r.path, writeErr, scriptStderrSuffix(r.stderr))
+	}
+
+	rctxDone := func() <-chan struct{} {
+		if r.ctx == nil {
+			return nil
 		}
-		return scriptResponseMessage{}, fmt.Errorf("%s: extension runtime stopped: %w%s", r.path, err, scriptStderrSuffix(r.stderr))
+		return r.ctx.Done()
+	}()
+
+	select {
+	case response := <-respCh:
+		if response.ID != id {
+			return scriptResponseMessage{}, fmt.Errorf("%s: extension response id mismatch: got %d want %d", r.path, response.ID, id)
+		}
+		if !response.OK {
+			return scriptResponseMessage{}, fmt.Errorf("%s: %s%s", r.path, firstNonEmpty(response.Error, "extension request failed"), scriptStderrSuffix(r.stderr))
+		}
+		return response, nil
+	case <-ctx.Done():
+		cleanup()
+		return scriptResponseMessage{}, ctx.Err()
+	case <-rctxDone:
+		cleanup()
+		return scriptResponseMessage{}, r.ctx.Err()
+	case <-r.readDone:
+		cleanup()
+		r.pendingMu.Lock()
+		readErr := r.readErr
+		r.pendingMu.Unlock()
+		if readErr == nil {
+			readErr = io.EOF
+		}
+		return scriptResponseMessage{}, fmt.Errorf("%s: extension runtime stopped: %w%s", r.path, readErr, scriptStderrSuffix(r.stderr))
 	}
-	var response scriptResponseMessage
-	if err := json.Unmarshal(r.scanner.Bytes(), &response); err != nil {
-		return scriptResponseMessage{}, fmt.Errorf("%s: invalid extension response: %w", r.path, err)
-	}
-	if response.ID != id {
-		return scriptResponseMessage{}, fmt.Errorf("%s: extension response id mismatch: got %d want %d", r.path, response.ID, id)
-	}
-	if !response.OK {
-		return scriptResponseMessage{}, fmt.Errorf("%s: %s%s", r.path, firstNonEmpty(response.Error, "extension request failed"), scriptStderrSuffix(r.stderr))
-	}
-	return response, nil
 }
 
 // syncBuffer is a goroutine-safe bytes.Buffer wrapper. os/exec's stderr copy
@@ -391,6 +553,22 @@ for (const level of ["log", "info", "warn", "error"]) {
 
 function write(message) {
 	process.stdout.write(JSON.stringify(message) + "\n");
+}
+
+// Server-initiated UI requests (ctx.ui.*): emit a ui_request keyed by a string
+// uiId and resolve when the host writes back the matching ui_response. The uiId
+// namespace is disjoint from the integer ids the host uses for execute_* requests.
+let uiRequestSeq = 0;
+const uiPending = new Map();
+// hasUIState tracks whether the host has a UI handler bound. Seeded at spawn and
+// updated live via set_has_ui, so ctx.hasUI reflects late handler binding.
+let hasUIState = process.env.PI_EXTENSION_HAS_UI === "1";
+function sendUIRequest(method, params) {
+	return new Promise((resolve, reject) => {
+		const uiId = "ui-" + (++uiRequestSeq);
+		uiPending.set(uiId, { resolve, reject });
+		write({ type: "ui_request", uiId, method, params: params ?? {} });
+	});
 }
 
 function typeModuleSource() {
@@ -586,24 +764,27 @@ const api = {
 		on(event, handler) { return api.on(event, handler); },
 		emit() {},
 	},
+	// ctx.ui requests are routed to the host over the bridge (ui_request ->
+	// ui_response). When the host bound no handler (truly headless) the host
+	// replies with an error and these reject, so a UI-gated extension fails loudly
+	// instead of silently taking the wrong branch. Signatures mirror TS:
+	// notify(message, level), select(message, choices[]) -> choice,
+	// confirm(message, detail) -> boolean, input(message, options) -> string.
 	ui: {
-		notify(message) { console.error(String(message ?? "")); },
-		// The Go bridge runs headless: there is no interactive prompter. Reject
-		// with an explicit error instead of silently auto-answering, so a
-		// confirm-gated extension (e.g. confirm-destructive) does not quietly take
-		// the wrong branch. (TS routes these to a real prompter when a UI exists.)
-		async select() {
-			throw new Error("pi.ui.select requires interactive input, which is not available in the Go bridge (headless).");
-		},
-		async confirm() {
-			throw new Error("pi.ui.confirm requires interactive input, which is not available in the Go bridge (headless).");
+		notify(message, level) { return sendUIRequest("notify", { message: String(message ?? ""), level: level ?? "info" }).catch(() => { process.stderr.write(String(message ?? "") + "\n"); }); },
+		select(message, choices) { return sendUIRequest("select", { message: String(message ?? ""), choices: Array.isArray(choices) ? choices : [] }); },
+		confirm(message, detail) { return sendUIRequest("confirm", { message: String(message ?? ""), detail: detail == null ? "" : String(detail) }); },
+		input(message, options) { return sendUIRequest("input", { message: String(message ?? ""), options: options ?? {} }); },
+		custom() {
+			console.warn("pi.ui.custom is not supported in the Go bridge; skipping (custom overlays are unavailable).");
+			return Promise.resolve(undefined);
 		},
 	},
 };
 
 function extensionContext() {
 	return {
-		hasUI: false,
+		hasUI: hasUIState,
 		ui: api.ui,
 		sessionManager: { getBranch() { return []; } },
 	};
@@ -637,6 +818,19 @@ rl.on("line", async (line) => {
 	let request;
 		try {
 			request = JSON.parse(line);
+			if (request.type === "set_has_ui") {
+				hasUIState = request.value === true;
+				return;
+			}
+			if (request.type === "ui_response") {
+				const pending = uiPending.get(request.uiId);
+				if (pending) {
+					uiPending.delete(request.uiId);
+					if (request.ok) pending.resolve(request.result);
+					else pending.reject(new Error(request.error || "ui request failed"));
+				}
+				return;
+			}
 			if (request.type === "execute_tool") {
 				const tool = tools.get(request.toolName);
 				if (!tool) throw new Error("unknown extension tool: " + request.toolName);

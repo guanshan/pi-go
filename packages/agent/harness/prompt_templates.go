@@ -4,10 +4,10 @@ import (
 	"context"
 	"errors"
 	"path"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
-	"unicode"
 
 	harnessenv "github.com/guanshan/pi-go/packages/agent/harness/env"
 	"gopkg.in/yaml.v3"
@@ -149,12 +149,16 @@ func promptTemplateDiagnostic(code string, err error, p string) PromptTemplateDi
 	return PromptTemplateDiagnostic{Type: "warning", Code: code, Message: errorMessage(err), Path: p}
 }
 
+// ParseCommandArgs mirrors TS parseCommandArgs exactly: the input is NOT
+// trimmed, only space and tab separate arguments (not arbitrary Unicode
+// whitespace), and a token is emitted only when its accumulated text is
+// non-empty -- so a bare pair of empty quotes yields no argument, matching the
+// truthiness check "if (current) args.push(current)".
 func ParseCommandArgs(input string) []string {
 	var args []string
 	var b strings.Builder
 	var quote rune
-	inArg := false
-	for _, r := range strings.TrimSpace(input) {
+	for _, r := range input {
 		switch {
 		case quote != 0:
 			if r == quote {
@@ -162,22 +166,18 @@ func ParseCommandArgs(input string) []string {
 			} else {
 				b.WriteRune(r)
 			}
-			inArg = true
 		case r == '\'' || r == '"':
 			quote = r
-			inArg = true
-		case unicode.IsSpace(r):
-			if inArg {
+		case r == ' ' || r == '\t':
+			if b.Len() > 0 {
 				args = append(args, b.String())
 				b.Reset()
-				inArg = false
 			}
 		default:
 			b.WriteRune(r)
-			inArg = true
 		}
 	}
-	if inArg {
+	if b.Len() > 0 {
 		args = append(args, b.String())
 	}
 	return args
@@ -218,56 +218,37 @@ func replaceDollarNumber(input string, args []string) string {
 	return out.String()
 }
 
+// argSliceRe mirrors the TS regex /\$\{@:(\d+)(?::(\d+))?\}/g. Because the
+// start/length groups are \d+ (non-negative digits only), negative or
+// non-numeric forms such as ${@:-1} simply do not match and are left literal,
+// exactly as in TS.
+var argSliceRe = regexp.MustCompile(`\$\{@:(\d+)(?::(\d+))?\}`)
+
 func replaceArgSlices(input string, args []string) string {
-	var out strings.Builder
-	for i := 0; i < len(input); {
-		if !strings.HasPrefix(input[i:], "${@:") {
-			out.WriteByte(input[i])
-			i++
-			continue
-		}
-		end := strings.IndexByte(input[i:], '}')
-		if end < 0 {
-			out.WriteByte(input[i])
-			i++
-			continue
-		}
-		expr := input[i+4 : i+end]
-		parts := strings.Split(expr, ":")
-		if len(parts) < 1 || len(parts) > 2 {
-			out.WriteString(input[i : i+end+1])
-			i += end + 1
-			continue
-		}
-		start, err := strconv.Atoi(parts[0])
-		if err != nil {
-			out.WriteString(input[i : i+end+1])
-			i += end + 1
-			continue
-		}
-		start--
+	return argSliceRe.ReplaceAllStringFunc(input, func(match string) string {
+		groups := argSliceRe.FindStringSubmatch(match)
+		// groups[1] is the start (always present), groups[2] the optional length.
+		start, _ := strconv.Atoi(groups[1])
+		start-- // TS: parseInt(startStr, 10) - 1
 		if start < 0 {
 			start = 0
 		}
-		stop := len(args)
-		if len(parts) == 2 {
-			length, err := strconv.Atoi(parts[1])
-			if err != nil {
-				out.WriteString(input[i : i+end+1])
-				i += end + 1
-				continue
+		if start > len(args) {
+			start = len(args)
+		}
+		if groups[2] != "" {
+			length, _ := strconv.Atoi(groups[2])
+			stop := start + length
+			if stop < start {
+				stop = start
 			}
-			stop = start + length
 			if stop > len(args) {
 				stop = len(args)
 			}
+			return strings.Join(args[start:stop], " ")
 		}
-		if start < len(args) && start < stop {
-			out.WriteString(strings.Join(args[start:stop], " "))
-		}
-		i += end + 1
-	}
-	return out.String()
+		return strings.Join(args[start:], " ")
+	})
 }
 
 func ParseFrontmatter(content string) (map[string]any, string) {

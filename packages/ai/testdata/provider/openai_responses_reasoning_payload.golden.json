@@ -1,0 +1,29 @@
+{
+  "include": [
+    "reasoning.encrypted_content"
+  ],
+  "input": [
+    {
+      "content": "system prompt",
+      "role": "developer"
+    },
+    {
+      "content": [
+        {
+          "text": "please reason",
+          "type": "input_text"
+        }
+      ],
+      "role": "user"
+    }
+  ],
+  "max_output_tokens": 64,
+  "model": "gpt-golden",
+  "prompt_cache_key": "golden-session",
+  "reasoning": {
+    "effort": "high",
+    "summary": "auto"
+  },
+  "store": false,
+  "stream": false
+}

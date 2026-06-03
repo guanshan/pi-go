@@ -21,7 +21,6 @@ type ScopedModel struct {
 }
 
 type CreateAgentSessionOptions struct {
-	Ctx                   context.Context
 	Cwd                   string
 	AgentDir              string
 	AuthStorage           *ai.AuthStorage
@@ -45,9 +44,6 @@ type CreateAgentSessionResult struct {
 }
 
 func CreateAgentSession(ctx context.Context, options CreateAgentSessionOptions) (CreateAgentSessionResult, error) {
-	if ctx == nil {
-		ctx = options.Ctx
-	}
 	if ctx == nil {
 		ctx = context.Background()
 	}

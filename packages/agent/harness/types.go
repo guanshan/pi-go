@@ -88,6 +88,7 @@ type Resources struct {
 type StreamOptions struct {
 	Transport       string
 	TimeoutMs       int
+	IdleTimeoutMs   int
 	MaxRetries      int
 	MaxRetryDelayMs int
 	Headers         map[string]string
@@ -98,6 +99,7 @@ type StreamOptions struct {
 type StreamOptionsPatch struct {
 	Transport       *string
 	TimeoutMs       *int
+	IdleTimeoutMs   *int
 	MaxRetries      *int
 	MaxRetryDelayMs *int
 	CacheRetention  *string

@@ -14,7 +14,7 @@ func BuiltinTools(cwd string, options BuiltinToolOptions) ToolSet {
 		"edit":  EditTool{CWD: cwd},
 		"write": WriteTool{CWD: cwd},
 		"grep":  GrepTool{CWD: cwd, BinDir: options.BinDir},
-		"find":  FindTool{CWD: cwd},
+		"find":  FindTool{CWD: cwd, BinDir: options.BinDir},
 		"ls":    LsTool{CWD: cwd},
 	}
 }

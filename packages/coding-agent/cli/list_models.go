@@ -52,7 +52,9 @@ func PrintModels(w io.Writer, registry ModelLister, searchPattern string) {
 			Model:    model.ID,
 			Context:  formatTokenCount(model.ContextWindow),
 			MaxOut:   formatTokenCount(model.MaxOutput),
-			Thinking: yesNo(model.Reasoning || len(model.ThinkingLevels) > 1),
+			// TS list-models.ts uses `m.reasoning ? "yes" : "no"` — only the
+			// reasoning flag, NOT the count of thinking levels.
+			Thinking: yesNo(model.Reasoning),
 			Images:   yesNo(modelSupportsInput(model, "image")),
 		})
 	}
@@ -155,6 +157,8 @@ func fuzzyFilterModels(models []ai.Model, pattern string) []ai.Model {
 }
 
 func formatTokenCount(count int) string {
+	// Mirrors formatTokenCount in src/cli/list-models.ts: counts below 1000 (incl.
+	// 0) are rendered as the plain decimal (TS count.toString()), not "-".
 	switch {
 	case count >= 1_000_000:
 		if count%1_000_000 == 0 {
@@ -166,10 +170,8 @@ func formatTokenCount(count int) string {
 			return fmt.Sprintf("%dK", count/1_000)
 		}
 		return fmt.Sprintf("%.1fK", float64(count)/1_000)
-	case count > 0:
-		return fmt.Sprintf("%d", count)
 	default:
-		return "-"
+		return fmt.Sprintf("%d", count)
 	}
 }
 

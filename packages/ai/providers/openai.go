@@ -336,19 +336,25 @@ func ResponsesReasoningEffort(levelMap map[string]*string, level string) string 
 	return level
 }
 
-func AnthropicStopReason(reason string, hasToolCall bool) (string, string) {
+// AnthropicStopReason mirrors the TypeScript Anthropic provider's mapStopReason
+// (packages/ai/src/providers/anthropic.ts). It maps purely on the Anthropic
+// stop_reason string and does NOT rewrite end_turn/pause_turn/stop_sequence to
+// "toolUse" based on tool-call presence: the Anthropic API natively returns
+// "tool_use" when the model invokes tools, and the agent loop detects tool calls
+// from content blocks rather than the stop reason. The empty-string case is a
+// deliberate divergence — TS throws "Unhandled stop reason", but Go maps "" to
+// "stop" so that streaming message_delta events without a stop_reason do not
+// surface as errors. See docs/AI_PROVIDER_PARITY.md.
+func AnthropicStopReason(reason string) (string, string) {
 	switch reason {
 	case "", "end_turn", "pause_turn", "stop_sequence":
-		if hasToolCall {
-			return "toolUse", ""
-		}
 		return "stop", ""
 	case "max_tokens":
 		return "length", ""
 	case "tool_use":
 		return "toolUse", ""
 	case "refusal", "sensitive":
-		return "error", "Provider stop_reason: " + reason
+		return "error", ""
 	default:
 		return "error", "Unhandled stop reason: " + reason
 	}

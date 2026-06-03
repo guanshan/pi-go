@@ -63,3 +63,23 @@ func TestSanitizeAndTruncateBashOutputAboveLimitSpillsFile(t *testing.T) {
 		t.Fatalf("spilled file should contain the full sanitized output (%d vs %d)", len(onDisk), len(full))
 	}
 }
+
+// TestSanitizeBinaryOutputPreservesRealReplacementChar locks the byte-width-aware
+// behavior of the bash executor's sanitizer (the path ExecuteBash actually uses):
+// a legitimate U+FFFD (valid EF BF BD, decoded with size 3) survives, while a
+// genuinely invalid byte (decoded as utf8.RuneError with size 1) is dropped.
+// Mirrors packages/coding-agent/utils.go and packages/agent/harness/utils
+// SanitizeShellBinaryOutput. Before the fix, the rune-range loop collapsed both
+// cases to utf8.RuneError and swallowed legit replacement characters.
+func TestSanitizeBinaryOutputPreservesRealReplacementChar(t *testing.T) {
+	if got := SanitizeBinaryOutput("a�b"); got != "a�b" {
+		t.Fatalf("real U+FFFD dropped: %q", got)
+	}
+	if got := SanitizeBinaryOutput("a\xffb"); got != "ab" {
+		t.Fatalf("invalid byte not dropped: %q", got)
+	}
+	// A real U+FFFD must also survive the full bash transform (strip ANSI + CR).
+	if got := SanitizeBashOutput("x�\ry"); got != "x�y" {
+		t.Fatalf("U+FFFD lost through bash transform: %q", got)
+	}
+}

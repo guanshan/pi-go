@@ -3,10 +3,12 @@ package core
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -77,6 +79,22 @@ type modelSelectDoneMsg struct {
 	Err error
 }
 
+type interactiveExtensionUIRequestMsg struct {
+	Request *interactiveExtensionUIRequest
+}
+
+type interactiveExtensionUICancelMsg struct {
+	Request *interactiveExtensionUIRequest
+}
+
+type interactiveExtensionUIRequest struct {
+	Method   string
+	Prompt   extensionUIPrompt
+	Input    string
+	Selected int
+	Response chan extensionUIResult
+}
+
 type interactiveBusyKind string
 
 const (
@@ -117,6 +135,11 @@ type interactiveModel struct {
 	sessionUnsubscribe func()
 	commandCancel      context.CancelFunc
 	modelSelector      *modelSelectorOverlay
+	extensionUI        *interactiveExtensionUIRequest
+	extensionUIQueue   []*interactiveExtensionUIRequest
+	history            []string
+	historyIndex       int
+	sessionAgent       *AgentSession
 }
 
 // beginCommand derives a per-command child context from m.ctx and records its
@@ -206,6 +229,7 @@ func runBubbleInteractiveMode(ctx context.Context, runtime *AgentSessionRuntime,
 		tea.WithOutput(stdout),
 	)
 	model.post = program.Send
+	model.bindExtensionUIHandler()
 	_, err = program.Run()
 	if errors.Is(err, tea.ErrInterrupted) || errors.Is(err, tea.ErrProgramKilled) {
 		return nil
@@ -253,6 +277,7 @@ func newInteractiveModel(ctx context.Context, runtime *AgentSessionRuntime, init
 		initialImages: append([]ai.ContentBlock(nil), images...),
 		initialQueue:  append([]string(nil), remaining...),
 		toolSlots:     map[string]int{},
+		historyIndex:  -1,
 	}
 	model.bindSession(agent)
 	if runtime != nil {
@@ -297,6 +322,11 @@ func (m *interactiveModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmd tea.Cmd
 	switch msg := msg.(type) {
 	case tea.KeyPressMsg:
+		if m.extensionUI != nil {
+			cmd = m.handleExtensionUIKey(msg)
+			m.refreshViewport()
+			return m, cmd
+		}
 		if m.modelSelector != nil {
 			cmd = m.handleModelSelectorKey(msg.String())
 			m.refreshViewport()
@@ -339,6 +369,23 @@ func (m *interactiveModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			cmd = m.cycleModel(true)
 			m.refreshViewport()
 			return m, cmd
+		case "up":
+			// Browse prompt history when the editor is empty, or when already
+			// browsing and the cursor is on the first line (TS editor.ts cursorUp).
+			if m.editorEmpty() || (m.historyIndex > -1 && m.editorOnFirstLine()) {
+				m.navigateHistory(-1)
+				m.refreshViewport()
+				return m, nil
+			}
+		case "down":
+			// Continue browsing history forward only while already browsing and on
+			// the last line (TS editor.ts cursorDown); otherwise fall through to the
+			// textarea so the cursor moves normally.
+			if m.historyIndex > -1 && m.editorOnLastLine() {
+				m.navigateHistory(1)
+				m.refreshViewport()
+				return m, nil
+			}
 		case "tab":
 			if m.completeSlashCommand() {
 				m.refreshViewport()
@@ -448,8 +495,24 @@ func (m *interactiveModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.refreshViewport()
 		return m, nil
+	case interactiveExtensionUIRequestMsg:
+		m.enqueueExtensionUIRequest(msg.Request)
+		m.refreshViewport()
+		return m, nil
+	case interactiveExtensionUICancelMsg:
+		m.cancelExtensionUIRequest(msg.Request)
+		m.refreshViewport()
+		return m, nil
 	}
+	// Forward to the textarea. If the input text actually changed (an edit — a
+	// keypress, a paste, etc., but not a pure cursor move), exit history browsing,
+	// mirroring TS editor.ts which resets historyIndex on edits. The history
+	// Up/Down branches return earlier, so their SetValue never reaches here.
+	before := m.input.Value()
 	m.input, cmd = m.input.Update(msg)
+	if m.input.Value() != before {
+		m.historyIndex = -1
+	}
 	m.refreshViewport()
 	return m, cmd
 }
@@ -465,6 +528,197 @@ func (m *interactiveModel) popInitialQueue() (string, bool) {
 	return "", false
 }
 
+func (m *interactiveModel) extensionUIHandler(ctx context.Context, method string, params json.RawMessage) (json.RawMessage, error) {
+	if m == nil || m.post == nil {
+		return nil, fmt.Errorf("pi.ui.%s requires an interactive TUI host, which is not available", method)
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	req := &interactiveExtensionUIRequest{
+		Method:   method,
+		Prompt:   parseExtensionUIPrompt(method, params),
+		Response: make(chan extensionUIResult, 1),
+	}
+	if method == "input" {
+		req.Input = req.Prompt.DefaultValue
+	}
+	m.post(interactiveExtensionUIRequestMsg{Request: req})
+	select {
+	case result := <-req.Response:
+		return result.Result, result.Err
+	case <-ctx.Done():
+		m.post(interactiveExtensionUICancelMsg{Request: req})
+		return nil, ctx.Err()
+	case <-m.ctx.Done():
+		m.post(interactiveExtensionUICancelMsg{Request: req})
+		return nil, m.ctx.Err()
+	}
+}
+
+func (r *interactiveExtensionUIRequest) respond(result json.RawMessage, err error) {
+	if r == nil || r.Response == nil {
+		return
+	}
+	r.Response <- extensionUIResult{Result: result, Err: err}
+}
+
+func (m *interactiveModel) enqueueExtensionUIRequest(req *interactiveExtensionUIRequest) {
+	if req == nil {
+		return
+	}
+	switch req.Method {
+	case "notify":
+		level := firstNonEmpty(req.Prompt.Level, "info")
+		m.appendMessage(interactiveRoleSystem, fmt.Sprintf("[%s] %s", level, req.Prompt.Message))
+		req.respond(json.RawMessage("null"), nil)
+	case "confirm", "select", "input":
+		if req.Method == "select" && len(req.Prompt.Choices) == 0 {
+			req.respond(nil, fmt.Errorf("pi.ui.select requires at least one choice"))
+			return
+		}
+		if m.extensionUI == nil {
+			m.extensionUI = req
+		} else {
+			m.extensionUIQueue = append(m.extensionUIQueue, req)
+		}
+	default:
+		req.respond(nil, fmt.Errorf("pi.ui.%s is not supported in this host", req.Method))
+	}
+}
+
+func (m *interactiveModel) finishExtensionUI(result json.RawMessage, err error) {
+	req := m.extensionUI
+	if req == nil {
+		return
+	}
+	m.extensionUI = nil
+	req.respond(result, err)
+	for m.extensionUI == nil && len(m.extensionUIQueue) > 0 {
+		next := m.extensionUIQueue[0]
+		copy(m.extensionUIQueue, m.extensionUIQueue[1:])
+		m.extensionUIQueue[len(m.extensionUIQueue)-1] = nil
+		m.extensionUIQueue = m.extensionUIQueue[:len(m.extensionUIQueue)-1]
+		m.enqueueExtensionUIRequest(next)
+	}
+}
+
+func (m *interactiveModel) cancelExtensionUIRequest(req *interactiveExtensionUIRequest) {
+	if req == nil {
+		return
+	}
+	if m.extensionUI == req {
+		m.extensionUI = nil
+		for m.extensionUI == nil && len(m.extensionUIQueue) > 0 {
+			next := m.extensionUIQueue[0]
+			copy(m.extensionUIQueue, m.extensionUIQueue[1:])
+			m.extensionUIQueue[len(m.extensionUIQueue)-1] = nil
+			m.extensionUIQueue = m.extensionUIQueue[:len(m.extensionUIQueue)-1]
+			m.enqueueExtensionUIRequest(next)
+		}
+		return
+	}
+	for i, queued := range m.extensionUIQueue {
+		if queued == req {
+			copy(m.extensionUIQueue[i:], m.extensionUIQueue[i+1:])
+			m.extensionUIQueue[len(m.extensionUIQueue)-1] = nil
+			m.extensionUIQueue = m.extensionUIQueue[:len(m.extensionUIQueue)-1]
+			return
+		}
+	}
+}
+
+func (m *interactiveModel) handleExtensionUIKey(msg tea.KeyPressMsg) tea.Cmd {
+	req := m.extensionUI
+	if req == nil {
+		return nil
+	}
+	key := msg.String()
+	switch req.Method {
+	case "confirm":
+		switch strings.ToLower(key) {
+		case "y", "yes":
+			m.finishExtensionUI(json.RawMessage("true"), nil)
+		case "n", "no", "enter", "esc", "ctrl+c":
+			m.finishExtensionUI(json.RawMessage("false"), nil)
+		}
+	case "select":
+		switch key {
+		case "up":
+			if req.Selected > 0 {
+				req.Selected--
+			}
+		case "down":
+			if req.Selected < len(req.Prompt.Choices)-1 {
+				req.Selected++
+			}
+		case "enter":
+			m.finishExtensionUI(req.Prompt.Choices[req.Selected].Raw, nil)
+		case "esc", "ctrl+c":
+			m.finishExtensionUI(json.RawMessage("null"), nil)
+		default:
+			if len(key) == 1 && key[0] >= '1' && key[0] <= '9' {
+				index := int(key[0] - '1')
+				if index >= 0 && index < len(req.Prompt.Choices) {
+					req.Selected = index
+					m.finishExtensionUI(req.Prompt.Choices[index].Raw, nil)
+				}
+			}
+		}
+	case "input":
+		switch key {
+		case "enter":
+			result, err := extensionUIJSON(req.Input)
+			m.finishExtensionUI(result, err)
+		case "esc", "ctrl+c":
+			m.finishExtensionUI(json.RawMessage("null"), nil)
+		case "backspace":
+			if req.Input != "" {
+				runes := []rune(req.Input)
+				req.Input = string(runes[:len(runes)-1])
+			}
+		default:
+			if text := msg.Key().Text; text != "" {
+				req.Input += text
+			}
+		}
+	}
+	return nil
+}
+
+func (m *interactiveModel) renderExtensionUI(width int) []string {
+	req := m.extensionUI
+	if req == nil {
+		return nil
+	}
+	lineWidth := max(1, width-2)
+	lines := []string{
+		interactiveSystemStyle.Render("ctx.ui."+req.Method) + " " + tui.TruncateToWidth(req.Prompt.Message, lineWidth, "..."),
+	}
+	if req.Prompt.Detail != "" {
+		lines = append(lines, interactiveFooterStyle.Render(tui.TruncateToWidth(req.Prompt.Detail, lineWidth, "...")))
+	}
+	switch req.Method {
+	case "confirm":
+		lines = append(lines, interactiveSuggestionStyle.Render("  y = yes    n/enter/esc = no"))
+	case "select":
+		for i, choice := range req.Prompt.Choices {
+			marker := "  "
+			if i == req.Selected {
+				marker = "> "
+			}
+			lines = append(lines, interactiveSuggestionStyle.Render(tui.TruncateToWidth(fmt.Sprintf("%s%d. %s", marker, i+1, choice.Label), lineWidth, "...")))
+		}
+	case "input":
+		value := req.Input
+		if value == "" {
+			value = req.Prompt.Placeholder
+		}
+		lines = append(lines, interactiveInputStyle.Width(lineWidth).Render("> "+value))
+	}
+	return lines
+}
+
 func (m *interactiveModel) View() tea.View {
 	width := max(1, m.width)
 	header := interactiveHeaderStyle.Render(m.header())
@@ -476,6 +730,8 @@ func (m *interactiveModel) View() tea.View {
 		// region (and suggestions), mirroring TS showModelSelector swapping the
 		// editor container for the selector component. Header/body/footer stay.
 		parts = append(parts, m.modelSelector.Render(width)...)
+	} else if m.extensionUI != nil {
+		parts = append(parts, m.renderExtensionUI(width)...)
 	} else {
 		if suggestions := m.renderSuggestions(); suggestions != "" {
 			parts = append(parts, suggestions)
@@ -490,12 +746,60 @@ func (m *interactiveModel) View() tea.View {
 	return view
 }
 
+// addToHistory records a submitted prompt for Up/Down browsing, mirroring TS
+// editor.ts addToHistory: skip empty, skip a consecutive duplicate of the most
+// recent entry, prepend (most-recent-first), and cap at 100 entries.
+func (m *interactiveModel) addToHistory(text string) {
+	trimmed := strings.TrimSpace(text)
+	if trimmed == "" {
+		return
+	}
+	if len(m.history) > 0 && m.history[0] == trimmed {
+		return
+	}
+	m.history = append([]string{trimmed}, m.history...)
+	if len(m.history) > 100 {
+		m.history = m.history[:100]
+	}
+}
+
+// navigateHistory browses prompt history (direction -1 = older/Up, +1 =
+// newer/Down), mirroring TS editor.ts navigateHistory. historyIndex -1 means not
+// browsing; 0 is the most recent entry. Reaching index -1 again restores an
+// empty editor.
+func (m *interactiveModel) navigateHistory(direction int) {
+	if len(m.history) == 0 {
+		return
+	}
+	newIndex := m.historyIndex - direction
+	if newIndex < -1 || newIndex >= len(m.history) {
+		return
+	}
+	m.historyIndex = newIndex
+	if m.historyIndex == -1 {
+		m.input.SetValue("")
+	} else {
+		m.input.SetValue(m.history[m.historyIndex])
+	}
+	m.input.MoveToEnd()
+}
+
+// editorEmpty reports whether the input is empty; editorOnFirstLine /
+// editorOnLastLine report cursor position by logical line (the Go textarea has no
+// visual-line API, so wrapped lines are treated as their logical line — a small
+// divergence from TS isOnFirstVisualLine/isOnLastVisualLine).
+func (m *interactiveModel) editorEmpty() bool       { return m.input.Value() == "" }
+func (m *interactiveModel) editorOnFirstLine() bool { return m.input.Line() == 0 }
+func (m *interactiveModel) editorOnLastLine() bool  { return m.input.Line() == m.input.LineCount()-1 }
+
 func (m *interactiveModel) submitInputWithBehavior(behavior StreamingBehavior) tea.Cmd {
 	raw := m.input.Value()
 	text := strings.TrimSpace(raw)
 	if text == "" {
 		return nil
 	}
+	m.addToHistory(raw)
+	m.historyIndex = -1
 	m.input.Reset()
 	m.autoScroll = true
 	if !m.busy && text == "/model" {
@@ -778,12 +1082,16 @@ func (m *interactiveModel) refreshViewport() {
 	}
 	inputWidth := max(1, width-4)
 	m.input.SetWidth(inputWidth)
-	inputHeight := lipgloss.Height(m.input.View()) + 2
+	controlHeight := lipgloss.Height(m.input.View()) + 2
 	suggestionHeight := 0
-	if m.renderSuggestions() != "" {
+	if m.modelSelector != nil {
+		controlHeight = len(m.modelSelector.Render(width))
+	} else if m.extensionUI != nil {
+		controlHeight = len(m.renderExtensionUI(width))
+	} else if m.renderSuggestions() != "" {
 		suggestionHeight = 1
 	}
-	bodyHeight := height - inputHeight - suggestionHeight - 3
+	bodyHeight := height - controlHeight - suggestionHeight - 3
 	if bodyHeight < 1 {
 		bodyHeight = 1
 	}
@@ -904,8 +1212,137 @@ func (m *interactiveModel) completeSlashCommand() bool {
 	if len(suggestions) == 0 {
 		return false
 	}
-	m.input.SetValue(suggestions[0] + " ")
+	value := m.input.Value()
+	first := suggestions[0]
+	if _, start, ok := trailingFileRefToken(value); ok {
+		// Replace just the trailing @token. A directory completion ends with "/"
+		// so the user can keep descending without a separating space.
+		completed := value[:start] + first
+		if !strings.HasSuffix(first, "/") {
+			completed += " "
+		}
+		m.input.SetValue(completed)
+		m.input.MoveToEnd()
+		return true
+	}
+	m.input.SetValue(first + " ")
+	m.input.MoveToEnd()
 	return true
+}
+
+// trailingFileRefToken returns the final whitespace-delimited token of value, the
+// byte index where it starts, and whether it is a file-reference token (begins
+// with "@"). Used for @-attachment autocomplete.
+func trailingFileRefToken(value string) (token string, start int, ok bool) {
+	// An open @"..." quote lets a file reference contain spaces, so the token runs
+	// from that @ to end-of-input rather than from the last whitespace (mirrors TS
+	// findUnclosedQuoteStart/extractQuotedPrefix).
+	if at := unclosedAtQuoteStart(value); at >= 0 {
+		return value[at:], at, true
+	}
+	start = strings.LastIndexAny(value, " \t\r\n") + 1
+	token = value[start:]
+	return token, start, strings.HasPrefix(token, "@")
+}
+
+// unclosedAtQuoteStart returns the index of an '@' that opens an unclosed @"..."
+// quote at a token boundary, or -1. Only @-prefixed quotes qualify (a bare
+// unclosed quote is not a file reference).
+func unclosedAtQuoteStart(value string) int {
+	inQuotes := false
+	quoteIdx := -1
+	for i := 0; i < len(value); i++ {
+		if value[i] == '"' {
+			inQuotes = !inQuotes
+			if inQuotes {
+				quoteIdx = i
+			}
+		}
+	}
+	if !inQuotes || quoteIdx <= 0 || value[quoteIdx-1] != '@' {
+		return -1
+	}
+	at := quoteIdx - 1
+	if at == 0 || strings.ContainsRune(" \t\r\n", rune(value[at-1])) {
+		return at
+	}
+	return -1
+}
+
+// fileReferenceSuggestions lists files/directories under cwd that complete the
+// given "@<partial>" token, returning full replacement values like "@src/" or
+// "@main.go" (mirrors the TS @-attachment provider: directories get a trailing
+// slash, values with spaces are quoted as @"...", hidden entries are shown only
+// when explicitly typed).
+func fileReferenceSuggestions(token, cwd string) []string {
+	rawPrefix := strings.TrimPrefix(token, "@")
+	quoted := false
+	if strings.HasPrefix(rawPrefix, "\"") {
+		quoted = true
+		rawPrefix = rawPrefix[1:]
+	}
+	absolute := strings.HasPrefix(rawPrefix, "/")
+	var dir, base string
+	if slash := strings.LastIndex(rawPrefix, "/"); slash >= 0 {
+		dir, base = rawPrefix[:slash], rawPrefix[slash+1:]
+		if dir == "" {
+			dir = "/" // "@/abc" -> list the filesystem root, not cwd
+		}
+	} else {
+		dir, base = ".", rawPrefix
+	}
+	// An absolute prefix is read from the filesystem directly; a relative one is
+	// resolved against the session cwd (mirrors TS getFileSuggestions, which keys
+	// off expandedPrefix.startsWith("/")).
+	readDir := dir
+	if !absolute {
+		readDir = filepath.Join(cwd, dir)
+	}
+	entries, err := os.ReadDir(readDir)
+	if err != nil {
+		return nil
+	}
+	matches := make([]string, 0, 8)
+	for _, entry := range entries {
+		name := entry.Name()
+		// Hide dotfiles only at the bare top level (a plain "@" with no path and no
+		// dot typed) to avoid .git/node_modules noise; once the user descends into a
+		// directory or types a leading dot, surface hidden entries like TS fd --hidden.
+		if strings.HasPrefix(name, ".") && dir == "." && !strings.HasPrefix(base, ".") {
+			continue
+		}
+		if base != "" && !strings.HasPrefix(name, base) {
+			continue
+		}
+		var rel string
+		switch {
+		case dir == "/":
+			rel = "/" + name
+		case dir != ".":
+			rel = strings.TrimSuffix(dir, "/") + "/" + name
+		default:
+			rel = name
+		}
+		if entry.IsDir() {
+			rel += "/"
+		}
+		matches = append(matches, buildFileRefCompletion(rel, quoted))
+	}
+	sort.Strings(matches)
+	if len(matches) > 8 {
+		matches = matches[:8]
+	}
+	return matches
+}
+
+// buildFileRefCompletion wraps a path as an "@"-prefixed completion value,
+// quoting it as @"..." when the original token was quoted or the path contains a
+// space (mirrors TS buildCompletionValue).
+func buildFileRefCompletion(path string, quoted bool) string {
+	if quoted || strings.Contains(path, " ") {
+		return "@\"" + path + "\""
+	}
+	return "@" + path
 }
 
 func slashCommandSuggestions(input string) []string {
@@ -918,6 +1355,17 @@ func (m *interactiveModel) currentSuggestions() []string {
 }
 
 func interactiveSuggestions(input string, agent *AgentSession) []string {
+	// A trailing "@<partial>" token requests file-reference completion against the
+	// session cwd (mirrors the TS @-attachment autocomplete), and may appear after
+	// any text, including a slash command's arguments.
+	if token, _, ok := trailingFileRefToken(input); ok {
+		if agent != nil {
+			if cwd := agent.Session.CWD(); cwd != "" {
+				return fileReferenceSuggestions(token, cwd)
+			}
+		}
+		return nil
+	}
 	raw := strings.TrimLeft(input, " \t\r\n")
 	text := strings.TrimSpace(input)
 	if strings.HasPrefix(raw, "/model ") {
@@ -1179,16 +1627,29 @@ func (m *interactiveModel) bindSession(agent *AgentSession) {
 	if agent == nil {
 		return
 	}
+	m.sessionAgent = agent
 	m.sessionUnsubscribe = agent.Subscribe(func(event SessionEvent) {
 		if m.post != nil {
 			m.post(interactiveSessionEventMsg{Event: event})
 		}
 	})
+	m.bindExtensionUIHandler()
 }
 
 func (m *interactiveModel) unbindSession() {
+	if m.sessionAgent != nil {
+		m.sessionAgent.SetExtensionUIHandler(nil)
+		m.sessionAgent = nil
+	}
 	if m.sessionUnsubscribe != nil {
 		m.sessionUnsubscribe()
 		m.sessionUnsubscribe = nil
 	}
+}
+
+func (m *interactiveModel) bindExtensionUIHandler() {
+	if m == nil || m.sessionAgent == nil || m.post == nil {
+		return
+	}
+	m.sessionAgent.SetExtensionUIHandler(m.extensionUIHandler)
 }

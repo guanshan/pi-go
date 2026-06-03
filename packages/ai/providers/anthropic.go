@@ -363,7 +363,7 @@ func ParseAnthropicMessage(resp *anthropic.Message, isOAuth bool, tools []map[st
 			calls = append(calls, AnthropicToolCall{ID: id, Name: name, Arguments: args})
 		}
 	}
-	stop, errorMessage := AnthropicStopReason(string(resp.StopReason), len(calls) > 0)
+	stop, errorMessage := AnthropicStopReason(string(resp.StopReason))
 	return AnthropicParsed{
 		Blocks:       blocks,
 		ToolCalls:    calls,

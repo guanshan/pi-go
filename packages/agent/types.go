@@ -169,6 +169,9 @@ type AgentLoopConfig struct {
 	SessionID        string
 	Transport        string
 	ThinkingBudgets  *ai.ThinkingBudgets
+	TimeoutMs        int
+	IdleTimeoutMs    int
+	MaxRetries       int
 	MaxRetryDelayMs  int
 	ConvertToLLM     ConvertToLLMFunc
 	TransformContext TransformContextFunc
@@ -210,6 +213,9 @@ type AgentOptions struct {
 	SessionID       string
 	ThinkingBudgets *ai.ThinkingBudgets
 	Transport       string
+	TimeoutMs       int
+	IdleTimeoutMs   int
+	MaxRetries      int
 	MaxRetryDelayMs int
 	OnPayload       func(payload any, model ai.Model) (any, error)
 	OnResponse      func(resp ai.ProviderResponse, model ai.Model) error

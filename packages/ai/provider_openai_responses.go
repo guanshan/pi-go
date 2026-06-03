@@ -26,6 +26,23 @@ func (r *ModelRegistry) openAIResponsesChat(ctx context.Context, req ChatRequest
 	if err != nil {
 		return ChatResponse{}, err
 	}
+	var fallbackDiagnostics []AssistantMessageDiagnostic
+	if shouldTryOpenAICodexWebSocket(req) {
+		partial := NewAssistantMessageForModel(req.Model, nil, Usage{}, "stop")
+		message, started, err := r.runOpenAICodexWebSocket(ctx, req, key, body, partial, nil)
+		if err == nil {
+			return ChatResponse{Message: message, ToolCalls: toolCallsFromMessage(message)}, nil
+		}
+		if started || isOpenAICodexNonTransportError(err) {
+			return ChatResponse{}, err
+		}
+		appendOpenAICodexWebSocketFailureDiagnostic(&partial, req, err, started, body)
+		recordOpenAICodexWebSocketFailure(req.SessionID, err)
+		recordOpenAICodexWebSocketSSEFallback(req.SessionID)
+		fallbackDiagnostics = append(fallbackDiagnostics, partial.Diagnostics...)
+	} else if req.Model.API == "openai-codex-responses" && req.Transport != "sse" && openAICodexWebSocketSSEFallbackActive(req.SessionID) {
+		recordOpenAICodexWebSocketSSEFallback(req.SessionID)
+	}
 	if raw, usedSDK, err := doOpenAIResponsesSDK(ctx, req, key, headers, body); usedSDK {
 		if err != nil {
 			return ChatResponse{}, err
@@ -36,7 +53,7 @@ func (r *ModelRegistry) openAIResponsesChat(ctx context.Context, req ChatRequest
 		}
 		parsed = openAIResponsesParsedWithRequestDefaults(parsed, req)
 		response := openAIResponsesChatResponse(parsed, req.Model)
-		applyOpenAICodexSSEFallbackDiagnostic(&response.Message, req)
+		response.Message.Diagnostics = append(fallbackDiagnostics, response.Message.Diagnostics...)
 		return response, nil
 	}
 	bearerAuth := req.Model.API == "openai-responses" && req.Model.Provider != "cloudflare-ai-gateway"
@@ -50,7 +67,7 @@ func (r *ModelRegistry) openAIResponsesChat(ctx context.Context, req ChatRequest
 	}
 	parsed = openAIResponsesParsedWithRequestDefaults(parsed, req)
 	response := openAIResponsesChatResponse(parsed, req.Model)
-	applyOpenAICodexSSEFallbackDiagnostic(&response.Message, req)
+	response.Message.Diagnostics = append(fallbackDiagnostics, response.Message.Diagnostics...)
 	return response, nil
 }
 
@@ -80,31 +97,6 @@ func validateOpenAICodexResponsesTransport(req ChatRequest) error {
 	default:
 		return fmt.Errorf("unsupported openai-codex-responses transport %q; expected \"sse\", \"websocket\", \"websocket-cached\", or \"auto\"", req.Transport)
 	}
-}
-
-func applyOpenAICodexSSEFallbackDiagnostic(message *AssistantMessage, req ChatRequest) {
-	if message == nil || req.Model.API != "openai-codex-responses" {
-		return
-	}
-	if req.Transport != "" && req.Transport != "auto" && req.Transport != "websocket" && req.Transport != "websocket-cached" {
-		return
-	}
-	transport := req.Transport
-	if transport == "" {
-		transport = "auto"
-	}
-	reason := "websocket transport is not implemented in the Go provider"
-	if transport == "websocket" || transport == "websocket-cached" {
-		reason = "configured websocket transport fell back to SSE in the Go provider"
-	}
-	message.Diagnostics = append(message.Diagnostics, AssistantMessageDiagnostic{
-		Type: "provider_transport_fallback",
-		Details: map[string]any{
-			"configuredTransport": transport,
-			"fallbackTransport":   "sse",
-			"reason":              reason,
-		},
-	})
 }
 
 func openAIResponsesRequestOptions(req ChatRequest) aiproviders.OpenAIResponsesRequestOptions {

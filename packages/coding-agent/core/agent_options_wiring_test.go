@@ -11,7 +11,7 @@ import (
 // capturingFauxProvider overrides the builtin "faux" API provider so the test
 // can inspect the ChatRequest the agent loop hands to the provider. The agent
 // builds the ChatRequest from the AgentOptions (SessionID/Transport/
-// ThinkingBudgets/MaxRetryDelayMs) populated in newLoopAgent, so capturing it
+// ThinkingBudgets/provider timeout and retry settings) populated in newLoopAgent, so capturing it
 // proves those fields are actually wired through.
 type capturingFauxProvider struct {
 	mu       sync.Mutex
@@ -48,10 +48,10 @@ func (p *capturingFauxProvider) StreamSimple(ctx context.Context, r *ai.ModelReg
 
 // TestNewLoopAgentWiresSessionAndProviderSettings is the parity guard for
 // finding P1-A1 / P1-1: coding-agent must forward SessionID, Transport,
-// ThinkingBudgets and MaxRetryDelayMs into the agent (mirrors sdk.ts:383,
-// 391-393). Before the fix these were never populated, so the prompt-cache
-// key, session-affinity header, transport selection and provider retry-delay
-// cap silently had no effect.
+// ThinkingBudgets and provider timeout/retry controls into the agent (mirrors
+// sdk.ts:383,391-393). Before the fix these were never populated, so the
+// prompt-cache key, session-affinity header, transport selection and provider
+// retry behavior silently had no effect.
 func TestNewLoopAgentWiresSessionAndProviderSettings(t *testing.T) {
 	capture := &capturingFauxProvider{}
 	ai.RegisterProvider(capture, "test-capturing-faux")
@@ -64,9 +64,11 @@ func TestNewLoopAgentWiresSessionAndProviderSettings(t *testing.T) {
 		Global: Settings{
 			Transport:       "sse",
 			ThinkingBudgets: ThinkingBudgets{Minimal: 111, Low: 222, Medium: 333, High: 444},
-			Retry:           RetryConfig{Provider: ProviderRetryConfig{MaxRetryDelayMS: 12345}},
+			Retry:           RetryConfig{Provider: ProviderRetryConfig{TimeoutMS: 2345, MaxRetries: 6, MaxRetryDelayMS: 12345}},
 		},
 	}
+	idle := HTTPIdleTimeoutSetting(45678)
+	settings.Global.HTTPIdleTimeoutMS = &idle
 
 	auth := ai.NewAuthStorage(settings.AgentDir)
 	registry := ai.NewModelRegistry(settings.AgentDir, auth)
@@ -94,6 +96,15 @@ func TestNewLoopAgentWiresSessionAndProviderSettings(t *testing.T) {
 	}
 	if req.Transport != "sse" {
 		t.Fatalf("Transport=%q, want sse", req.Transport)
+	}
+	if req.TimeoutMs != 2345 {
+		t.Fatalf("TimeoutMs=%d, want 2345", req.TimeoutMs)
+	}
+	if req.IdleTimeoutMs != 45678 {
+		t.Fatalf("IdleTimeoutMs=%d, want 45678", req.IdleTimeoutMs)
+	}
+	if req.MaxRetries != 6 {
+		t.Fatalf("MaxRetries=%d, want 6", req.MaxRetries)
 	}
 	if req.MaxRetryDelayMs != 12345 {
 		t.Fatalf("MaxRetryDelayMs=%d, want 12345", req.MaxRetryDelayMs)

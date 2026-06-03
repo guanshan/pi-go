@@ -3,34 +3,122 @@ package ai
 import (
 	"context"
 	"encoding/json"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 )
 
-type fauxAPIProvider struct{}
+// fauxAPIProvider is a deterministic test provider. Each instance carries its
+// own scripted-response queue and call counter, so multiple registrations (and
+// t.Parallel subtests using RegisterFauxProvider) never share state. The
+// process-wide default instance (defaultFauxProvider, API "faux") backs the
+// package-level Set/Append/Reset shims for serial tests. Because the struct now
+// embeds a mutex, every method uses a pointer receiver.
+type fauxAPIProvider struct {
+	api       string
+	mu        sync.Mutex
+	responses []FauxResponse
+	callCount int
+}
+
+// NewFauxProvider returns a fresh faux provider instance with its own scripted
+// state. An empty api defaults to "faux".
+func NewFauxProvider(api string) *fauxAPIProvider {
+	if api == "" {
+		api = "faux"
+	}
+	return &fauxAPIProvider{api: api}
+}
+
+// defaultFauxProvider is the process-wide instance registered as the builtin
+// "faux" provider; the package-level shims drive its queue.
+var defaultFauxProvider = NewFauxProvider("faux")
 
 func registerFauxProvider() {
-	registerBuiltinProvider(fauxAPIProvider{})
+	registerBuiltinProvider(defaultFauxProvider)
 }
 
-func (fauxAPIProvider) API() string { return "faux" }
+func (p *fauxAPIProvider) API() string { return p.api }
 
-func (fauxAPIProvider) complete(_ context.Context, _ *ModelRegistry, req ChatRequest) (ChatResponse, error) {
-	return fauxChat(req), nil
+func (p *fauxAPIProvider) complete(_ context.Context, _ *ModelRegistry, req ChatRequest) (ChatResponse, error) {
+	return p.fauxChat(req), nil
 }
 
-func (p fauxAPIProvider) Complete(ctx context.Context, r *ModelRegistry, req ChatRequest) (ChatResponse, error) {
+func (p *fauxAPIProvider) Complete(ctx context.Context, r *ModelRegistry, req ChatRequest) (ChatResponse, error) {
 	return p.complete(ctx, r, req)
 }
 
-func (p fauxAPIProvider) Stream(ctx context.Context, _ *ModelRegistry, req ChatRequest) *AssistantMessageEventStream {
+func (p *fauxAPIProvider) Stream(ctx context.Context, _ *ModelRegistry, req ChatRequest) *AssistantMessageEventStream {
 	return streamChatResponse(ctx, func(context.Context) (ChatResponse, error) {
 		return p.complete(ctx, nil, req)
 	})
 }
 
-func (p fauxAPIProvider) StreamSimple(ctx context.Context, r *ModelRegistry, req ChatRequest) *AssistantMessageEventStream {
+func (p *fauxAPIProvider) StreamSimple(ctx context.Context, r *ModelRegistry, req ChatRequest) *AssistantMessageEventStream {
 	return p.Stream(ctx, r, req)
+}
+
+// SetResponses replaces this instance's scripted queue. Responses are consumed
+// in order across successive Complete/Stream calls.
+func (p *fauxAPIProvider) SetResponses(responses []FauxResponse) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.responses = append(p.responses[:0:0], responses...)
+}
+
+// AppendResponses appends to this instance's scripted queue.
+func (p *fauxAPIProvider) AppendResponses(responses []FauxResponse) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.responses = append(p.responses, responses...)
+}
+
+// ResetResponses clears this instance's scripted queue and call counter,
+// restoring the legacy echo behaviour.
+func (p *fauxAPIProvider) ResetResponses() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.responses = nil
+	p.callCount = 0
+}
+
+// PendingResponseCount reports how many scripted responses remain queued on this
+// instance.
+func (p *fauxAPIProvider) PendingResponseCount() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return len(p.responses)
+}
+
+// CallCount reports how many times this instance has been invoked since the last
+// ResetResponses.
+func (p *fauxAPIProvider) CallCount() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.callCount
+}
+
+// next pops the next scripted response, reporting whether the queue was active.
+// It always increments the call counter.
+func (p *fauxAPIProvider) next() (FauxResponse, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.callCount++
+	if len(p.responses) == 0 {
+		return FauxResponse{}, false
+	}
+	next := p.responses[0]
+	p.responses = p.responses[1:]
+	return next, true
+}
+
+func (p *fauxAPIProvider) fauxChat(req ChatRequest) ChatResponse {
+	scripted, ok := p.next()
+	if ok {
+		return fauxScriptedResponse(req, scripted)
+	}
+	return fauxEchoResponse(req)
 }
 
 // FauxResponse scripts a single faux-provider turn. It can express assistant
@@ -98,72 +186,82 @@ func NewFauxText(text string) FauxResponse {
 	return FauxResponse{Content: []ContentBlock{FauxText(text)}}
 }
 
-var (
-	fauxMu        sync.Mutex
-	fauxResponses []FauxResponse
-	fauxCallCount int
-)
+// The package-level Set/Append/Reset/Pending/FauxCallCount functions are thin
+// shims over the shared default faux instance (defaultFauxProvider). They exist
+// for serial tests that script the builtin "faux" provider without a registry
+// handle, isolated with `defer ResetFauxResponses()`. Tests needing concurrency
+// safety (t.Parallel, or multiple independent scripts in one process) should use
+// RegisterFauxProvider, which mints a private instance under a unique API.
 
-// SetFauxResponses replaces the scripted faux-provider response queue. Responses
-// are consumed in order across successive Complete/Stream calls. Passing nil (or
-// calling ResetFauxResponses) restores the legacy echo behaviour.
-func SetFauxResponses(responses []FauxResponse) {
-	fauxMu.Lock()
-	defer fauxMu.Unlock()
-	fauxResponses = append(fauxResponses[:0:0], responses...)
-}
+// SetFauxResponses replaces the default faux instance's scripted response queue.
+// Responses are consumed in order across successive Complete/Stream calls.
+// Passing nil (or calling ResetFauxResponses) restores the legacy echo behaviour.
+func SetFauxResponses(responses []FauxResponse) { defaultFauxProvider.SetResponses(responses) }
 
-// AppendFauxResponses appends to the scripted faux-provider response queue.
-func AppendFauxResponses(responses []FauxResponse) {
-	fauxMu.Lock()
-	defer fauxMu.Unlock()
-	fauxResponses = append(fauxResponses, responses...)
-}
+// AppendFauxResponses appends to the default faux instance's scripted queue.
+func AppendFauxResponses(responses []FauxResponse) { defaultFauxProvider.AppendResponses(responses) }
 
-// ResetFauxResponses clears the scripted queue and resets the call counter,
+// ResetFauxResponses clears the default faux instance's queue and call counter,
 // restoring the legacy echo behaviour. Tests should defer this for isolation.
-func ResetFauxResponses() {
-	fauxMu.Lock()
-	defer fauxMu.Unlock()
-	fauxResponses = nil
-	fauxCallCount = 0
+func ResetFauxResponses() { defaultFauxProvider.ResetResponses() }
+
+// PendingFauxResponseCount reports how many scripted responses remain queued on
+// the default faux instance.
+func PendingFauxResponseCount() int { return defaultFauxProvider.PendingResponseCount() }
+
+// FauxCallCount reports how many times the default faux instance has been
+// invoked since the last ResetFauxResponses.
+func FauxCallCount() int { return defaultFauxProvider.CallCount() }
+
+// fauxInstanceCounter mints unique API ids for per-instance faux registrations.
+var fauxInstanceCounter atomic.Uint64
+
+// FauxRegistration is a handle to a per-instance faux provider registered under
+// a unique API id. Call Unregister (e.g. via t.Cleanup) to remove it.
+type FauxRegistration struct {
+	// Provider is the per-instance faux provider; script it via its
+	// SetResponses/AppendResponses/ResetResponses methods.
+	Provider *fauxAPIProvider
+	// Model resolves to this instance (API is the unique id) while keeping
+	// Provider "faux" so auth/availability gates treat it as always-available.
+	Model    Model
+	sourceID string
 }
 
-// PendingFauxResponseCount reports how many scripted responses remain queued.
-func PendingFauxResponseCount() int {
-	fauxMu.Lock()
-	defer fauxMu.Unlock()
-	return len(fauxResponses)
-}
-
-// FauxCallCount reports how many times the faux provider has been invoked since
-// the last ResetFauxResponses.
-func FauxCallCount() int {
-	fauxMu.Lock()
-	defer fauxMu.Unlock()
-	return fauxCallCount
-}
-
-// nextFauxResponse pops the next scripted response, reporting whether the queue
-// was active (a response was scripted). It always increments the call counter.
-func nextFauxResponse() (FauxResponse, bool) {
-	fauxMu.Lock()
-	defer fauxMu.Unlock()
-	fauxCallCount++
-	if len(fauxResponses) == 0 {
-		return FauxResponse{}, false
+// Unregister removes the per-instance faux provider from the global registry.
+func (r *FauxRegistration) Unregister() {
+	if r == nil {
+		return
 	}
-	next := fauxResponses[0]
-	fauxResponses = fauxResponses[1:]
-	return next, true
+	UnregisterProviders(r.sourceID)
 }
 
-func fauxChat(req ChatRequest) ChatResponse {
-	scripted, ok := nextFauxResponse()
-	if ok {
-		return fauxScriptedResponse(req, scripted)
+// RegisterFauxProvider registers a fresh faux provider instance under a unique
+// API id so multiple instances — including t.Parallel subtests — can script
+// independent responses without crosstalk. The returned Model keeps Provider
+// "faux" (so HasAuth/AvailableConfigured/InitialModel still treat it as the
+// always-available test provider) but carries the unique API for dispatch,
+// mirroring the TS registerFauxProvider per-registration state. Optional initial
+// responses may be supplied; further scripting goes through reg.Provider.
+func RegisterFauxProvider(responses ...FauxResponse) *FauxRegistration {
+	n := fauxInstanceCounter.Add(1)
+	suffix := strconv.FormatUint(n, 10)
+	api := "faux-" + suffix
+	sourceID := "faux-instance-" + suffix
+	p := NewFauxProvider(api)
+	if len(responses) > 0 {
+		p.SetResponses(responses)
 	}
-	return fauxEchoResponse(req)
+	RegisterProvider(p, sourceID)
+	model := Model{
+		Provider:       "faux",
+		ID:             api,
+		Name:           "Faux deterministic test model (" + api + ")",
+		API:            api,
+		Input:          []string{"text"},
+		ThinkingLevels: []ThinkingLevel{ThinkingOff},
+	}
+	return &FauxRegistration{Provider: p, Model: model, sourceID: sourceID}
 }
 
 func fauxScriptedResponse(req ChatRequest, scripted FauxResponse) ChatResponse {

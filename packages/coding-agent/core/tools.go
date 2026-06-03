@@ -1,7 +1,7 @@
 package core
 
 import (
-	"fmt"
+	"slices"
 	"sort"
 
 	"github.com/guanshan/pi-go/packages/coding-agent/cli"
@@ -30,17 +30,74 @@ func FilterTools(all ToolSet, args cli.Args) ToolSet {
 	}))
 }
 
-func AllToolDescriptions(tools ToolSet) []string {
-	names := make([]string, 0, len(tools))
+// builtinToolOrder is the canonical registration order of the builtin tools,
+// matching the TS state.tools registration order that getActiveToolNames returns
+// (agent-session.ts). The system prompt lists tools and collects their guideline
+// bullets in this order, so it must NOT be sorted or the byte-shape diverges.
+var builtinToolOrder = []string{"read", "bash", "edit", "write", "grep", "find", "ls"}
+
+// ToolPromptInfo carries the per-tool data the system-prompt builder needs: the
+// present tool names in registration order, their one-line snippets, and the
+// collected guideline bullets (in tool order). It is the Go analogue of the TS
+// buildSystemPrompt options (selectedTools / toolSnippets / promptGuidelines).
+type ToolPromptInfo struct {
+	// OrderedNames are the present tool names: builtins in builtinToolOrder, then
+	// any custom/extension tools in sorted order.
+	OrderedNames []string
+	// Snippets maps a present tool name to its one-line prompt snippet, only for
+	// tools that expose a non-empty one via catools.PromptMetadata.
+	Snippets map[string]string
+	// Guidelines are the per-tool guideline bullets in OrderedNames order (before
+	// the builder dedups them and appends the always-on bullets).
+	Guidelines []string
+}
+
+// Has reports whether the named tool is present.
+func (i ToolPromptInfo) Has(name string) bool {
+	return slices.Contains(i.OrderedNames, name)
+}
+
+// orderedToolNames returns the tool names in canonical builtin order, with any
+// non-builtin (custom/extension) tools appended in sorted order for determinism.
+// The builtin order is a byte-exact match with the TS registration order; custom
+// tools are sorted rather than kept in registration order (a minor, deliberate
+// divergence — the ToolSet is a map with no insertion order, and custom tools
+// rarely expose prompt snippets so they seldom affect the rendered prompt).
+func orderedToolNames(tools ToolSet) []string {
+	out := make([]string, 0, len(tools))
+	seen := make(map[string]bool, len(tools))
+	for _, name := range builtinToolOrder {
+		if _, ok := tools[name]; ok {
+			out = append(out, name)
+			seen[name] = true
+		}
+	}
+	rest := make([]string, 0)
 	for name := range tools {
-		names = append(names, name)
+		if !seen[name] {
+			rest = append(rest, name)
+		}
 	}
-	sort.Strings(names)
-	out := make([]string, 0, len(names))
-	for _, name := range names {
-		out = append(out, fmt.Sprintf("%s: %s", name, tools[name].Description()))
+	sort.Strings(rest)
+	return append(out, rest...)
+}
+
+// ToolPromptInfoFor builds the ToolPromptInfo for a tool set by reading each
+// tool's optional catools.PromptMetadata (snippet + guidelines).
+func ToolPromptInfoFor(tools ToolSet) ToolPromptInfo {
+	info := ToolPromptInfo{Snippets: map[string]string{}}
+	for _, name := range orderedToolNames(tools) {
+		info.OrderedNames = append(info.OrderedNames, name)
+		pm, ok := tools[name].(catools.PromptMetadata)
+		if !ok {
+			continue
+		}
+		if snippet := pm.PromptSnippet(); snippet != "" {
+			info.Snippets[name] = snippet
+		}
+		info.Guidelines = append(info.Guidelines, pm.PromptGuidelines()...)
 	}
-	return out
+	return info
 }
 
 func ToolDefinitions(tools ToolSet) []map[string]any {

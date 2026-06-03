@@ -8,10 +8,12 @@ import (
 	"io"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/guanshan/pi-go/packages/ai"
 	"github.com/guanshan/pi-go/packages/coding-agent/cli"
+	coreext "github.com/guanshan/pi-go/packages/coding-agent/core/extensions"
 	catools "github.com/guanshan/pi-go/packages/coding-agent/core/tools"
 	cautils "github.com/guanshan/pi-go/packages/coding-agent/utils"
 	"github.com/guanshan/pi-go/packages/tui"
@@ -89,10 +91,38 @@ func printFinalAssistantText(agent *AgentSession, stdout, stderr io.Writer) int 
 
 func RunInteractiveMode(ctx context.Context, runtime *AgentSessionRuntime, initial string, images []ai.ContentBlock, stdin io.Reader, stdout, stderr io.Writer, remainingMessages ...[]string) error {
 	remaining := flattenPromptMessages(remainingMessages...)
+	showStartupChangelog(runtime, stdout)
 	if shouldRunBubbleInteractive(stdin, stdout) {
 		return runBubbleInteractiveMode(ctx, runtime, initial, images, stdin, stdout, stderr, remaining...)
 	}
 	return runLineInteractiveMode(ctx, runtime, initial, images, stdin, stdout, stderr, remaining...)
+}
+
+// showStartupChangelog displays the post-upgrade changelog exactly once after a
+// version change, then persists the recorded version (lastChangelogVersion) so it
+// is not shown again. Mirrors the changelog display wired into interactive-mode.ts.
+func showStartupChangelog(runtime *AgentSessionRuntime, stdout io.Writer) {
+	if runtime == nil {
+		return
+	}
+	agent := runtime.Session()
+	if agent == nil || agent.Settings == nil || agent.Session == nil {
+		return
+	}
+	hasMessages := len(agent.Session.BuildContext().Messages) > 0
+	before := agent.Settings.LastChangelogVersion()
+	changelog := ChangelogForDisplay(agent.Settings, hasMessages, cautils.ChangelogPath())
+	// Persist only when ChangelogForDisplay recorded a new version (fresh install
+	// or after an upgrade), even if there is nothing to display this run.
+	if agent.Settings.LastChangelogVersion() != before {
+		_ = agent.Settings.SaveGlobal()
+	}
+	if changelog == "" || stdout == nil {
+		return
+	}
+	fmt.Fprintln(stdout, "What's New")
+	fmt.Fprintln(stdout)
+	fmt.Fprintln(stdout, changelog)
 }
 
 func runLineInteractiveMode(ctx context.Context, runtime *AgentSessionRuntime, initial string, images []ai.ContentBlock, stdin io.Reader, stdout, stderr io.Writer, remaining ...string) error {
@@ -100,6 +130,10 @@ func runLineInteractiveMode(ctx context.Context, runtime *AgentSessionRuntime, i
 	if err != nil {
 		return err
 	}
+	scanner := bufio.NewScanner(stdin)
+	uiHandler := newLineExtensionUIHandler(scanner, stdout)
+	bindRuntimeExtensionUI(runtime, uiHandler)
+	defer clearRuntimeExtensionUI(runtime)
 	fmt.Fprintln(stdout, tui.TruncateToWidth(fmt.Sprintf("pi-go %s  cwd=%s  model=%s/%s", Version, agent.Session.CWD(), agent.Model.Provider, agent.Model.ID), 120, "..."))
 	fmt.Fprintln(stdout, "Type /help for commands, /quit to exit.")
 	if strings.TrimSpace(initial) != "" || len(images) > 0 {
@@ -119,7 +153,6 @@ func runLineInteractiveMode(ctx context.Context, runtime *AgentSessionRuntime, i
 			fmt.Fprintln(stderr, err)
 		}
 	}
-	scanner := bufio.NewScanner(stdin)
 	for {
 		fmt.Fprint(stdout, "> ")
 		if !scanner.Scan() {
@@ -215,6 +248,212 @@ func runtimeAgent(runtime *AgentSessionRuntime) (*AgentSession, error) {
 		return nil, fmt.Errorf("runtime has no active session")
 	}
 	return runtime.Session(), nil
+}
+
+func bindRuntimeExtensionUI(runtime *AgentSessionRuntime, handler coreext.UIRequestHandler) {
+	if runtime == nil {
+		return
+	}
+	runtime.SetBeforeSessionInvalidate(func() {
+		if agent := runtime.Session(); agent != nil {
+			agent.SetExtensionUIHandler(nil)
+		}
+	})
+	runtime.SetRebindSession(func(agent *AgentSession) error {
+		if agent != nil {
+			agent.SetExtensionUIHandler(handler)
+		}
+		return nil
+	})
+	if agent := runtime.Session(); agent != nil {
+		agent.SetExtensionUIHandler(handler)
+	}
+}
+
+func clearRuntimeExtensionUI(runtime *AgentSessionRuntime) {
+	if runtime == nil {
+		return
+	}
+	if agent := runtime.Session(); agent != nil {
+		agent.SetExtensionUIHandler(nil)
+	}
+}
+
+type extensionUIChoice struct {
+	Raw   json.RawMessage
+	Label string
+}
+
+type extensionUIPrompt struct {
+	Message      string
+	Detail       string
+	Level        string
+	Placeholder  string
+	DefaultValue string
+	Choices      []extensionUIChoice
+}
+
+type extensionUIResult struct {
+	Result json.RawMessage
+	Err    error
+}
+
+func parseExtensionUIPrompt(method string, params json.RawMessage) extensionUIPrompt {
+	var payload struct {
+		Message string            `json:"message"`
+		Detail  string            `json:"detail"`
+		Level   string            `json:"level"`
+		Choices []json.RawMessage `json:"choices"`
+		Options json.RawMessage   `json:"options"`
+	}
+	_ = json.Unmarshal(params, &payload)
+	prompt := extensionUIPrompt{
+		Message: strings.TrimSpace(payload.Message),
+		Detail:  strings.TrimSpace(payload.Detail),
+		Level:   strings.TrimSpace(payload.Level),
+	}
+	if prompt.Message == "" {
+		prompt.Message = "Extension request"
+	}
+	for _, raw := range payload.Choices {
+		if len(raw) == 0 {
+			continue
+		}
+		prompt.Choices = append(prompt.Choices, extensionUIChoice{
+			Raw:   append(json.RawMessage(nil), raw...),
+			Label: extensionUIChoiceLabel(raw),
+		})
+	}
+	if method == "input" && len(payload.Options) > 0 {
+		var placeholder string
+		if json.Unmarshal(payload.Options, &placeholder) == nil {
+			prompt.Placeholder = placeholder
+		} else {
+			var options struct {
+				Placeholder  string `json:"placeholder"`
+				DefaultValue string `json:"defaultValue"`
+				Value        string `json:"value"`
+			}
+			if json.Unmarshal(payload.Options, &options) == nil {
+				prompt.Placeholder = options.Placeholder
+				prompt.DefaultValue = firstNonEmpty(options.DefaultValue, options.Value)
+			}
+		}
+	}
+	return prompt
+}
+
+func extensionUIChoiceLabel(raw json.RawMessage) string {
+	var text string
+	if json.Unmarshal(raw, &text) == nil {
+		return text
+	}
+	var object map[string]any
+	if json.Unmarshal(raw, &object) == nil {
+		for _, key := range []string{"label", "title", "name", "value", "id"} {
+			if value, ok := object[key]; ok {
+				label := strings.TrimSpace(fmt.Sprint(value))
+				if label != "" && label != "<nil>" {
+					return label
+				}
+			}
+		}
+	}
+	return strings.TrimSpace(string(raw))
+}
+
+func extensionUIJSON(value any) (json.RawMessage, error) {
+	raw, err := json.Marshal(value)
+	if err != nil {
+		return nil, err
+	}
+	return json.RawMessage(raw), nil
+}
+
+func newLineExtensionUIHandler(scanner *bufio.Scanner, stdout io.Writer) coreext.UIRequestHandler {
+	return func(ctx context.Context, method string, params json.RawMessage) (json.RawMessage, error) {
+		if ctx == nil {
+			ctx = context.Background()
+		}
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		prompt := parseExtensionUIPrompt(method, params)
+		switch method {
+		case "notify":
+			if stdout != nil {
+				level := firstNonEmpty(prompt.Level, "info")
+				fmt.Fprintf(stdout, "\n[%s] %s\n", level, prompt.Message)
+			}
+			return json.RawMessage("null"), nil
+		case "confirm":
+			if stdout != nil {
+				fmt.Fprintf(stdout, "\n%s", prompt.Message)
+				if prompt.Detail != "" {
+					fmt.Fprintf(stdout, "\n%s", prompt.Detail)
+				}
+				fmt.Fprint(stdout, "\nConfirm? [y/N]: ")
+			}
+			if !scanner.Scan() {
+				if err := scanner.Err(); err != nil {
+					return nil, err
+				}
+				return json.RawMessage("false"), nil
+			}
+			answer := strings.ToLower(strings.TrimSpace(scanner.Text()))
+			return extensionUIJSON(answer == "y" || answer == "yes")
+		case "select":
+			if len(prompt.Choices) == 0 {
+				return nil, fmt.Errorf("pi.ui.select requires at least one choice")
+			}
+			if stdout != nil {
+				fmt.Fprintf(stdout, "\n%s\n", prompt.Message)
+				for i, choice := range prompt.Choices {
+					fmt.Fprintf(stdout, "  %d. %s\n", i+1, choice.Label)
+				}
+				fmt.Fprintf(stdout, "Select [1-%d]: ", len(prompt.Choices))
+			}
+			if !scanner.Scan() {
+				if err := scanner.Err(); err != nil {
+					return nil, err
+				}
+				return json.RawMessage("null"), nil
+			}
+			answer := strings.TrimSpace(scanner.Text())
+			if answer == "" {
+				return prompt.Choices[0].Raw, nil
+			}
+			index, err := strconv.Atoi(answer)
+			if err != nil || index < 1 || index > len(prompt.Choices) {
+				return nil, fmt.Errorf("invalid selection: %s", answer)
+			}
+			return prompt.Choices[index-1].Raw, nil
+		case "input":
+			if stdout != nil {
+				fmt.Fprintf(stdout, "\n%s", prompt.Message)
+				switch {
+				case prompt.DefaultValue != "":
+					fmt.Fprintf(stdout, " [%s]", prompt.DefaultValue)
+				case prompt.Placeholder != "":
+					fmt.Fprintf(stdout, " [%s]", prompt.Placeholder)
+				}
+				fmt.Fprint(stdout, ": ")
+			}
+			if !scanner.Scan() {
+				if err := scanner.Err(); err != nil {
+					return nil, err
+				}
+				return json.RawMessage("null"), nil
+			}
+			value := scanner.Text()
+			if strings.TrimSpace(value) == "" && prompt.DefaultValue != "" {
+				value = prompt.DefaultValue
+			}
+			return extensionUIJSON(value)
+		default:
+			return nil, fmt.Errorf("pi.ui.%s is not supported in this host", method)
+		}
+	}
 }
 
 func interactivePrompt(ctx context.Context, agent *AgentSession, message string, images []ai.ContentBlock, stdout, stderr io.Writer) error {
@@ -695,4 +934,37 @@ func mustJSON(value any) json.RawMessage {
 func isInputTTY() bool {
 	info, err := os.Stdin.Stat()
 	return err == nil && (info.Mode()&os.ModeCharDevice) != 0
+}
+
+// ChangelogForDisplay returns the changelog text to show once on startup after a
+// version change, recording the current version so it is not shown again. It
+// mirrors getChangelogForDisplay() in interactive-mode.ts:
+//   - resumed/continued sessions (sessionHasMessages) never see the changelog;
+//   - on a fresh install (no recorded version) it records the version and shows
+//     nothing;
+//   - otherwise it shows the entries newer than the recorded version (if any)
+//     and records the current version.
+//
+// The numeric upstream version (ai.UpstreamVersion, e.g. "0.78.0") is used for
+// comparison and recording because CHANGELOG.md headers are numeric semver, not
+// the "-go" suffixed build string. When this returns non-empty the caller must
+// persist settings (SaveGlobal) so the recorded version survives restart.
+func ChangelogForDisplay(settings *SettingsManager, sessionHasMessages bool, changelogPath string) string {
+	if settings == nil || sessionHasMessages {
+		return ""
+	}
+	version := ai.UpstreamVersion
+	lastVersion := settings.LastChangelogVersion()
+	entries := cautils.ParseChangelog(changelogPath)
+	if lastVersion == "" {
+		// Fresh install: record the version, do not show the changelog.
+		settings.SetLastChangelogVersion(version)
+		return ""
+	}
+	newEntries := cautils.GetNewChangelogEntries(entries, lastVersion)
+	if len(newEntries) == 0 {
+		return ""
+	}
+	settings.SetLastChangelogVersion(version)
+	return cautils.FormatChangelogMarkdown(newEntries)
 }

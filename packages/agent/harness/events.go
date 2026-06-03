@@ -44,6 +44,15 @@ func (AbortEvent) harnessEventTag()       {}
 func (SettledEvent) harnessEventTag()     {}
 func (ToolsUpdateEvent) harnessEventTag() {}
 
+// The events below also reach wildcard SubscribeHarness listeners (besides their
+// typed handlers), mirroring TS emitOwn which feeds every "own" event to the
+// wildcard subscribe() listeners.
+func (ModelSelectEvent) harnessEventTag()         {}
+func (ThinkingLevelSelectEvent) harnessEventTag() {}
+func (ResourcesUpdateEvent) harnessEventTag()     {}
+func (SessionTreeEvent) harnessEventTag()         {}
+func (SessionCompactEvent) harnessEventTag()      {}
+
 func (h *AgentHarness) SubscribeHarness(f func(context.Context, HarnessEvent) error) func() {
 	if f == nil {
 		return func() {}

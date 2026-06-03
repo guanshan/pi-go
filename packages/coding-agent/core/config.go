@@ -52,6 +52,7 @@ type Settings struct {
 	HideThinkingBlock       *bool                   `json:"hideThinkingBlock,omitempty"`
 	QuietStartup            *bool                   `json:"quietStartup,omitempty"`
 	CollapseChangelog       *bool                   `json:"collapseChangelog,omitempty"`
+	LastChangelogVersion    string                  `json:"lastChangelogVersion,omitempty"`
 	EnableInstallTelemetry  *bool                   `json:"enableInstallTelemetry,omitempty"`
 	HTTPIdleTimeoutMS       *HTTPIdleTimeoutSetting `json:"httpIdleTimeoutMs,omitempty"`
 	ShellPath               string                  `json:"shellPath,omitempty"`
@@ -423,11 +424,32 @@ func BinDir() string {
 }
 
 func GetPackageDir() string {
+	// PI_PACKAGE_DIR override mirrors TS getPackageDir (config.ts:345-348), useful
+	// where store paths tokenize poorly (Nix/Guix) or for tests.
+	if envDir := os.Getenv("PI_PACKAGE_DIR"); envDir != "" {
+		return filepath.Clean(envDir)
+	}
 	exe, err := os.Executable()
 	if err != nil || exe == "" {
 		return ""
 	}
 	return filepath.Dir(exe)
+}
+
+// ReadmePath, DocsPath, and ExamplesPath return absolute paths to the shipped
+// README.md, docs directory, and examples directory respectively, mirroring TS
+// getReadmePath/getDocsPath/getExamplesPath (config.ts:403-415). They are
+// referenced by the default system prompt's "Pi documentation" section.
+func ReadmePath() string   { return resolvePackagePath("README.md") }
+func DocsPath() string     { return resolvePackagePath("docs") }
+func ExamplesPath() string { return resolvePackagePath("examples") }
+
+func resolvePackagePath(rel string) string {
+	p := filepath.Join(GetPackageDir(), rel)
+	if abs, err := filepath.Abs(p); err == nil {
+		return abs
+	}
+	return p
 }
 
 func ProjectPiDir(cwd string) string {
@@ -621,6 +643,23 @@ func (s *SettingsManager) QuietStartup() bool {
 
 func (s *SettingsManager) CollapseChangelog() bool {
 	return s.Bool(s.Project.CollapseChangelog, s.Global.CollapseChangelog, false)
+}
+
+// LastChangelogVersion returns the most recent version for which the post-upgrade
+// changelog was shown. Mirrors getLastChangelogVersion() in settings-manager.ts:
+// read from the merged view (project overrides global), empty if never recorded.
+func (s *SettingsManager) LastChangelogVersion() string {
+	if s.Project.LastChangelogVersion != "" {
+		return s.Project.LastChangelogVersion
+	}
+	return s.Global.LastChangelogVersion
+}
+
+// SetLastChangelogVersion records the version whose changelog has been shown.
+// Mirrors setLastChangelogVersion() in settings-manager.ts, which writes to the
+// global settings. The caller persists via SaveGlobal.
+func (s *SettingsManager) SetLastChangelogVersion(version string) {
+	s.Global.LastChangelogVersion = version
 }
 
 func (s *SettingsManager) EnableInstallTelemetry() bool {

@@ -12,7 +12,7 @@ import (
 )
 
 const (
-	UpstreamVersion = "0.76.0"
+	UpstreamVersion = "0.78.0"
 	Version         = UpstreamVersion + "-go"
 )
 
@@ -41,6 +41,7 @@ type ChatRequest struct {
 	OnPayload       func(payload any, model Model) (any, error)
 	OnResponse      func(resp ProviderResponse, model Model) error
 	TimeoutMs       int
+	IdleTimeoutMs   int
 	MaxRetries      int
 	MaxRetryDelayMs int
 	ToolChoice      any

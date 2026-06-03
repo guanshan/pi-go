@@ -119,6 +119,36 @@ func (a *AgentSession) QueueFollowUp(message string, images []ai.ContentBlock) {
 	go a.emitQueueUpdate()
 }
 
+// chatRequestFromStreamOptions builds an ai.ChatRequest from the model, context,
+// and stream options handed to a StreamFn. It mirrors ai's internal
+// chatRequestFromOptions field-for-field so callers can attach request-level
+// settings, then route via Registry.StreamChat.
+func chatRequestFromStreamOptions(model ai.Model, llmContext ai.Context, options ai.StreamOptions) ai.ChatRequest {
+	return ai.ChatRequest{
+		Model:           model,
+		SystemPrompt:    llmContext.SystemPrompt,
+		Messages:        llmContext.Messages,
+		Tools:           ai.ToolsByName(llmContext.Tools),
+		ThinkingLevel:   options.Reasoning,
+		CacheRetention:  options.CacheRetention,
+		SessionID:       options.SessionID,
+		MaxTokens:       options.MaxTokens,
+		Temperature:     options.Temperature,
+		Headers:         options.Headers,
+		Transport:       options.Transport,
+		OnPayload:       options.OnPayload,
+		OnResponse:      options.OnResponse,
+		TimeoutMs:       options.TimeoutMs,
+		IdleTimeoutMs:   options.IdleTimeoutMs,
+		MaxRetries:      options.MaxRetries,
+		MaxRetryDelayMs: options.MaxRetryDelayMs,
+		ToolChoice:      options.ToolChoice,
+		RequestMetadata: options.RequestMetadata,
+		Metadata:        options.Metadata,
+		ThinkingBudgets: options.ThinkingBudgets,
+	}
+}
+
 func (a *AgentSession) newLoopAgent(sink ai.EventSink, maxLoopHit *bool, persistErr *error) *agentcore.Agent {
 	turnCount := 0
 	extensionTurnIndex := 0
@@ -150,9 +180,9 @@ func (a *AgentSession) newLoopAgent(sink ai.EventSink, maxLoopHit *bool, persist
 		},
 	}
 	// Mirror sdk.ts:383,391-393: wire the session id, transport, thinking
-	// budgets, and provider retry-delay cap into the agent so the prompt-cache
-	// key, session-affinity headers, transport selection, custom thinking
-	// budget_tokens, and the provider retry-delay ceiling actually take effect.
+	// budgets, provider timeouts, and retry controls into the agent so the
+	// prompt-cache key, session-affinity headers, transport selection, custom
+	// thinking budget_tokens, and provider retry behavior actually take effect.
 	// SessionID is read here (per newLoopAgent construction, i.e. each run) so it
 	// reflects the current session after /new, /fork, or session switches.
 	if a.Session != nil {
@@ -161,14 +191,30 @@ func (a *AgentSession) newLoopAgent(sink ai.EventSink, maxLoopHit *bool, persist
 	if a.Settings != nil {
 		opts.Transport = a.Settings.Transport()
 		opts.ThinkingBudgets = a.Settings.ThinkingBudgets()
+		opts.TimeoutMs = a.Settings.ProviderRetryTimeoutMS()
+		opts.IdleTimeoutMs = a.Settings.HTTPIdleTimeoutMS()
+		opts.MaxRetries = a.Settings.ProviderRetryMaxRetries()
 		opts.MaxRetryDelayMs = a.Settings.ProviderRetryMaxDelayMS()
 	}
-	if a.Settings != nil && a.Settings.BlockImages() {
-		streamFn := agentcore.DefaultStreamFn(a.Registry)
-		opts.StreamFn = func(ctx context.Context, model ai.Model, agentContext ai.Context, options ai.StreamOptions) agentcore.AssistantStream {
+	// Always wrap the stream function so image filtering and the ChatRequest
+	// conversion stay in one place. ai.StreamOptions now carries IdleTimeoutMs,
+	// but this wrapper keeps the coding-agent request path explicit.
+	blockImages := false
+	if a.Settings != nil {
+		blockImages = a.Settings.BlockImages()
+	}
+	registry := a.Registry
+	opts.StreamFn = func(ctx context.Context, model ai.Model, agentContext ai.Context, options ai.StreamOptions) agentcore.AssistantStream {
+		if blockImages {
 			agentContext.Messages = filterImageBlocks(agentContext.Messages)
-			return streamFn(ctx, model, agentContext, options)
 		}
+		if registry == nil {
+			// No registry to route a ChatRequest through; fall back to the default
+			// stream path (idle timeout cannot be applied without a provider).
+			return ai.Stream(ctx, model, agentContext, options)
+		}
+		req := chatRequestFromStreamOptions(model, agentContext, options)
+		return registry.StreamChat(ctx, req)
 	}
 	loopAgent := agentcore.New(opts)
 	loopAgent.Subscribe(func(ctx context.Context, event agentcore.AgentEvent) error {

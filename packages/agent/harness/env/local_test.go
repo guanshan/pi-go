@@ -252,3 +252,78 @@ func TestLocalExecutionEnvConcurrentTempDirs(t *testing.T) {
 		t.Fatalf("final Cleanup: %v", err)
 	}
 }
+
+// TestNewLocalExecutionEnvDoesNotValidateCwd mirrors TS: the constructor stores
+// the cwd without statting it, so a not-yet-created directory still yields a
+// usable env (validation happens at use-time).
+func TestNewLocalExecutionEnvDoesNotValidateCwd(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "does", "not", "exist")
+	env, err := NewLocalExecutionEnv(missing, "", nil)
+	if err != nil {
+		t.Fatalf("construct with missing cwd should succeed, got %v", err)
+	}
+	if env.Cwd() != filepath.Clean(missing) {
+		t.Fatalf("cwd=%q want %q", env.Cwd(), filepath.Clean(missing))
+	}
+
+	// Pointing at a regular file (not a directory) also must not fail at
+	// construction time.
+	file := filepath.Join(t.TempDir(), "regular.txt")
+	if err := os.WriteFile(file, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := NewLocalExecutionEnv(file, "", nil); err != nil {
+		t.Fatalf("construct with file cwd should succeed, got %v", err)
+	}
+}
+
+func TestSplitTrailingPartialRune(t *testing.T) {
+	euro := []byte("€") // E2 82 AC (3 bytes)
+	cases := []struct {
+		name        string
+		in          []byte
+		wantEmit    []byte
+		wantPending []byte
+	}{
+		{"empty", nil, nil, nil},
+		{"ascii", []byte("abc"), []byte("abc"), nil},
+		{"complete multibyte", euro, euro, nil},
+		{"split after lead", euro[:1], nil, euro[:1]},
+		{"split after two bytes", euro[:2], nil, euro[:2]},
+		{"ascii then partial", append([]byte("hi"), euro[:1]...), []byte("hi"), euro[:1]},
+		{"lone continuation byte", []byte{0x80}, []byte{0x80}, nil},
+		{"invalid lead byte", []byte{0xFF}, []byte{0xFF}, nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			emit, pending := splitTrailingPartialRune(tc.in)
+			if string(emit) != string(tc.wantEmit) || string(pending) != string(tc.wantPending) {
+				t.Fatalf("split(%x)=emit %x pending %x want emit %x pending %x",
+					tc.in, emit, pending, tc.wantEmit, tc.wantPending)
+			}
+		})
+	}
+}
+
+// TestExecutionStreamWriterReassemblesSplitRune feeds a multibyte rune split
+// across two Write calls and asserts the callback never observes a U+FFFD from
+// the chunk boundary -- matching TS setEncoding("utf8") decoder buffering.
+func TestExecutionStreamWriterReassemblesSplitRune(t *testing.T) {
+	var chunks []string
+	w := &executionStreamWriter{callback: func(s string) { chunks = append(chunks, s) }}
+	euro := []byte("€")
+	if _, err := w.Write(euro[:2]); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Write(euro[2:]); err != nil {
+		t.Fatal(err)
+	}
+	w.flush()
+	joined := strings.Join(chunks, "")
+	if joined != "€" {
+		t.Fatalf("reassembled output=%q want €", joined)
+	}
+	if strings.ContainsRune(joined, '�') {
+		t.Fatalf("callback saw replacement char: %q", joined)
+	}
+}

@@ -260,6 +260,7 @@ func MainWithOptions(ctx context.Context, argv []string, options MainOptions) er
 				AgentDir:              options.AgentDir,
 				AuthStorage:           auth,
 				ResourceLoaderOptions: resourceOptions,
+				ExtensionFlagValues:   args.UnknownFlags,
 			})
 			if err != nil {
 				return CreateAgentSessionRuntimeResult{}, err

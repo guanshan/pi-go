@@ -90,6 +90,66 @@ func TestPromptTemplateArgumentSubstitution(t *testing.T) {
 	}
 }
 
+// P2-03: ParseCommandArgs edge cases must match TS parseCommandArgs exactly.
+func TestParseCommandArgsEdgeCases(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want []string
+	}{
+		// Bare empty quotes emit no argument (TS pushes only truthy current).
+		{"empty double quotes", `""`, nil},
+		{"empty single quotes", `''`, nil},
+		{"empty quotes between args", `a "" b`, []string{"a", "b"}},
+		// Adjacent quotes concatenate into the surrounding token.
+		{"empty quotes inside token", `a""b`, []string{"ab"}},
+		// Only space and tab separate; other Unicode whitespace is literal.
+		{"tab separates", "a\tb", []string{"a", "b"}},
+		{"newline is literal", "a\nb", []string{"a\nb"}},
+		{"nbsp is literal", "a b", []string{"a b"}},
+		// Input is not trimmed, but leading/trailing spaces just yield no empty args.
+		{"surrounding spaces", "  a  ", []string{"a"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := ParseCommandArgs(tc.in)
+			if len(got) != len(tc.want) {
+				t.Fatalf("ParseCommandArgs(%q)=%#v want %#v", tc.in, got, tc.want)
+			}
+			for i := range tc.want {
+				if got[i] != tc.want[i] {
+					t.Fatalf("ParseCommandArgs(%q)=%#v want %#v", tc.in, got, tc.want)
+				}
+			}
+		})
+	}
+}
+
+// P2-03: ${@:N} with a negative/non-numeric N is left literal (the TS regex only
+// matches \d+); valid forms clamp to the argument bounds.
+func TestSubstituteArgSlicesEdgeCases(t *testing.T) {
+	args := []string{"a", "b", "c"}
+	cases := []struct {
+		in   string
+		want string
+	}{
+		{"${@:-1}", "${@:-1}"},     // negative start: left literal
+		{"${@:-1:2}", "${@:-1:2}"}, // negative start with length: literal
+		{"${@:x}", "${@:x}"},       // non-numeric: literal
+		{"${@:0}", "a b c"},        // start 0 -> index -1 clamped to 0
+		{"${@:1}", "a b c"},        // 1-based: from first arg
+		{"${@:2}", "b c"},          // from second arg
+		{"${@:2:1}", "b"},          // length-limited
+		{"${@:2:99}", "b c"},       // length beyond end clamps
+		{"${@:99}", ""},            // start beyond end -> empty
+	}
+	for _, tc := range cases {
+		if got := SubstitutePromptArgs(tc.in, args); got != tc.want {
+			t.Fatalf("SubstitutePromptArgs(%q)=%q want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
 func TestEnvPathHelpersHandleWindowsSeparators(t *testing.T) {
 	root := `C:\work\project\skills`
 	file := `C:\work\project\skills\inspect\SKILL.md`
