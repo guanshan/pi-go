@@ -275,7 +275,7 @@ func TestFileReferenceSuggestions(t *testing.T) {
 	// Absolute @-references read the real directory, not cwd, and emit absolute
 	// completions (#2). Using cwd's own absolute path exercises the absolute branch.
 	absToken := "@" + filepath.Join(cwd, "ma")
-	if got := fileReferenceSuggestions(absToken, cwd); !slices.Contains(got, "@"+filepath.Join(cwd, "main.go")) {
+	if got := fileReferenceSuggestions(absToken, cwd); !slices.Contains(got, "@"+filepath.ToSlash(filepath.Join(cwd, "main.go"))) {
 		t.Fatalf("absolute @ suggestions for %q = %#v", absToken, got)
 	}
 
@@ -333,8 +333,12 @@ func TestInteractiveAutocompleteDropdownNavigation(t *testing.T) {
 	if !model.completeSlashCommand() {
 		t.Fatal("expected completion to apply selected suggestion")
 	}
-	if got := model.input.Value(); got != selected+" " {
-		t.Fatalf("completed value=%q want selected %q", got, selected+" ")
+	want := selected
+	if !completionIsDirectory(selected) {
+		want += " "
+	}
+	if got := model.input.Value(); got != want {
+		t.Fatalf("completed value=%q want selected %q", got, want)
 	}
 	if model.historyIndex != -1 {
 		t.Fatalf("autocomplete navigation should exit history browsing, historyIndex=%d", model.historyIndex)

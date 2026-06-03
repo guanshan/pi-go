@@ -917,9 +917,9 @@ func defaultPromptBody(tools ToolPromptInfo) string {
 		"In addition to the tools above, you may have access to other custom tools depending on the project.\n\n" +
 		"Guidelines:\n" + gb.String() + "\n\n" +
 		"Pi documentation (read only when the user asks about pi itself, its SDK, extensions, themes, skills, or TUI):\n" +
-		"- Main documentation: " + ReadmePath() + "\n" +
-		"- Additional docs: " + DocsPath() + "\n" +
-		"- Examples: " + ExamplesPath() + " (extensions, custom tools, SDK)\n" +
+		"- Main documentation: " + filepath.ToSlash(ReadmePath()) + "\n" +
+		"- Additional docs: " + filepath.ToSlash(DocsPath()) + "\n" +
+		"- Examples: " + filepath.ToSlash(ExamplesPath()) + " (extensions, custom tools, SDK)\n" +
 		"- When reading pi docs or examples, resolve docs/... under Additional docs and examples/... under Examples, not the current working directory\n" +
 		"- When asked about: extensions (docs/extensions.md, examples/extensions/), themes (docs/themes.md), skills (docs/skills.md), prompt templates (docs/prompt-templates.md), TUI components (docs/tui.md), keybindings (docs/keybindings.md), SDK integrations (docs/sdk.md), custom providers (docs/custom-provider.md), adding models (docs/models.md), pi packages (docs/packages.md)\n" +
 		"- When working on pi topics, read the docs and examples, and follow .md cross-references before implementing\n" +

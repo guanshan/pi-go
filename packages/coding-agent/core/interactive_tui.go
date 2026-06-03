@@ -1340,22 +1340,22 @@ func fileReferenceSuggestions(token, cwd string) []string {
 		quoted = true
 		rawPrefix = rawPrefix[1:]
 	}
-	absolute := strings.HasPrefix(rawPrefix, "/")
+	displayPrefix := filepath.ToSlash(rawPrefix)
+	absolute := filepath.IsAbs(rawPrefix) || strings.HasPrefix(displayPrefix, "/")
 	var dir, base string
-	if slash := strings.LastIndex(rawPrefix, "/"); slash >= 0 {
-		dir, base = rawPrefix[:slash], rawPrefix[slash+1:]
+	if slash := strings.LastIndex(displayPrefix, "/"); slash >= 0 {
+		dir, base = displayPrefix[:slash], displayPrefix[slash+1:]
 		if dir == "" {
 			dir = "/" // "@/abc" -> list the filesystem root, not cwd
+		} else if len(dir) == 2 && dir[1] == ':' {
+			dir += "/" // "@C:/abc" -> list C:/, not C:'s cwd
 		}
 	} else {
-		dir, base = ".", rawPrefix
+		dir, base = ".", displayPrefix
 	}
-	// An absolute prefix is read from the filesystem directly; a relative one is
-	// resolved against the session cwd (mirrors TS getFileSuggestions, which keys
-	// off expandedPrefix.startsWith("/")).
-	readDir := dir
+	readDir := filepath.FromSlash(dir)
 	if !absolute {
-		readDir = filepath.Join(cwd, dir)
+		readDir = filepath.Join(cwd, readDir)
 	}
 	entries, err := os.ReadDir(readDir)
 	if err != nil {
