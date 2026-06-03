@@ -64,7 +64,7 @@ func TestCycleModelPersistsDefault(t *testing.T) {
 	if !ok {
 		t.Fatalf("CycleModel returned false; data=%#v", data)
 	}
-	next := agent.Model
+	next := agent.CurrentModel()
 
 	reloaded := NewSettingsManager(settings.CWD, settings.AgentDir)
 	if reloaded.DefaultProvider() != next.Provider || reloaded.DefaultModel() != next.ID {
@@ -112,16 +112,100 @@ func TestSetThinkingLevelOffOnNonThinkingModelDoesNotPersist(t *testing.T) {
 	nonThinking := ai.Model{Provider: "bedrock", ID: "nova", API: "bedrock-converse", ThinkingLevels: []ai.ThinkingLevel{ai.ThinkingOff}}
 	agent, settings := buildPersistAgent(t, []ai.Model{nonThinking}, nonThinking)
 	// Start from a non-off level so the set is an actual change down to "off".
+	agent.mu.Lock()
 	agent.ThinkingLevel = ai.ThinkingHigh
+	agent.mu.Unlock()
 
 	if err := agent.SetThinkingLevel(ai.ThinkingOff); err != nil {
 		t.Fatalf("SetThinkingLevel off: %v", err)
 	}
-	if agent.ThinkingLevel != ai.ThinkingOff {
-		t.Fatalf("expected clamp to off, got %q", agent.ThinkingLevel)
+	if got := agent.CurrentThinkingLevel(); got != ai.ThinkingOff {
+		t.Fatalf("expected clamp to off, got %q", got)
 	}
 	reloaded := NewSettingsManager(settings.CWD, settings.AgentDir)
 	if reloaded.Global.DefaultThinkingLevel != "" {
 		t.Fatalf("off on non-thinking model must not persist, got %q", reloaded.Global.DefaultThinkingLevel)
+	}
+}
+
+func TestSetModelRejectedWhileStreaming(t *testing.T) {
+	models := []ai.Model{
+		{Provider: "anthropic", ID: "claude-sonnet-4-5", API: "anthropic"},
+		{Provider: "openai", ID: "gpt-5", API: "openai"},
+	}
+	agent, _ := buildPersistAgent(t, models, models[0])
+	agent.mu.Lock()
+	agent.streaming = true
+	agent.mu.Unlock()
+
+	if _, err := agent.SetModel("openai", "gpt-5"); err == nil {
+		t.Fatal("SetModel while streaming should be rejected")
+	}
+	if got := agent.CurrentModel(); got.Provider != "anthropic" || got.ID != "claude-sonnet-4-5" {
+		t.Fatalf("model changed while streaming: %s/%s", got.Provider, got.ID)
+	}
+}
+
+func TestCycleModelRejectedWhileStreaming(t *testing.T) {
+	models := []ai.Model{
+		{Provider: "anthropic", ID: "claude-sonnet-4-5", API: "anthropic"},
+		{Provider: "openai", ID: "gpt-5", API: "openai"},
+	}
+	agent, _ := buildPersistAgent(t, models, models[0])
+	agent.mu.Lock()
+	agent.streaming = true
+	agent.mu.Unlock()
+
+	// Rejected while streaming: ok=false with a busy marker so the TUI can
+	// distinguish this from a "only one model" refusal.
+	data, ok := agent.CycleModel()
+	if ok {
+		t.Fatalf("CycleModel while streaming should be rejected, got ok=%v", ok)
+	}
+	if busy, _ := data["busy"].(bool); !busy {
+		t.Fatalf("expected busy marker on streaming rejection, got %#v", data)
+	}
+	if got := agent.CurrentModel(); got.Provider != "anthropic" || got.ID != "claude-sonnet-4-5" {
+		t.Fatalf("model changed while streaming: %s/%s", got.Provider, got.ID)
+	}
+}
+
+func TestSetThinkingLevelRejectedWhileStreaming(t *testing.T) {
+	model := ai.Model{Provider: "anthropic", ID: "claude-sonnet-4-5", API: "anthropic", Reasoning: true, ThinkingLevels: []ai.ThinkingLevel{ai.ThinkingOff, ai.ThinkingLow, ai.ThinkingHigh}}
+	agent, settings := buildPersistAgent(t, []ai.Model{model}, model)
+	start := agent.CurrentThinkingLevel()
+	agent.mu.Lock()
+	agent.streaming = true
+	agent.mu.Unlock()
+
+	if err := agent.SetThinkingLevel(ai.ThinkingHigh); err == nil {
+		t.Fatal("SetThinkingLevel while streaming should be rejected")
+	}
+	if got := agent.CurrentThinkingLevel(); got != start {
+		t.Fatalf("thinking level changed while streaming: got %q want %q", got, start)
+	}
+	reloaded := NewSettingsManager(settings.CWD, settings.AgentDir)
+	if reloaded.Global.DefaultThinkingLevel != "" {
+		t.Fatalf("streaming rejection should not persist thinking level, got %q", reloaded.Global.DefaultThinkingLevel)
+	}
+}
+
+func TestCycleThinkingLevelRejectedWhileStreaming(t *testing.T) {
+	model := ai.Model{Provider: "anthropic", ID: "claude-sonnet-4-5", API: "anthropic", Reasoning: true, ThinkingLevels: []ai.ThinkingLevel{ai.ThinkingOff, ai.ThinkingLow, ai.ThinkingHigh}}
+	agent, _ := buildPersistAgent(t, []ai.Model{model}, model)
+	start := agent.CurrentThinkingLevel()
+	agent.mu.Lock()
+	agent.streaming = true
+	agent.mu.Unlock()
+
+	level, ok := agent.CycleThinkingLevel()
+	if ok {
+		t.Fatalf("CycleThinkingLevel while streaming should be rejected, got ok=%v level=%q", ok, level)
+	}
+	if level != start {
+		t.Fatalf("rejected cycle returned level=%q want %q", level, start)
+	}
+	if got := agent.CurrentThinkingLevel(); got != start {
+		t.Fatalf("thinking level changed while streaming: got %q want %q", got, start)
 	}
 }

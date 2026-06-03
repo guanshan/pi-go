@@ -73,6 +73,7 @@ type interactiveSessionEventMsg struct {
 type modelCycleDoneMsg struct {
 	ok     bool
 	scoped bool
+	busy   bool
 }
 
 type modelSelectDoneMsg struct {
@@ -139,6 +140,7 @@ type interactiveModel struct {
 	extensionUIQueue   []*interactiveExtensionUIRequest
 	history            []string
 	historyIndex       int
+	autocompleteIndex  int
 	sessionAgent       *AgentSession
 }
 
@@ -289,9 +291,10 @@ func newInteractiveModel(ctx context.Context, runtime *AgentSessionRuntime, init
 			return nil
 		})
 	}
+	currentModel := agent.CurrentModel()
 	model.messages = append(model.messages, interactiveMessage{
 		Role: interactiveRoleSystem,
-		Text: fmt.Sprintf("pi-go %s  cwd=%s  model=%s/%s", Version, agent.Session.CWD(), agent.Model.Provider, agent.Model.ID),
+		Text: fmt.Sprintf("pi-go %s  cwd=%s  model=%s/%s", Version, agent.Session.CWD(), currentModel.Provider, currentModel.ID),
 	})
 	model.refreshViewport()
 	return model, nil
@@ -370,6 +373,10 @@ func (m *interactiveModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.refreshViewport()
 			return m, cmd
 		case "up":
+			if m.navigateAutocomplete(-1) {
+				m.refreshViewport()
+				return m, nil
+			}
 			// Browse prompt history when the editor is empty, or when already
 			// browsing and the cursor is on the first line (TS editor.ts cursorUp).
 			if m.editorEmpty() || (m.historyIndex > -1 && m.editorOnFirstLine()) {
@@ -378,6 +385,10 @@ func (m *interactiveModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 		case "down":
+			if m.navigateAutocomplete(1) {
+				m.refreshViewport()
+				return m, nil
+			}
 			// Continue browsing history forward only while already browsing and on
 			// the last line (TS editor.ts cursorDown); otherwise fall through to the
 			// textarea so the cursor moves normally.
@@ -479,9 +490,12 @@ func (m *interactiveModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case modelCycleDoneMsg:
 		m.cyclingModel = false
 		if !msg.ok {
-			if msg.scoped {
+			switch {
+			case msg.busy:
+				m.setStatus("Can't switch model while a response is streaming")
+			case msg.scoped:
 				m.setStatus("Only one model in scope")
-			} else {
+			default:
 				m.setStatus("Only one model available")
 			}
 		}
@@ -512,6 +526,7 @@ func (m *interactiveModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	m.input, cmd = m.input.Update(msg)
 	if m.input.Value() != before {
 		m.historyIndex = -1
+		m.autocompleteIndex = 0
 	}
 	m.refreshViewport()
 	return m, cmd
@@ -1162,7 +1177,8 @@ func (m *interactiveModel) header() string {
 	if err != nil {
 		return "pi-go"
 	}
-	text := fmt.Sprintf("pi-go %s  %s/%s", Version, agent.Model.Provider, agent.Model.ID)
+	currentModel := agent.CurrentModel()
+	text := fmt.Sprintf("pi-go %s  %s/%s", Version, currentModel.Provider, currentModel.ID)
 	return tui.TruncateToWidth(text, max(1, m.width), "...")
 }
 
@@ -1194,7 +1210,7 @@ func (m *interactiveModel) footer() string {
 		parts = append(parts, m.statusMessage)
 	}
 	if suggestions := m.currentSuggestions(); len(suggestions) > 0 {
-		parts = append(parts, "tab="+suggestions[0])
+		parts = append(parts, "tab="+suggestions[m.selectedSuggestionIndex(suggestions)])
 	}
 	return tui.TruncateToWidth(strings.Join(parts, "  "), max(1, m.width), "...")
 }
@@ -1204,7 +1220,41 @@ func (m *interactiveModel) renderSuggestions() string {
 	if len(suggestions) == 0 {
 		return ""
 	}
-	return interactiveSuggestionStyle.Render("  " + strings.Join(suggestions, "  "))
+	selected := m.selectedSuggestionIndex(suggestions)
+	maxVisible := 5
+	if agent, err := runtimeAgent(m.runtime); err == nil && agent != nil && agent.Settings != nil {
+		maxVisible = agent.Settings.AutocompleteMaxVisible()
+	}
+	if maxVisible <= 0 {
+		maxVisible = 5
+	}
+	half := maxVisible / 2
+	start := selected - half
+	if start > len(suggestions)-maxVisible {
+		start = len(suggestions) - maxVisible
+	}
+	if start < 0 {
+		start = 0
+	}
+	end := start + maxVisible
+	if end > len(suggestions) {
+		end = len(suggestions)
+	}
+	width := max(1, m.width)
+	lines := make([]string, 0, end-start+1)
+	for i := start; i < end; i++ {
+		prefix := "  "
+		style := interactiveSuggestionStyle
+		if i == selected {
+			prefix = "> "
+			style = interactiveSelectorSelectedStyle
+		}
+		lines = append(lines, style.Render(tui.TruncateToWidth(prefix+suggestions[i], width, "...")))
+	}
+	if start > 0 || end < len(suggestions) {
+		lines = append(lines, interactiveSuggestionStyle.Render(tui.TruncateToWidth(fmt.Sprintf("  (%d/%d)", selected+1, len(suggestions)), width, "...")))
+	}
+	return strings.Join(lines, "\n")
 }
 
 func (m *interactiveModel) completeSlashCommand() bool {
@@ -1213,12 +1263,21 @@ func (m *interactiveModel) completeSlashCommand() bool {
 		return false
 	}
 	value := m.input.Value()
-	first := suggestions[0]
+	first := suggestions[m.selectedSuggestionIndex(suggestions)]
 	if _, start, ok := trailingFileRefToken(value); ok {
 		// Replace just the trailing @token. A directory completion ends with "/"
 		// so the user can keep descending without a separating space.
 		completed := value[:start] + first
-		if !strings.HasSuffix(first, "/") {
+		if !completionIsDirectory(first) {
+			completed += " "
+		}
+		m.input.SetValue(completed)
+		m.input.MoveToEnd()
+		return true
+	}
+	if _, start, ok := trailingPathCompletionToken(value); ok {
+		completed := value[:start] + first
+		if !completionIsDirectory(first) {
 			completed += " "
 		}
 		m.input.SetValue(completed)
@@ -1340,9 +1399,146 @@ func fileReferenceSuggestions(token, cwd string) []string {
 // space (mirrors TS buildCompletionValue).
 func buildFileRefCompletion(path string, quoted bool) string {
 	if quoted || strings.Contains(path, " ") {
+		if strings.HasSuffix(path, "/") {
+			return "@\"" + path
+		}
 		return "@\"" + path + "\""
 	}
 	return "@" + path
+}
+
+func completionIsDirectory(value string) bool {
+	return strings.HasSuffix(value, "/") || strings.HasSuffix(value, "/\"")
+}
+
+func trailingPathCompletionToken(value string) (token string, start int, ok bool) {
+	if at := unclosedPlainQuoteStart(value); at >= 0 {
+		return value[at:], at, true
+	}
+	start = strings.LastIndexAny(value, " \t\r\n=") + 1
+	token = value[start:]
+	return token, start, looksLikePathCompletionToken(token)
+}
+
+func unclosedPlainQuoteStart(value string) int {
+	inQuotes := false
+	quoteIdx := -1
+	for i := 0; i < len(value); i++ {
+		if value[i] == '"' {
+			inQuotes = !inQuotes
+			if inQuotes {
+				quoteIdx = i
+			}
+		}
+	}
+	if !inQuotes || quoteIdx < 0 {
+		return -1
+	}
+	if quoteIdx > 0 && value[quoteIdx-1] == '@' {
+		return -1
+	}
+	if quoteIdx == 0 || strings.ContainsRune(" \t\r\n=", rune(value[quoteIdx-1])) {
+		return quoteIdx
+	}
+	return -1
+}
+
+func looksLikePathCompletionToken(token string) bool {
+	if token == "" || strings.HasPrefix(token, "@") {
+		return false
+	}
+	return strings.HasPrefix(token, "\"") ||
+		strings.HasPrefix(token, "./") ||
+		strings.HasPrefix(token, "../") ||
+		strings.HasPrefix(token, "~/") ||
+		strings.Contains(token, "/")
+}
+
+func pathCompletionSuggestions(token, cwd string) []string {
+	rawPrefix := token
+	quoted := false
+	if strings.HasPrefix(rawPrefix, "\"") {
+		quoted = true
+		rawPrefix = rawPrefix[1:]
+	}
+	displayBase := ""
+	readPrefix := rawPrefix
+	if strings.HasPrefix(rawPrefix, "~/") {
+		home := HomeDir()
+		if home == "" {
+			return nil
+		}
+		displayBase = "~/"
+		readPrefix = filepath.Join(home, strings.TrimPrefix(rawPrefix, "~/"))
+	}
+	absolute := filepath.IsAbs(readPrefix)
+	var dir, base string
+	if slash := strings.LastIndex(readPrefix, "/"); slash >= 0 {
+		dir, base = readPrefix[:slash], readPrefix[slash+1:]
+		if dir == "" {
+			dir = "/"
+		}
+	} else {
+		dir, base = ".", readPrefix
+	}
+	readDir := dir
+	if !absolute && displayBase == "" {
+		readDir = filepath.Join(cwd, dir)
+	}
+	entries, err := os.ReadDir(readDir)
+	if err != nil {
+		return nil
+	}
+	matches := make([]string, 0, 8)
+	for _, entry := range entries {
+		name := entry.Name()
+		if strings.HasPrefix(name, ".") && dir == "." && !strings.HasPrefix(base, ".") {
+			continue
+		}
+		if base != "" && !strings.HasPrefix(name, base) {
+			continue
+		}
+		var rel string
+		switch {
+		case displayBase != "":
+			typedDir := strings.TrimSuffix(strings.TrimPrefix(rawPrefix, "~/"), "/")
+			if typedDir != "" && typedDir != base {
+				parent := filepath.Dir(strings.TrimPrefix(rawPrefix, "~/"))
+				if parent != "." {
+					rel = displayBase + strings.TrimSuffix(parent, "/") + "/" + name
+				} else {
+					rel = displayBase + name
+				}
+			} else {
+				rel = displayBase + name
+			}
+		case dir == "/":
+			rel = "/" + name
+		case dir != ".":
+			rel = strings.TrimSuffix(dir, "/") + "/" + name
+		default:
+			rel = name
+		}
+		if entry.IsDir() {
+			rel += "/"
+		}
+		matches = append(matches, buildPathCompletion(rel, quoted))
+	}
+	sort.Strings(matches)
+	if len(matches) > 8 {
+		matches = matches[:8]
+	}
+	return matches
+}
+
+func buildPathCompletion(path string, quoted bool) string {
+	if quoted || strings.Contains(path, " ") {
+		if strings.HasSuffix(path, "/") {
+			return "\"" + path
+		}
+		return "\"" + path + "\""
+	}
+	return path
 }
 
 func slashCommandSuggestions(input string) []string {
@@ -1365,6 +1561,15 @@ func interactiveSuggestions(input string, agent *AgentSession) []string {
 			}
 		}
 		return nil
+	}
+	if token, _, ok := trailingPathCompletionToken(input); ok {
+		if agent != nil {
+			if cwd := agent.Session.CWD(); cwd != "" {
+				if suggestions := pathCompletionSuggestions(token, cwd); len(suggestions) > 0 {
+					return suggestions
+				}
+			}
+		}
 	}
 	raw := strings.TrimLeft(input, " \t\r\n")
 	text := strings.TrimSpace(input)
@@ -1402,6 +1607,36 @@ func interactiveSuggestions(input string, agent *AgentSession) []string {
 		matches = matches[:6]
 	}
 	return matches
+}
+
+func (m *interactiveModel) selectedSuggestionIndex(suggestions []string) int {
+	if len(suggestions) == 0 {
+		m.autocompleteIndex = 0
+		return 0
+	}
+	if m.autocompleteIndex < 0 {
+		m.autocompleteIndex = 0
+	}
+	if m.autocompleteIndex >= len(suggestions) {
+		m.autocompleteIndex = len(suggestions) - 1
+	}
+	return m.autocompleteIndex
+}
+
+func (m *interactiveModel) navigateAutocomplete(delta int) bool {
+	suggestions := m.currentSuggestions()
+	if len(suggestions) == 0 {
+		m.autocompleteIndex = 0
+		return false
+	}
+	index := m.selectedSuggestionIndex(suggestions)
+	index = (index + delta) % len(suggestions)
+	if index < 0 {
+		index += len(suggestions)
+	}
+	m.autocompleteIndex = index
+	m.historyIndex = -1
+	return true
 }
 
 func modelCommandSuggestions(text string, agent *AgentSession) []string {
@@ -1512,10 +1747,9 @@ func (m *interactiveModel) setStatus(text string) {
 // tea.Cmd goroutine: CycleModel emits ModelChangedEvent -> m.post ->
 // program.Send, which blocks on Bubble Tea's unbuffered msg channel, so
 // invoking it on the Update goroutine would deadlock. m.cyclingModel (toggled
-// only on the Update goroutine) serializes presses so the cmd never mutates
-// a.Model concurrently; cycling is also suppressed mid-turn (m.busy). Success
-// feedback rides the emitted ModelChangedEvent; only the "nothing to cycle"
-// case sets a status, via modelCycleDoneMsg.
+// only on the Update goroutine) serializes presses; cycling is also suppressed
+// mid-turn (m.busy). Success feedback rides the emitted ModelChangedEvent; only
+// the "nothing to cycle" case sets a status, via modelCycleDoneMsg.
 func (m *interactiveModel) cycleModel(backward bool) tea.Cmd {
 	if m.busy {
 		m.setStatus("Can't switch model while a response is streaming")
@@ -1532,12 +1766,18 @@ func (m *interactiveModel) cycleModel(backward bool) tea.Cmd {
 	m.cyclingModel = true
 	return func() tea.Msg {
 		var ok bool
+		var data map[string]any
 		if backward {
-			_, ok = agent.CycleModelBackward()
+			data, ok = agent.CycleModelBackward()
 		} else {
-			_, ok = agent.CycleModel()
+			data, ok = agent.CycleModel()
 		}
-		return modelCycleDoneMsg{ok: ok, scoped: len(agent.scopedModels) > 0}
+		scoped, _ := data["isScoped"].(bool)
+		busy, _ := data["busy"].(bool)
+		if data == nil {
+			scoped = agent.hasScopedModels()
+		}
+		return modelCycleDoneMsg{ok: ok, scoped: scoped, busy: busy}
 	}
 }
 
@@ -1559,7 +1799,7 @@ func (m *interactiveModel) openModelSelector() {
 		return
 	}
 	models := agent.availableModels()
-	overlay := newModelSelectorOverlay(models, agent.Model)
+	overlay := newModelSelectorOverlay(models, agent.CurrentModel())
 	if overlay == nil {
 		m.setStatus("No models available")
 		return
@@ -1589,6 +1829,10 @@ func (m *interactiveModel) handleModelSelectorKey(key string) tea.Cmd {
 		if !ok {
 			return nil
 		}
+		if m.busy {
+			m.setStatus("Can't switch model while a response is streaming")
+			return nil
+		}
 		return m.applyModelSelection(value)
 	case modelSelectorCancel:
 		m.modelSelector = nil
@@ -1614,7 +1858,8 @@ func (m *interactiveModel) applyModelSelection(value string) tea.Cmd {
 		if err != nil {
 			return modelSelectDoneMsg{Err: err}
 		}
-		if agent.Model.Provider == provider && agent.Model.ID == id {
+		currentModel := agent.CurrentModel()
+		if currentModel.Provider == provider && currentModel.ID == id {
 			return modelSelectDoneMsg{}
 		}
 		_, err = agent.SetModel(provider, id)

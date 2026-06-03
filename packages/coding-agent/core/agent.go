@@ -80,6 +80,50 @@ func NewAgentSession(session *SessionManager, settings *SettingsManager, registr
 	}
 }
 
+type agentModelSnapshot struct {
+	Model         ai.Model
+	ThinkingLevel ai.ThinkingLevel
+}
+
+type agentLoopSnapshot struct {
+	Model         ai.Model
+	ThinkingLevel ai.ThinkingLevel
+	SteeringMode  string
+	FollowUpMode  string
+}
+
+func (a *AgentSession) modelSnapshot() agentModelSnapshot {
+	if a == nil {
+		return agentModelSnapshot{}
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return agentModelSnapshot{Model: a.Model, ThinkingLevel: a.ThinkingLevel}
+}
+
+func (a *AgentSession) loopSnapshot() agentLoopSnapshot {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return agentLoopSnapshot{
+		Model:         a.Model,
+		ThinkingLevel: a.ThinkingLevel,
+		SteeringMode:  a.steeringMode,
+		FollowUpMode:  a.followUpMode,
+	}
+}
+
+func (a *AgentSession) CurrentModel() ai.Model {
+	return a.modelSnapshot().Model
+}
+
+func (a *AgentSession) CurrentThinkingLevel() ai.ThinkingLevel {
+	return a.modelSnapshot().ThinkingLevel
+}
+
+func (a *AgentSession) promptActiveLocked() bool {
+	return a.streaming || a.activeAgent != nil
+}
+
 func (a *AgentSession) Prompt(ctx context.Context, text string, images []ai.ContentBlock, sink ai.EventSink) error {
 	return a.promptWithRetry(ctx, text, images, "", nil, sink)
 }
@@ -153,17 +197,18 @@ func (a *AgentSession) newLoopAgent(sink ai.EventSink, maxLoopHit *bool, persist
 	turnCount := 0
 	extensionTurnIndex := 0
 	sessionCtx := a.Session.BuildContext()
+	snapshot := a.loopSnapshot()
 	opts := agentcore.AgentOptions{
 		InitialState: agentcore.AgentState{
 			SystemPrompt:  a.SystemPrompt,
-			Model:         a.Model,
-			ThinkingLevel: a.ThinkingLevel,
+			Model:         snapshot.Model,
+			ThinkingLevel: snapshot.ThinkingLevel,
 			Tools:         agentTools(a, a.Tools),
 			Messages:      sessionCtx.Messages,
 		},
 		Registry:      a.Registry,
-		SteeringMode:  queueMode(a.steeringMode),
-		FollowUpMode:  queueMode(a.followUpMode),
+		SteeringMode:  queueMode(snapshot.SteeringMode),
+		FollowUpMode:  queueMode(snapshot.FollowUpMode),
 		ToolExecution: agentcore.ToolExecutionSequential,
 		// Run the extension runner's tool_call/tool_result handlers as part of the
 		// execution chain so security extensions (permission-gate, protected-paths)
@@ -484,14 +529,21 @@ func (a *AgentSession) SetModel(provider, modelID string) (ai.Model, error) {
 	if !ok {
 		return ai.Model{}, fmt.Errorf("model not found: %s/%s", provider, modelID)
 	}
+	a.mu.Lock()
+	if a.promptActiveLocked() {
+		a.mu.Unlock()
+		return ai.Model{}, errorsString("can't switch model while a response is streaming")
+	}
 	a.Model = model
+	thinkingLevel := a.ThinkingLevel
 	_ = a.Session.AppendModelChange(provider, modelID)
 	// Persist as the global default so a fresh launch remembers the choice,
 	// mirroring agent-session.ts:1448 setModel -> setDefaultModelAndProvider.
 	if a.Settings != nil {
 		_ = a.Settings.SetDefaultModelAndProvider(provider, modelID)
 	}
-	a.emitSessionEvent(ModelChangedEvent{Model: model, ThinkingLevel: a.ThinkingLevel})
+	a.mu.Unlock()
+	a.emitSessionEvent(ModelChangedEvent{Model: model, ThinkingLevel: thinkingLevel})
 	return model, nil
 }
 
@@ -507,13 +559,22 @@ func (a *AgentSession) CycleModelBackward() (map[string]any, bool) {
 }
 
 func (a *AgentSession) cycleModelInDirection(step int) (map[string]any, bool) {
-	models := a.availableModels()
+	models, isScoped := a.availableModelsWithScoped()
 	if len(models) <= 1 {
 		return nil, false
 	}
+	a.mu.Lock()
+	if a.promptActiveLocked() {
+		a.mu.Unlock()
+		// Distinguish a streaming-busy refusal from "only one model" (len<=1 above)
+		// so the TUI can show the right reason; both still report ok=false.
+		return map[string]any{"busy": true}, false
+	}
+	current := a.Model
+	thinkingLevel := a.ThinkingLevel
 	idx := 0
 	for i, m := range models {
-		if m.Provider == a.Model.Provider && m.ID == a.Model.ID {
+		if m.Provider == current.Provider && m.ID == current.ID {
 			idx = i
 			break
 		}
@@ -528,8 +589,9 @@ func (a *AgentSession) cycleModelInDirection(step int) (map[string]any, bool) {
 	if a.Settings != nil {
 		_ = a.Settings.SetDefaultModelAndProvider(next.Provider, next.ID)
 	}
-	a.emitSessionEvent(ModelChangedEvent{Model: next, ThinkingLevel: a.ThinkingLevel})
-	return map[string]any{"model": next, "thinkingLevel": a.ThinkingLevel, "isScoped": len(a.scopedModels) > 0}, true
+	a.mu.Unlock()
+	a.emitSessionEvent(ModelChangedEvent{Model: next, ThinkingLevel: thinkingLevel})
+	return map[string]any{"model": next, "thinkingLevel": thinkingLevel, "isScoped": isScoped}, true
 }
 
 func (a *AgentSession) SetThinkingLevel(level ai.ThinkingLevel) error {
@@ -540,43 +602,60 @@ func (a *AgentSession) SetThinkingLevel(level ai.ThinkingLevel) error {
 	// when the effective level actually changes, mirroring
 	// agent-session.ts:1532 setThinkingLevel (which gates the session append,
 	// settings write, and event on isChanging).
-	effectiveLevel := ClampThinking(a.Model, level)
+	a.mu.Lock()
+	if a.promptActiveLocked() {
+		a.mu.Unlock()
+		return errorsString("can't switch thinking level while a response is streaming")
+	}
+	model := a.Model
+	effectiveLevel := ClampThinking(model, level)
 	previousLevel := a.ThinkingLevel
 	a.ThinkingLevel = effectiveLevel
+	supportsThinking := modelSupportsThinking(model)
 	if effectiveLevel == previousLevel {
+		a.mu.Unlock()
 		return nil
 	}
 	if err := a.Session.AppendThinkingChange(effectiveLevel); err != nil {
+		a.mu.Unlock()
 		return err
 	}
 	// Only persist as the global default when the model supports thinking or the
 	// level is non-off, mirroring the `supportsThinking() || level !== "off"`
 	// guard at agent-session.ts:1544.
-	if a.Settings != nil && (a.SupportsThinking() || effectiveLevel != ai.ThinkingOff) {
+	if a.Settings != nil && (supportsThinking || effectiveLevel != ai.ThinkingOff) {
 		_ = a.Settings.SetDefaultThinkingLevel(effectiveLevel)
 	}
+	a.mu.Unlock()
 	a.emitSessionEvent(ThinkingLevelChangedEvent{Level: effectiveLevel})
 	return nil
 }
 
 func (a *AgentSession) CycleThinkingLevel() (ai.ThinkingLevel, bool) {
-	levels := a.Model.ThinkingLevels
-	if len(levels) == 0 {
-		levels = []ai.ThinkingLevel{ai.ThinkingOff, ai.ThinkingMinimal, ai.ThinkingLow, ai.ThinkingMedium, ai.ThinkingHigh}
+	a.mu.Lock()
+	if a.promptActiveLocked() {
+		level := a.ThinkingLevel
+		a.mu.Unlock()
+		return level, false
 	}
+	snapshot := agentModelSnapshot{Model: a.Model, ThinkingLevel: a.ThinkingLevel}
+	a.mu.Unlock()
+	levels := availableThinkingLevelsForModel(snapshot.Model)
 	if len(levels) <= 1 {
-		return a.ThinkingLevel, false
+		return snapshot.ThinkingLevel, false
 	}
 	idx := 0
 	for i, l := range levels {
-		if l == a.ThinkingLevel {
+		if l == snapshot.ThinkingLevel {
 			idx = i
 			break
 		}
 	}
 	next := levels[(idx+1)%len(levels)]
-	_ = a.SetThinkingLevel(next)
-	return a.ThinkingLevel, true
+	if err := a.SetThinkingLevel(next); err != nil {
+		return snapshot.ThinkingLevel, false
+	}
+	return a.CurrentThinkingLevel(), true
 }
 
 func (a *AgentSession) SetSessionName(name string) error {

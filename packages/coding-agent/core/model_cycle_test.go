@@ -23,20 +23,22 @@ func cycleTestModels() []ai.Model {
 func TestCycleModelBackwardWrapsAndCycles(t *testing.T) {
 	models := cycleTestModels()
 	agent, _ := buildPersistAgent(t, models, models[0])
-	start := agent.Model
+	start := agent.CurrentModel()
 
 	if _, ok := agent.CycleModelBackward(); !ok {
 		t.Fatalf("CycleModelBackward returned false with 2 models")
 	}
-	if agent.Model.Provider == start.Provider && agent.Model.ID == start.ID {
+	current := agent.CurrentModel()
+	if current.Provider == start.Provider && current.ID == start.ID {
 		t.Fatalf("backward cycle did not change model from %s/%s", start.Provider, start.ID)
 	}
 	if _, ok := agent.CycleModelBackward(); !ok {
 		t.Fatalf("second CycleModelBackward returned false")
 	}
-	if agent.Model.Provider != start.Provider || agent.Model.ID != start.ID {
+	current = agent.CurrentModel()
+	if current.Provider != start.Provider || current.ID != start.ID {
 		t.Fatalf("two backward cycles did not return to start: got %s/%s want %s/%s",
-			agent.Model.Provider, agent.Model.ID, start.Provider, start.ID)
+			current.Provider, current.ID, start.Provider, start.ID)
 	}
 }
 
@@ -45,20 +47,22 @@ func TestCycleModelBackwardWrapsAndCycles(t *testing.T) {
 func TestCycleModelForwardBackwardRoundTrip(t *testing.T) {
 	models := cycleTestModels()
 	agent, _ := buildPersistAgent(t, models, models[0])
-	start := agent.Model
+	start := agent.CurrentModel()
 
 	if _, ok := agent.CycleModel(); !ok {
 		t.Fatalf("CycleModel (forward) returned false")
 	}
-	if agent.Model.Provider == start.Provider && agent.Model.ID == start.ID {
+	current := agent.CurrentModel()
+	if current.Provider == start.Provider && current.ID == start.ID {
 		t.Fatalf("forward cycle did not change model")
 	}
 	if _, ok := agent.CycleModelBackward(); !ok {
 		t.Fatalf("CycleModelBackward returned false")
 	}
-	if agent.Model.Provider != start.Provider || agent.Model.ID != start.ID {
+	current = agent.CurrentModel()
+	if current.Provider != start.Provider || current.ID != start.ID {
 		t.Fatalf("forward+backward did not round-trip: got %s/%s want %s/%s",
-			agent.Model.Provider, agent.Model.ID, start.Provider, start.ID)
+			current.Provider, current.ID, start.Provider, start.ID)
 	}
 }
 
@@ -67,13 +71,14 @@ func TestCycleModelForwardBackwardRoundTrip(t *testing.T) {
 func TestCycleModelBackwardSingleModelNoop(t *testing.T) {
 	models := []ai.Model{{Provider: "anthropic", ID: "claude-sonnet-4-5", API: "anthropic"}}
 	agent, _ := buildPersistAgent(t, models, models[0])
-	start := agent.Model
+	start := agent.CurrentModel()
 
 	if data, ok := agent.CycleModelBackward(); ok || data != nil {
 		t.Fatalf("CycleModelBackward with one model should return (nil,false); got (%#v,%v)", data, ok)
 	}
-	if agent.Model.Provider != start.Provider || agent.Model.ID != start.ID {
-		t.Fatalf("single-model backward cycle mutated model to %s/%s", agent.Model.Provider, agent.Model.ID)
+	current := agent.CurrentModel()
+	if current.Provider != start.Provider || current.ID != start.ID {
+		t.Fatalf("single-model backward cycle mutated model to %s/%s", current.Provider, current.ID)
 	}
 }
 

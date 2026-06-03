@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/guanshan/pi-go/packages/ai"
 )
@@ -243,11 +244,75 @@ func TestScriptExtensionHasUIUpdatesOnLateBinding(t *testing.T) {
 	api.SetUIHandler(func(_ context.Context, _ string, _ json.RawMessage) (json.RawMessage, error) {
 		return json.RawMessage("null"), nil
 	})
-	res, err = tool.Execute(context.Background(), []byte("{}"))
-	if err != nil {
-		t.Fatalf("execute (post-bind): %v", err)
+	deadline := time.Now().Add(time.Second)
+	for {
+		res, err = tool.Execute(context.Background(), []byte("{}"))
+		if err != nil {
+			t.Fatalf("execute (post-bind): %v", err)
+		}
+		if got := toolResultText(res); got == "hasUI=true" {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("post-bind result=%q want hasUI=true (set_has_ui not delivered)", toolResultText(res))
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
-	if got := toolResultText(res); got != "hasUI=true" {
-		t.Fatalf("post-bind result=%q want hasUI=true (set_has_ui not delivered)", got)
+}
+
+// TestSendSetHasUIIgnoresStaleSeq verifies the ordering guard: an out-of-order
+// dispatch goroutine carrying an older sequence must not overwrite a newer
+// hasUI state, so a rapid bind/unbind resolves to its latest value.
+func TestSendSetHasUIIgnoresStaleSeq(t *testing.T) {
+	r := &scriptRuntime{hasUIWake: make(chan struct{}, 1)}
+
+	r.sendSetHasUI(2, false)
+	r.sendSetHasUI(1, true) // stale: lower seq than what's already recorded
+
+	r.hasUIMu.Lock()
+	pending, seq := r.hasUIPending, r.hasUISeq
+	r.hasUIMu.Unlock()
+	if pending != false || seq != 2 {
+		t.Fatalf("stale seq applied: pending=%v seq=%d, want false/2", pending, seq)
 	}
+
+	r.sendSetHasUI(3, true) // newer: applies
+	r.hasUIMu.Lock()
+	pending = r.hasUIPending
+	r.hasUIMu.Unlock()
+	if pending != true {
+		t.Fatalf("newer seq not applied: pending=%v, want true", pending)
+	}
+}
+
+func TestSetUIHandlerDoesNotBlockOnSlowListener(t *testing.T) {
+	api := NewAPI()
+	started := make(chan struct{})
+	release := make(chan struct{})
+	api.registerUIListener(func(uint64, bool) {
+		close(started)
+		<-release
+	})
+
+	done := make(chan struct{})
+	go func() {
+		api.SetUIHandler(func(context.Context, string, json.RawMessage) (json.RawMessage, error) {
+			return json.RawMessage("null"), nil
+		})
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(200 * time.Millisecond):
+		close(release)
+		t.Fatal("SetUIHandler blocked on a listener")
+	}
+	select {
+	case <-started:
+	case <-time.After(200 * time.Millisecond):
+		close(release)
+		t.Fatal("listener was not invoked")
+	}
+	close(release)
 }

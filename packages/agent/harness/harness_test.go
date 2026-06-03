@@ -1051,6 +1051,51 @@ func TestAgentHarnessNavigateTreeHooksAndSummary(t *testing.T) {
 	}
 }
 
+func TestAgentHarnessNavigateTreeUsesPrecomputedSummary(t *testing.T) {
+	ctx := context.Background()
+	sess, err := session.NewMemory(session.Metadata{ID: "s1"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rootID, err := sess.AppendMessage(ctx, ai.NewUserMessage("root", nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	leftID, err := sess.AppendMessage(ctx, ai.NewUserMessage("left", nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sess.MoveTo(ctx, &rootID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sess.AppendMessage(ctx, ai.NewUserMessage("right", nil)); err != nil {
+		t.Fatal(err)
+	}
+	h, err := New(Options{Session: sess})
+	if err != nil {
+		t.Fatal(err)
+	}
+	details := map[string]any{"source": "caller"}
+	result, err := h.NavigateTree(ctx, leftID, NavigateTreeOptions{
+		Summary:          "precomputed summary",
+		Details:          details,
+		UserWantsSummary: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.SummaryEntry == nil {
+		t.Fatal("expected precomputed summary entry")
+	}
+	if result.SummaryEntry.Summary != "precomputed summary" {
+		t.Fatalf("summary=%q", result.SummaryEntry.Summary)
+	}
+	gotDetails, ok := result.SummaryEntry.Details.(map[string]any)
+	if !ok || gotDetails["source"] != "caller" {
+		t.Fatalf("details=%#v", result.SummaryEntry.Details)
+	}
+}
+
 func TestAgentHarnessNavigateTreeCancel(t *testing.T) {
 	ctx := context.Background()
 	sess, err := session.NewMemory(session.Metadata{ID: "s1"}, nil)

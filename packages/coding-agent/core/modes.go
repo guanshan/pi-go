@@ -134,7 +134,8 @@ func runLineInteractiveMode(ctx context.Context, runtime *AgentSessionRuntime, i
 	uiHandler := newLineExtensionUIHandler(scanner, stdout)
 	bindRuntimeExtensionUI(runtime, uiHandler)
 	defer clearRuntimeExtensionUI(runtime)
-	fmt.Fprintln(stdout, tui.TruncateToWidth(fmt.Sprintf("pi-go %s  cwd=%s  model=%s/%s", Version, agent.Session.CWD(), agent.Model.Provider, agent.Model.ID), 120, "..."))
+	currentModel := agent.CurrentModel()
+	fmt.Fprintln(stdout, tui.TruncateToWidth(fmt.Sprintf("pi-go %s  cwd=%s  model=%s/%s", Version, agent.Session.CWD(), currentModel.Provider, currentModel.ID), 120, "..."))
 	fmt.Fprintln(stdout, "Type /help for commands, /quit to exit.")
 	if strings.TrimSpace(initial) != "" || len(images) > 0 {
 		if err := interactivePrompt(ctx, agent, initial, images, stdout, stderr); err != nil {
@@ -527,7 +528,7 @@ func handleSlashWithPrompt(ctx context.Context, target any, line string, prompte
 				fmt.Fprintf(stdout, "%s/%s%s\n", model.Provider, model.ID, auth)
 			}
 		} else {
-			provider := agent.Model.Provider
+			provider := agent.CurrentModel().Provider
 			modelID := arg
 			if strings.Contains(arg, "/") {
 				parts := strings.SplitN(arg, "/", 2)

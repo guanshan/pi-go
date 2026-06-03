@@ -118,7 +118,11 @@ func findFd(binDir string) (string, bool) {
 }
 
 func searchFd(ctx context.Context, fdPath, root, pattern string, limit int) ([]string, bool, error) {
-	args := []string{"--hidden", "--glob", "--color=never", "--exclude", ".git", "--", pattern, "."}
+	args := []string{"--hidden", "--glob", "--color=never", "--no-require-git", "--exclude", ".git"}
+	if fdGlobNeedsFullPath(pattern) {
+		args = append(args, "--full-path")
+	}
+	args = append(args, "--", pattern, ".")
 	cmd := exec.CommandContext(ctx, fdPath, args...)
 	cmd.Dir = root
 	var stderr bytes.Buffer
@@ -155,6 +159,10 @@ func searchFd(ctx context.Context, fdPath, root, pattern string, limit int) ([]s
 		return nil, false, fmt.Errorf("fd failed: %w: %s", waitErr, strings.TrimSpace(stderr.String()))
 	}
 	return results, limitReached, nil
+}
+
+func fdGlobNeedsFullPath(pattern string) bool {
+	return strings.Contains(filepath.ToSlash(pattern), "/")
 }
 
 func normalizeFdLine(root, line string) string {

@@ -67,48 +67,150 @@ func (t *idleTimeoutTransport) RoundTrip(req *http.Request) (*http.Response, err
 	return resp, nil
 }
 
-// idleTimeoutReader fails a Read that blocks longer than the idle window: a timer
-// armed around each Read closes the body on fire, unblocking the stalled Read.
+// idleTimeoutReader enforces a per-read idle deadline without ever closing a
+// body that is still delivering data. A dedicated goroutine (readLoop) performs
+// the underlying reads and hands each chunk to Read over a channel; Read waits
+// up to the idle window for the next chunk and closes the body only when that
+// window genuinely elapses with no data arriving. A slow-but-progressing stream
+// is therefore never truncated. (The previous design armed a timer that closed
+// the body around every Read, so a chunk landing near the boundary — or the
+// terminal EOF — could be lost the instant the timer fired, even on a healthy
+// connection.)
 type idleTimeoutReader struct {
 	body io.ReadCloser
 	idle time.Duration
 
-	mu       sync.Mutex
-	closed   bool
-	timedOut bool
+	start   sync.Once
+	results chan idleReadResult
+	closeCh chan struct{}
+
+	// Consumer-goroutine-only state. Read is not safe for concurrent use (per the
+	// io.Reader contract), so these need no lock: leftover holds the tail of an
+	// oversized chunk, and done/finalErr latch the terminal result.
+	leftover []byte
+	done     bool
+	finalErr error
+
+	mu     sync.Mutex
+	closed bool
+}
+
+// idleReadResult carries one outcome from readLoop: either a freshly-copied data
+// chunk or a terminal error (the two are sent as separate results).
+type idleReadResult struct {
+	data []byte
+	err  error
 }
 
 func newIdleTimeoutReader(body io.ReadCloser, idle time.Duration) *idleTimeoutReader {
-	return &idleTimeoutReader{body: body, idle: idle}
+	return &idleTimeoutReader{
+		body:    body,
+		idle:    idle,
+		results: make(chan idleReadResult, 1),
+		closeCh: make(chan struct{}),
+	}
+}
+
+// readLoop is the sole reader of the underlying body. It copies each chunk into
+// a fresh buffer (so the consumer owns the bytes even if a later Read times out
+// and aborts the stream) and forwards it, then forwards the terminal error. It
+// exits once the body errors or the reader is closed.
+func (r *idleTimeoutReader) readLoop() {
+	defer close(r.results)
+	buf := make([]byte, 32*1024)
+	for {
+		n, err := r.body.Read(buf)
+		if n > 0 {
+			chunk := make([]byte, n)
+			copy(chunk, buf[:n])
+			select {
+			case r.results <- idleReadResult{data: chunk}:
+			case <-r.closeCh:
+				return
+			}
+		}
+		if err != nil {
+			select {
+			case r.results <- idleReadResult{err: err}:
+			case <-r.closeCh:
+			}
+			return
+		}
+	}
 }
 
 func (r *idleTimeoutReader) Read(p []byte) (int, error) {
-	timer := time.AfterFunc(r.idle, func() {
-		r.mu.Lock()
-		r.timedOut = true
-		body := r.body
-		r.mu.Unlock()
-		// Closing the underlying body unblocks a stalled Read on the connection.
-		_ = body.Close()
-	})
-	n, err := r.body.Read(p)
-	timer.Stop()
-	r.mu.Lock()
-	timedOut := r.timedOut
-	r.mu.Unlock()
-	if timedOut && (err != nil || n == 0) {
-		return n, fmt.Errorf("stream idle timeout after %s", r.idle)
+	r.start.Do(func() { go r.readLoop() })
+	if len(p) == 0 {
+		return 0, nil
 	}
-	return n, err
+	if len(r.leftover) > 0 {
+		n := copy(p, r.leftover)
+		r.leftover = r.leftover[n:]
+		return n, nil
+	}
+	if r.done {
+		return 0, r.finalErr
+	}
+
+	timer := time.NewTimer(r.idle)
+	defer timer.Stop()
+	select {
+	case res, ok := <-r.results:
+		return r.deliver(p, res, ok)
+	case <-timer.C:
+		// The idle window elapsed with no delivery. Prefer a chunk that landed at
+		// the very boundary before declaring a timeout, so a healthy stream is
+		// never truncated by a hair's-breadth scheduling race.
+		select {
+		case res, ok := <-r.results:
+			return r.deliver(p, res, ok)
+		default:
+		}
+		_ = r.closeBody()
+		r.done = true
+		r.finalErr = fmt.Errorf("stream idle timeout after %s", r.idle)
+		return 0, r.finalErr
+	}
+}
+
+// deliver copies a received result into p, stashing any overflow in leftover and
+// latching a terminal error/EOF for subsequent calls.
+func (r *idleTimeoutReader) deliver(p []byte, res idleReadResult, ok bool) (int, error) {
+	if !ok {
+		r.done = true
+		r.finalErr = io.EOF
+		return 0, io.EOF
+	}
+	if len(res.data) > 0 {
+		n := copy(p, res.data)
+		if n < len(res.data) {
+			r.leftover = res.data[n:]
+		}
+		return n, nil
+	}
+	r.done = true
+	r.finalErr = res.err
+	if r.finalErr == nil {
+		r.finalErr = io.EOF
+	}
+	return 0, r.finalErr
 }
 
 func (r *idleTimeoutReader) Close() error {
+	return r.closeBody()
+}
+
+// closeBody closes the underlying body exactly once and signals readLoop to
+// stop. Safe to call from both the idle-timeout path and an explicit Close.
+func (r *idleTimeoutReader) closeBody() error {
 	r.mu.Lock()
 	if r.closed {
 		r.mu.Unlock()
 		return nil
 	}
 	r.closed = true
+	close(r.closeCh)
 	body := r.body
 	r.mu.Unlock()
 	return body.Close()

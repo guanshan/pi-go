@@ -94,7 +94,8 @@ func (a *AgentSession) NavigateTree(ctx context.Context, targetID string, opts N
 			details = beforeTree.Summary.Details
 		}
 		if summary == "" {
-			generatedSummary, generatedDetails, err := mustBuildBranchSummary(treeCtx, a.Session, a.Registry, a.Model, a.ThinkingLevel, a.Settings.BranchSummaryReserveTokens(), oldLeaf, resolvedTargetID, opts.CustomInstructions, opts.ReplaceInstructions)
+			snapshot := a.modelSnapshot()
+			generatedSummary, generatedDetails, err := mustBuildBranchSummary(treeCtx, a.Session, a.Registry, snapshot.Model, snapshot.ThinkingLevel, a.Settings.BranchSummaryReserveTokens(), oldLeaf, resolvedTargetID, opts.CustomInstructions, opts.ReplaceInstructions)
 			if err != nil {
 				if errors.Is(err, context.Canceled) {
 					result.Cancelled = true
@@ -177,10 +178,14 @@ func (a *AgentSession) GetSessionStats() SessionStats {
 }
 
 func (a *AgentSession) GetContextUsage() *ContextUsage {
-	if a == nil || a.Session == nil || a.Model.ContextWindow <= 0 {
+	if a == nil || a.Session == nil {
 		return nil
 	}
-	return &ContextUsage{UsedTokens: estimateMessageTokens(a.Session.BuildContext().Messages), ContextWindow: a.Model.ContextWindow, EstimatedAt: time.Now()}
+	model := a.CurrentModel()
+	if model.ContextWindow <= 0 {
+		return nil
+	}
+	return &ContextUsage{UsedTokens: estimateMessageTokens(a.Session.BuildContext().Messages), ContextWindow: model.ContextWindow, EstimatedAt: time.Now()}
 }
 
 func estimateMessageTokens(messages []ai.Message) int {

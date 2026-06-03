@@ -9,7 +9,10 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/gorilla/websocket"
 	aiproviders "github.com/guanshan/pi-go/packages/ai/providers"
@@ -740,6 +743,67 @@ func TestOpenAICodexResponsesWebSocketTransportFallsBackToSSE(t *testing.T) {
 	}
 }
 
+func TestOpenAICodexResponsesStickySSEFallbackKeepsDiagnostic(t *testing.T) {
+	sessionID := "sticky-sse-session"
+	ResetOpenAICodexWebSocketDebugStats(sessionID)
+	CloseOpenAICodexWebSocketSessions(sessionID)
+	t.Cleanup(func() {
+		CloseOpenAICodexWebSocketSessions(sessionID)
+		ResetOpenAICodexWebSocketDebugStats(sessionID)
+	})
+
+	var wsAttempts atomic.Int32
+	var sseRequests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if websocket.IsWebSocketUpgrade(r) {
+			wsAttempts.Add(1)
+			http.Error(w, "websocket unavailable", http.StatusBadGateway)
+			return
+		}
+		n := sseRequests.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprintf(w, `{"id":"resp_%d","status":"completed","output":[{"type":"message","id":"msg_%d","content":[{"type":"output_text","text":"fallback %d"}]}]}`, n, n, n)
+	}))
+	defer server.Close()
+
+	registry := NewModelRegistry(t.TempDir(), NewAuthStorage(t.TempDir()))
+	registry.Auth.SetRuntime("openai-codex", codexTestJWT("acct-123"))
+	model := Model{
+		Provider: "openai-codex",
+		ID:       "gpt-5-codex",
+		API:      "openai-codex-responses",
+		BaseURL:  server.URL + "/backend-api",
+		Input:    []string{"text"},
+	}
+	first, err := registry.StreamlessChat(context.Background(), ChatRequest{
+		Model:     model,
+		Messages:  []Message{NewUserMessage("first", nil)},
+		Transport: "auto",
+		SessionID: sessionID,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := registry.StreamlessChat(context.Background(), ChatRequest{
+		Model:     model,
+		Messages:  []Message{NewUserMessage("second", nil)},
+		Transport: "auto",
+		SessionID: sessionID,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if MessageText(first.Message) != "fallback 1" || MessageText(second.Message) != "fallback 2" {
+		t.Fatalf("responses=%q/%q", MessageText(first.Message), MessageText(second.Message))
+	}
+	if wsAttempts.Load() != 1 {
+		t.Fatalf("sticky fallback should skip second websocket attempt, got %d attempts", wsAttempts.Load())
+	}
+	if len(second.Message.Diagnostics) != 1 || second.Message.Diagnostics[0].Type != "provider_transport_failure" || second.Message.Diagnostics[0].Details["fallbackTransport"] != "sse" {
+		t.Fatalf("sticky fallback diagnostics=%#v", second.Message.Diagnostics)
+	}
+}
+
 func TestOpenAICodexResponsesWebSocketTransportStreams(t *testing.T) {
 	ResetOpenAICodexWebSocketDebugStats("ws-session")
 	CloseOpenAICodexWebSocketSessions("ws-session")
@@ -933,6 +997,103 @@ func TestOpenAICodexResponsesWebSocketCachedSendsInputDelta(t *testing.T) {
 	}
 	if stats.LastDeltaInputItems == nil || *stats.LastDeltaInputItems != 1 {
 		t.Fatalf("last delta input items=%#v", stats.LastDeltaInputItems)
+	}
+}
+
+func TestOpenAICodexWebSocketConcurrentSameSessionAcquireDoesNotLeak(t *testing.T) {
+	sessionID := "ws-race-session"
+	ResetOpenAICodexWebSocketDebugStats(sessionID)
+	CloseOpenAICodexWebSocketSessions(sessionID)
+	t.Cleanup(func() {
+		CloseOpenAICodexWebSocketSessions(sessionID)
+		ResetOpenAICodexWebSocketDebugStats(sessionID)
+	})
+
+	var entered atomic.Int32
+	var enteredOnce sync.Once
+	bothEntered := make(chan struct{})
+	releaseUpgrades := make(chan struct{})
+	var releaseOnce sync.Once
+	defer releaseOnce.Do(func() { close(releaseUpgrades) })
+	closed := make(chan struct{}, 2)
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !websocket.IsWebSocketUpgrade(r) {
+			http.Error(w, "expected websocket", http.StatusBadRequest)
+			return
+		}
+		if entered.Add(1) == 2 {
+			enteredOnce.Do(func() { close(bothEntered) })
+		}
+		<-releaseUpgrades
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		defer conn.Close()
+		_, _, _ = conn.ReadMessage()
+		closed <- struct{}{}
+	}))
+	defer server.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http")
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	acquired := make(chan openAICodexWebSocketAcquire, 2)
+	errs := make(chan error, 2)
+	var wg sync.WaitGroup
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			acq, err := acquireOpenAICodexWebSocket(ctx, wsURL, nil, sessionID)
+			if err != nil {
+				errs <- err
+				return
+			}
+			acquired <- acq
+		}()
+	}
+	select {
+	case <-bothEntered:
+	case <-time.After(time.Second):
+		t.Fatal("websocket dials did not overlap")
+	}
+	releaseOnce.Do(func() { close(releaseUpgrades) })
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("websocket acquires did not finish")
+	}
+	close(acquired)
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("acquire failed: %v", err)
+		}
+	}
+
+	count := 0
+	for acq := range acquired {
+		count++
+		acq.release(true)
+	}
+	if count != 2 {
+		t.Fatalf("acquired %d connections, want 2", count)
+	}
+	CloseOpenAICodexWebSocketSessions(sessionID)
+	for i := 0; i < 2; i++ {
+		select {
+		case <-closed:
+		case <-time.After(time.Second):
+			t.Fatalf("only observed %d closed websocket(s), want 2", i)
+		}
 	}
 }
 

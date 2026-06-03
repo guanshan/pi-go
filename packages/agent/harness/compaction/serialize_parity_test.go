@@ -26,6 +26,50 @@ func TestSerializeConversationToolCallArgsPreserveOrder(t *testing.T) {
 	}
 }
 
+func TestSerializeConversationToolCallArgsCanonicalizeNumbers(t *testing.T) {
+	assistant := ai.AssistantMessage{
+		Role: "assistant",
+		Content: []ai.ContentBlock{
+			{Type: "toolCall", Name: "calc", Arguments: json.RawMessage(`{"exp":1e10,"fixed":1.0,"nested":[2.50]}`)},
+		},
+	}
+	got := SerializeConversation([]ai.Message{assistant})
+	want := `[Assistant tool calls]: calc(exp=10000000000, fixed=1, nested=[2.5])`
+	if got != want {
+		t.Fatalf("serialized=%q want %q", got, want)
+	}
+}
+
+// P1-07c: a nested object value must keep its JSON key insertion order too
+// (JSON.stringify preserves it); decoding into a Go map would re-sort the keys.
+func TestSerializeConversationToolCallArgsPreserveNestedOrder(t *testing.T) {
+	assistant := ai.AssistantMessage{
+		Role: "assistant",
+		Content: []ai.ContentBlock{
+			{Type: "toolCall", Name: "cfg", Arguments: json.RawMessage(`{"outer":{"zeta":1,"alpha":2,"deep":{"y":1.0,"x":3}}}`)},
+		},
+	}
+	got := SerializeConversation([]ai.Message{assistant})
+	want := `[Assistant tool calls]: cfg(outer={"zeta":1,"alpha":2,"deep":{"y":1,"x":3}})`
+	if got != want {
+		t.Fatalf("serialized=%q want %q", got, want)
+	}
+}
+
+func TestSerializeConversationToolCallArgsUseJSPropertyOrder(t *testing.T) {
+	assistant := ai.AssistantMessage{
+		Role: "assistant",
+		Content: []ai.ContentBlock{
+			{Type: "toolCall", Name: "order", Arguments: json.RawMessage(`{"10":"ten","2":"two","alpha":{"10":"ten","2":"two","z":0},"01":"kept","z":1}`)},
+		},
+	}
+	got := SerializeConversation([]ai.Message{assistant})
+	want := `[Assistant tool calls]: order(2="two", 10="ten", alpha={"2":"two","10":"ten","z":0}, 01="kept", z=1)`
+	if got != want {
+		t.Fatalf("serialized=%q want %q", got, want)
+	}
+}
+
 // P1-07c: user (and tool result) text blocks join with "" (not "\n").
 func TestSerializeConversationUserTextBlocksJoinEmpty(t *testing.T) {
 	user := ai.UserMessage{

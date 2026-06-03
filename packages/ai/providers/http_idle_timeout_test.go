@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -37,8 +38,9 @@ func TestIdleTimeoutFiresOnStalledStream(t *testing.T) {
 	defer server.Close()
 
 	// Total Timeout is generous (5s) so the test only passes if the per-read idle
-	// deadline (50ms) is what fires first.
-	client := NewHTTPClientWithOptions(RequestOptions{TimeoutMs: 5000, IdleTimeoutMs: 50})
+	// deadline (200ms) is what fires first. Keep the idle window above very short
+	// scheduler hiccups while still well below the total timeout.
+	client := NewHTTPClientWithOptions(RequestOptions{TimeoutMs: 5000, IdleTimeoutMs: 200})
 
 	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, server.URL, nil)
 	if err != nil {
@@ -61,7 +63,7 @@ func TestIdleTimeoutFiresOnStalledStream(t *testing.T) {
 	if !strings.Contains(err.Error(), "idle timeout") {
 		t.Fatalf("expected idle timeout error, got: %v", err)
 	}
-	// The idle deadline is 50ms; it must fire well before the 5s total timeout.
+	// The idle deadline is 200ms; it must fire well before the 5s total timeout.
 	if elapsed >= 2*time.Second {
 		t.Fatalf("idle timeout did not fire promptly, elapsed=%s", elapsed)
 	}
@@ -109,4 +111,104 @@ func TestNoIdleTimeoutWhenUnset(t *testing.T) {
 	if c := NewHTTPClientWithOptions(RequestOptions{IdleTimeoutMs: 100}); c.Transport == nil {
 		t.Fatal("expected idle-timeout transport installed when IdleTimeoutMs set")
 	}
+}
+
+// TestIdleTimeoutReaderDoesNotTruncateLiveStream proves the idle timer never
+// closes a body that is still delivering data within the idle window. Unlike a
+// no-op Close, liveStreamReadCloser.Close actually severs the stream, so a
+// premature timer-close would lose data and the assertions below would fail.
+// The full payload must arrive and the body must remain open until the consumer
+// closes it explicitly.
+func TestIdleTimeoutReaderDoesNotTruncateLiveStream(t *testing.T) {
+	body := &liveStreamReadCloser{chunks: []string{"a", "b", "c", "d"}, delay: 5 * time.Millisecond}
+	reader := newIdleTimeoutReader(body, 100*time.Millisecond)
+
+	got, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatalf("live stream read returned error: %v", err)
+	}
+	if string(got) != "abcd" {
+		t.Fatalf("live stream = %q, want abcd", got)
+	}
+	if c := atomic.LoadInt32(&body.closeCount); c != 0 {
+		t.Fatalf("idle timer closed a live stream mid-flight: closeCount=%d, want 0", c)
+	}
+	if err := reader.Close(); err != nil {
+		t.Fatalf("explicit Close returned error: %v", err)
+	}
+	if c := atomic.LoadInt32(&body.closeCount); c != 1 {
+		t.Fatalf("body close count after explicit Close=%d, want 1", c)
+	}
+}
+
+func TestIdleTimeoutReaderTimerCloseIsIdempotent(t *testing.T) {
+	body := newCloseCountingReadCloser()
+	reader := newIdleTimeoutReader(body, 10*time.Millisecond)
+
+	n, err := reader.Read(make([]byte, 1))
+	if n != 0 {
+		t.Fatalf("timeout read returned n=%d, want 0", n)
+	}
+	if err == nil || !strings.Contains(err.Error(), "idle timeout") {
+		t.Fatalf("expected idle timeout error, got %v", err)
+	}
+	if err := reader.Close(); err != nil {
+		t.Fatalf("explicit Close after timer close returned error: %v", err)
+	}
+	if got := atomic.LoadInt32(&body.closeCount); got != 1 {
+		t.Fatalf("underlying body close count=%d, want 1", got)
+	}
+}
+
+// liveStreamReadCloser emits its chunks one per Read, each after a sub-idle
+// delay, then EOF. Its Close genuinely severs the stream (subsequent reads fail
+// with io.ErrClosedPipe) and counts invocations, so a test can detect a timer
+// that closes the body mid-stream.
+type liveStreamReadCloser struct {
+	chunks     []string
+	idx        int
+	delay      time.Duration
+	closeCount int32
+	closed     int32
+}
+
+func (b *liveStreamReadCloser) Read(p []byte) (int, error) {
+	if atomic.LoadInt32(&b.closed) != 0 {
+		return 0, io.ErrClosedPipe
+	}
+	if b.idx >= len(b.chunks) {
+		return 0, io.EOF
+	}
+	time.Sleep(b.delay) // each chunk arrives well within the idle window
+	n := copy(p, b.chunks[b.idx])
+	b.idx++
+	return n, nil
+}
+
+func (b *liveStreamReadCloser) Close() error {
+	atomic.AddInt32(&b.closeCount, 1)
+	atomic.StoreInt32(&b.closed, 1)
+	return nil
+}
+
+type closeCountingReadCloser struct {
+	closed     chan struct{}
+	closeCount int32
+}
+
+func newCloseCountingReadCloser() *closeCountingReadCloser {
+	return &closeCountingReadCloser{closed: make(chan struct{})}
+}
+
+func (b *closeCountingReadCloser) Read([]byte) (int, error) {
+	<-b.closed
+	return 0, io.ErrClosedPipe
+}
+
+func (b *closeCountingReadCloser) Close() error {
+	if atomic.AddInt32(&b.closeCount, 1) == 1 {
+		close(b.closed)
+		return nil
+	}
+	return io.ErrClosedPipe
 }

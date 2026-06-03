@@ -1,6 +1,10 @@
 package ai
 
-import "testing"
+import (
+	"testing"
+
+	aiutils "github.com/guanshan/pi-go/packages/ai/utils"
+)
 
 func overflowTestMessage(errorMessage string) Message {
 	msg := NewAssistantMessage("", "", "", nil, Usage{}, "error")
@@ -38,10 +42,17 @@ func TestIsContextOverflowIgnoresNonOverflowErrors(t *testing.T) {
 }
 
 // TestIsContextOverflowAllPatterns ports ../pi/packages/ai/test/overflow.test.ts
-// coverage of overflow.ts:34-73 — every one of the 24 OVERFLOW_PATTERNS must be
-// detected, and every one of the 3 NON_OVERFLOW_PATTERNS must be suppressed even
-// though they may also match an overflow pattern (e.g. "too many tokens").
+// coverage of overflow.ts:34-73 — every one of the 23 Go overflow patterns must
+// be detected (plus a comma-grouped numeric variant), and every one of the 3
+// non-overflow patterns must be suppressed even though they may also match an
+// overflow pattern (e.g. "too many tokens").
 func TestIsContextOverflowAllPatterns(t *testing.T) {
+	if got := len(aiutils.GetOverflowPatterns()); got != 23 {
+		t.Fatalf("expected 23 overflow patterns, got %d", got)
+	}
+	if got := len(aiutils.GetNonOverflowPatterns()); got != 3 {
+		t.Fatalf("expected 3 non-overflow patterns, got %d", got)
+	}
 	// One representative error string per OVERFLOW_PATTERN (overflow.ts:34-58),
 	// mirroring the documented example messages. The trailing comment names the
 	// pattern each string exercises, in source order.
@@ -73,9 +84,8 @@ func TestIsContextOverflowAllPatterns(t *testing.T) {
 	if len(overflow) != 23 {
 		t.Fatalf("expected 23 distinct overflow example strings, got %d", len(overflow))
 	}
-	// The 24th pattern (/exceeds (?:the )?(?:model'?s )?maximum context length of
-	// [\d,]+ tokens?/i) admits a comma-grouped variant; exercise it separately so
-	// the [\d,]+ alternation is covered too.
+	// The maximum-context-length pattern admits a comma-grouped variant; exercise
+	// it separately so the [\d,]+ alternation is covered too.
 	overflow = append(overflow, "exceeds the maximum context length of 1,048,576 tokens")
 	if len(overflow) != 24 {
 		t.Fatalf("expected 24 overflow examples after comma variant, got %d", len(overflow))
@@ -94,6 +104,9 @@ func TestIsContextOverflowAllPatterns(t *testing.T) {
 		"Service unavailable: temporarily down",                               // /^(Throttling error|Service unavailable):/i
 		"Provider hit a rate limit, please retry.",                            // /rate limit/i
 		"429 Too Many Requests",                                               // /too many requests/i
+	}
+	if len(nonOverflow) != 4 {
+		t.Fatalf("expected 4 non-overflow examples, got %d", len(nonOverflow))
 	}
 	for _, message := range nonOverflow {
 		if IsContextOverflow(overflowTestMessage(message), 0) {

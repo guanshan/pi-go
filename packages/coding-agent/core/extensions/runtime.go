@@ -83,7 +83,11 @@ type API struct {
 	shutdownHandlers []func(context.Context) error
 	eventHandlers    map[string]int
 	uiHandler        UIRequestHandler
-	uiListeners      []func(bool)
+	uiListeners      []func(uint64, bool)
+	// uiSeq is a monotonic sequence stamped on each SetUIHandler call (under mu)
+	// so listeners can discard stale notifications and resolve a true/false race
+	// to the latest state regardless of goroutine scheduling order.
+	uiSeq uint64
 }
 
 func NewAPI() *API {

@@ -92,6 +92,24 @@ func TestParseArgsKnownFlagMissingValueIsPermissive(t *testing.T) {
 	}
 }
 
+func TestParseArgsShortValueAliasMissingValueErrors(t *testing.T) {
+	for _, flag := range []string{"-t", "-e", "-xt"} {
+		args := ParseArgs([]string{flag})
+		found := false
+		for _, d := range args.Diagnostics {
+			if d.Type == "error" && d.Message == "Unknown option: "+flag {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("%s missing value should report Unknown option, diagnostics=%#v", flag, args.Diagnostics)
+		}
+		if len(args.UnknownFlags) != 0 {
+			t.Fatalf("%s missing value should not be stored in UnknownFlags: %#v", flag, args.UnknownFlags)
+		}
+	}
+}
+
 // TestParseArgsUnknownFlagCapturesFollowingValue mirrors TS: an unknown --flag
 // followed by a non-flag value captures that value; otherwise it is a boolean.
 func TestParseArgsUnknownFlagCapturesFollowingValue(t *testing.T) {

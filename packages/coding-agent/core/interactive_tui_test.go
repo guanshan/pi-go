@@ -311,6 +311,102 @@ func TestInteractiveAtCompletionReplacesTrailingToken(t *testing.T) {
 	}
 }
 
+func TestInteractiveAutocompleteDropdownNavigation(t *testing.T) {
+	runtime := testInteractiveRuntime(t)
+	model, err := newInteractiveModel(context.Background(), runtime, "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	model.input.SetValue("/")
+	if !model.navigateAutocomplete(1) {
+		t.Fatal("expected autocomplete navigation to consume down")
+	}
+	suggestions := model.currentSuggestions()
+	if len(suggestions) < 2 {
+		t.Fatalf("need at least two suggestions, got %#v", suggestions)
+	}
+	selected := suggestions[model.selectedSuggestionIndex(suggestions)]
+	rendered := model.renderSuggestions()
+	if !strings.Contains(rendered, "> ") {
+		t.Fatalf("dropdown render should include selected marker, got %q", rendered)
+	}
+	if !model.completeSlashCommand() {
+		t.Fatal("expected completion to apply selected suggestion")
+	}
+	if got := model.input.Value(); got != selected+" " {
+		t.Fatalf("completed value=%q want selected %q", got, selected+" ")
+	}
+	if model.historyIndex != -1 {
+		t.Fatalf("autocomplete navigation should exit history browsing, historyIndex=%d", model.historyIndex)
+	}
+}
+
+func TestInteractivePathCompletionWithoutAtPrefix(t *testing.T) {
+	runtime := testInteractiveRuntime(t)
+	cwd := runtime.Session().Session.CWD()
+	if err := os.Mkdir(filepath.Join(cwd, "src"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cwd, "src", "main.go"), []byte("package main"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	model, err := newInteractiveModel(context.Background(), runtime, "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	model.input.SetValue("inspect src/ma")
+	suggestions := model.currentSuggestions()
+	if !slices.Contains(suggestions, "src/main.go") {
+		t.Fatalf("expected path suggestion, got %#v", suggestions)
+	}
+	if !model.completeSlashCommand() {
+		t.Fatal("expected path completion")
+	}
+	if got := model.input.Value(); got != "inspect src/main.go " {
+		t.Fatalf("completed value=%q want path replacement", got)
+	}
+
+	model.input.SetValue("/model faux/f")
+	model.autocompleteIndex = 0
+	modelSuggestions := model.currentSuggestions()
+	if !slices.Contains(modelSuggestions, "/model faux/faux") {
+		t.Fatalf("/model suggestions should survive path-looking provider/id, got %#v", modelSuggestions)
+	}
+}
+
+func TestInteractivePathCompletionQuotedDirectoryContinues(t *testing.T) {
+	runtime := testInteractiveRuntime(t)
+	cwd := runtime.Session().Session.CWD()
+	dir := filepath.Join(cwd, "dir with space")
+	if err := os.Mkdir(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "nested.go"), []byte("package main"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	model, err := newInteractiveModel(context.Background(), runtime, "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	model.input.SetValue("inspect \"dir with sp")
+	suggestions := model.currentSuggestions()
+	if !slices.Contains(suggestions, "\"dir with space/") {
+		t.Fatalf("expected open quoted directory suggestion, got %#v", suggestions)
+	}
+	if !model.completeSlashCommand() {
+		t.Fatal("expected quoted directory completion")
+	}
+	if got := model.input.Value(); got != "inspect \"dir with space/" {
+		t.Fatalf("directory completion=%q want open quote without trailing space", got)
+	}
+
+	suggestions = model.currentSuggestions()
+	if !slices.Contains(suggestions, "\"dir with space/nested.go\"") {
+		t.Fatalf("expected nested file suggestion after directory completion, got %#v", suggestions)
+	}
+}
+
 func TestLineExtensionUIHandlerAnswersPrompts(t *testing.T) {
 	scanner := bufio.NewScanner(strings.NewReader("y\n2\nhello\n"))
 	var stdout bytes.Buffer

@@ -23,21 +23,29 @@ func (api *API) SetUIHandler(handler UIRequestHandler) {
 	if api == nil {
 		return
 	}
+	// Stamp a monotonic sequence under the lock and snapshot the listeners, then
+	// notify them off the lock so a slow/blocking listener can never stall the
+	// caller (SetUIHandler runs on the host's command goroutine). The sequence
+	// lets each listener resolve a true/false race to the latest state even though
+	// the dispatch goroutines may run out of order.
 	api.mu.Lock()
 	api.uiHandler = handler
-	listeners := make([]func(bool), len(api.uiListeners))
+	api.uiSeq++
+	seq := api.uiSeq
+	has := handler != nil
+	listeners := make([]func(uint64, bool), len(api.uiListeners))
 	copy(listeners, api.uiListeners)
 	api.mu.Unlock()
-	has := handler != nil
 	for _, listen := range listeners {
-		listen(has)
+		go listen(seq, has)
 	}
 }
 
-// registerUIListener registers a callback invoked (outside the API lock) whenever
-// the UI handler is bound or cleared, with the new ctx.hasUI capability. Each
-// script runtime registers one to forward set_has_ui to its extension.
-func (api *API) registerUIListener(listen func(bool)) {
+// registerUIListener registers a callback invoked (outside the API lock, on a
+// dispatch goroutine) whenever the UI handler is bound or cleared, with the
+// SetUIHandler sequence and the new ctx.hasUI capability. Each script runtime
+// registers one to forward set_has_ui to its extension.
+func (api *API) registerUIListener(listen func(uint64, bool)) {
 	if api == nil || listen == nil {
 		return
 	}
@@ -46,16 +54,46 @@ func (api *API) registerUIListener(listen func(bool)) {
 	api.uiListeners = append(api.uiListeners, listen)
 }
 
-// sendSetHasUI pushes the current ctx.hasUI capability to the extension so its
-// ctx.hasUI getter reflects late handler binding/unbinding.
-func (r *scriptRuntime) sendSetHasUI(has bool) {
-	data, err := json.Marshal(map[string]any{"type": "set_has_ui", "value": has})
-	if err != nil {
+// sendSetHasUI records the latest ctx.hasUI capability for the extension and
+// wakes hasUIWriteLoop to push it. It never blocks the caller: seq discards
+// stale notifications so an out-of-order dispatch goroutine can't overwrite a
+// newer state, and the wake is a non-blocking signal. The actual (potentially
+// blocking) stdin write happens on the runtime's own goroutine, so a stuck
+// extension can never stall the host or leak a goroutine per binding.
+func (r *scriptRuntime) sendSetHasUI(seq uint64, has bool) {
+	if r == nil {
 		return
 	}
-	r.writeMu.Lock()
-	defer r.writeMu.Unlock()
-	_, _ = r.stdin.Write(append(data, '\n'))
+	r.hasUIMu.Lock()
+	if seq <= r.hasUISeq {
+		r.hasUIMu.Unlock()
+		return
+	}
+	r.hasUISeq = seq
+	r.hasUIPending = has
+	r.hasUIMu.Unlock()
+	select {
+	case r.hasUIWake <- struct{}{}:
+	default:
+	}
+}
+
+// hasUIWriteLoop is the sole writer of set_has_ui frames. It wakes on a pending
+// signal, writes the latest recorded state, and exits when the runtime context
+// is cancelled (Shutdown). Writing the latest state (rather than each transition)
+// coalesces a rapid true/false sequence to its final value.
+func (r *scriptRuntime) hasUIWriteLoop() {
+	for {
+		select {
+		case <-r.ctx.Done():
+			return
+		case <-r.hasUIWake:
+			r.hasUIMu.Lock()
+			has := r.hasUIPending
+			r.hasUIMu.Unlock()
+			r.writeStdinLine(map[string]any{"type": "set_has_ui", "value": has})
+		}
+	}
 }
 
 // UIHandler returns the currently bound UI request handler, or nil.
@@ -113,7 +151,14 @@ func (r *scriptRuntime) handleUIRequest(req uiRequestMessage) {
 }
 
 func (r *scriptRuntime) writeUIResponse(resp uiResponseMessage) {
-	data, err := json.Marshal(resp)
+	r.writeStdinLine(resp)
+}
+
+// writeStdinLine marshals message and writes it as one newline-terminated JSON
+// frame, serialized with all other stdin writers via writeMu so concurrent
+// frames never interleave on the pipe.
+func (r *scriptRuntime) writeStdinLine(message any) {
+	data, err := json.Marshal(message)
 	if err != nil {
 		return
 	}

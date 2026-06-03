@@ -76,15 +76,22 @@ func ParseArgs(argv []string) Args {
 	for i := 0; i < len(argv); i++ {
 		arg := argv[i]
 		// next returns the following argument as this flag's value. When a known
-		// value-flag is the last argument (no value follows), TS args.ts gates each
-		// known flag on `i + 1 < args.length`; failing that guard the flag falls
-		// through to the unknown-flag branch and is recorded as a boolean true (NOT
-		// an error). We mirror that here: record the bare flag name in UnknownFlags
-		// and return ok=false so the caller skips assigning a typed value. The sole
-		// exception is --name, which has its own "--name requires a value" error.
+		// long value-flag is the last argument (no value follows), TS args.ts gates
+		// each known flag on `i + 1 < args.length`; failing that guard the flag
+		// falls through to the unknown-flag branch and is recorded as a boolean true
+		// (NOT an error). Short aliases do not have a matching unknown-flag branch,
+		// so missing-value aliases are reported as Unknown option below.
 		next := func() (string, bool) {
 			if i+1 >= len(argv) {
 				result.UnknownFlags[strings.TrimLeft(arg, "-")] = true
+				return "", false
+			}
+			i++
+			return argv[i], true
+		}
+		nextShort := func() (string, bool) {
+			if i+1 >= len(argv) {
+				result.Diagnostics = append(result.Diagnostics, Diagnostic{Type: "error", Message: fmt.Sprintf("Unknown option: %s", arg)})
 				return "", false
 			}
 			i++
@@ -162,12 +169,20 @@ func ParseArgs(argv []string) Args {
 			result.NoTools = true
 		case arg == "--no-builtin-tools" || arg == "-nbt":
 			result.NoBuiltinTools = true
-		case arg == "--tools" || arg == "-t":
+		case arg == "--tools":
 			if v, ok := next(); ok {
 				result.Tools = splitCSV(v)
 			}
-		case arg == "--exclude-tools" || arg == "-xt":
+		case arg == "-t":
+			if v, ok := nextShort(); ok {
+				result.Tools = splitCSV(v)
+			}
+		case arg == "--exclude-tools":
 			if v, ok := next(); ok {
+				result.ExcludeTools = splitCSV(v)
+			}
+		case arg == "-xt":
+			if v, ok := nextShort(); ok {
 				result.ExcludeTools = splitCSV(v)
 			}
 		case arg == "--thinking":
@@ -192,8 +207,12 @@ func ParseArgs(argv []string) Args {
 			if v, ok := next(); ok {
 				result.Export = v
 			}
-		case arg == "--extension" || arg == "-e":
+		case arg == "--extension":
 			if v, ok := next(); ok {
+				result.Extensions = append(result.Extensions, v)
+			}
+		case arg == "-e":
+			if v, ok := nextShort(); ok {
 				result.Extensions = append(result.Extensions, v)
 			}
 		case arg == "--no-extensions" || arg == "-ne":

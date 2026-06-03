@@ -68,3 +68,7 @@ func IsContextOverflow(message ContextOverflowMessage, contextWindow int) bool {
 func GetOverflowPatterns() []*regexp.Regexp {
 	return append([]*regexp.Regexp(nil), overflowPatterns...)
 }
+
+func GetNonOverflowPatterns() []*regexp.Regexp {
+	return append([]*regexp.Regexp(nil), nonOverflowPatterns...)
+}

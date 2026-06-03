@@ -54,7 +54,7 @@ func TestLoginGitHubCopilotUsesInjectedClient(t *testing.T) {
 	// The flow is expected to fail (no real authorization), but it must have used
 	// the injected transport rather than http.DefaultClient.
 	if err == nil {
-		t.Log("login unexpectedly succeeded against fake transport")
+		t.Fatal("login unexpectedly succeeded against fake transport")
 	}
 	if fake.called.Load() == 0 {
 		t.Fatal("injected client was not used by LoginGitHubCopilot (still hardcoding http.DefaultClient?)")

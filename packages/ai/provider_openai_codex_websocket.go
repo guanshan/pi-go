@@ -383,6 +383,33 @@ func acquireOpenAICodexWebSocket(ctx context.Context, wsURL string, headers map[
 	}
 	entry := &openAICodexWebSocketConnection{conn: conn, busy: true}
 	openAICodexWebSocketState.Lock()
+	if existing := openAICodexWebSocketState.sessions[sessionID]; existing != nil {
+		if existing.idleTimer != nil {
+			existing.idleTimer.Stop()
+			existing.idleTimer = nil
+		}
+		if !existing.busy {
+			existing.busy = true
+			openAICodexWebSocketState.Unlock()
+			closeOpenAICodexWebSocket(conn, "superseded")
+			return openAICodexWebSocketAcquire{
+				conn:   existing.conn,
+				entry:  existing,
+				reused: true,
+				release: func(keep bool) {
+					releaseOpenAICodexCachedWebSocket(sessionID, existing, keep)
+				},
+			}, nil
+		}
+		openAICodexWebSocketState.Unlock()
+		return openAICodexWebSocketAcquire{
+			conn:   conn,
+			reused: false,
+			release: func(bool) {
+				closeOpenAICodexWebSocket(conn, "done")
+			},
+		}, nil
+	}
 	openAICodexWebSocketState.sessions[sessionID] = entry
 	openAICodexWebSocketState.Unlock()
 	return openAICodexWebSocketAcquire{
@@ -567,6 +594,32 @@ func appendOpenAICodexWebSocketFailureDiagnostic(message *AssistantMessage, req 
 		details["fallbackTransport"] = "sse"
 	}
 	message.Diagnostics = append(message.Diagnostics, aiutils.CreateAssistantMessageDiagnostic("provider_transport_failure", err, details))
+}
+
+func appendOpenAICodexSSEFallbackDiagnostic(message *AssistantMessage, req ChatRequest) {
+	if message == nil || req.SessionID == "" {
+		return
+	}
+	openAICodexWebSocketState.Lock()
+	active := openAICodexWebSocketState.sseFallbacks[req.SessionID]
+	stats := openAICodexWebSocketState.stats[req.SessionID]
+	errorMessage := ""
+	if stats != nil {
+		errorMessage = stats.LastWebSocketError
+	}
+	openAICodexWebSocketState.Unlock()
+	if !active {
+		return
+	}
+	if errorMessage == "" {
+		errorMessage = "Codex WebSocket transport previously failed; using SSE fallback"
+	}
+	details := map[string]any{
+		"configuredTransport": openAICodexTransport(req),
+		"fallbackTransport":   "sse",
+		"phase":               "sticky_sse_fallback",
+	}
+	message.Diagnostics = append(message.Diagnostics, aiutils.CreateAssistantMessageDiagnostic("provider_transport_failure", errors.New(errorMessage), details))
 }
 
 func recordOpenAICodexWebSocketRequest(sessionID string, body map[string]any, useCachedContext bool, reused bool) {

@@ -68,8 +68,8 @@ func (h *AgentHarness) NavigateTree(ctx context.Context, targetID string, opts N
 	// literal summary, they override the inputs fed to generateBranchSummary. So
 	// a hook that returns only customInstructions must still trigger generation
 	// when summarize is set, using the overridden instructions.
-	var summary string
-	var summaryDetails any
+	summary := opts.Summary
+	summaryDetails := opts.Details
 	fromHook := opts.GeneratedFromHook
 	if before != nil && before.Summary != nil {
 		summary = before.Summary.Summary

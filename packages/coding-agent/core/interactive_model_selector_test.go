@@ -207,8 +207,43 @@ func TestInteractiveModelSelectorSelectRunsAsync(t *testing.T) {
 		t.Fatalf("selection cmd reported error: %v", done.Err)
 	}
 	// The async cmd actually switched the model.
-	if agent := runtime.Session(); agent.Model.Provider+"/"+agent.Model.ID != target {
-		t.Fatalf("model not switched: got %s/%s, want %s", agent.Model.Provider, agent.Model.ID, target)
+	if agent := runtime.Session(); agent.CurrentModel().Provider+"/"+agent.CurrentModel().ID != target {
+		current := agent.CurrentModel()
+		t.Fatalf("model not switched: got %s/%s, want %s", current.Provider, current.ID, target)
+	}
+}
+
+func TestInteractiveModelSelectorEnterBusyDoesNotSwitch(t *testing.T) {
+	models := selectorTestModels()
+	runtime := selectorInteractiveRuntime(t, models, models[0])
+	model, err := newInteractiveModel(context.Background(), runtime, "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	model.openModelSelector()
+	if model.modelSelector == nil {
+		t.Fatal("openModelSelector did not open the overlay")
+	}
+	model.modelSelector.HandleKey("down")
+	target, ok := model.modelSelector.SelectedValue()
+	if !ok || target == models[0].Provider+"/"+models[0].ID {
+		t.Fatalf("expected to highlight a non-current model, got %q", target)
+	}
+
+	model.busy = true
+	model.busyKind = interactiveBusyAgent
+	if cmd := model.handleModelSelectorKey("enter"); cmd != nil {
+		t.Fatalf("busy selector enter returned cmd %#v, want nil", cmd)
+	}
+	if model.modelSelector != nil {
+		t.Fatal("overlay should close after a busy selection attempt")
+	}
+	current := runtime.Session().CurrentModel()
+	if current.Provider != models[0].Provider || current.ID != models[0].ID {
+		t.Fatalf("busy selection changed model to %s/%s", current.Provider, current.ID)
+	}
+	if !strings.Contains(model.statusMessage, "Can't switch model") {
+		t.Fatalf("busy selection status=%q, want switch warning", model.statusMessage)
 	}
 }
 

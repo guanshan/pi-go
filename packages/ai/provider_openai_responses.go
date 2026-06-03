@@ -42,6 +42,9 @@ func (r *ModelRegistry) openAIResponsesChat(ctx context.Context, req ChatRequest
 		fallbackDiagnostics = append(fallbackDiagnostics, partial.Diagnostics...)
 	} else if req.Model.API == "openai-codex-responses" && req.Transport != "sse" && openAICodexWebSocketSSEFallbackActive(req.SessionID) {
 		recordOpenAICodexWebSocketSSEFallback(req.SessionID)
+		partial := NewAssistantMessageForModel(req.Model, nil, Usage{}, "stop")
+		appendOpenAICodexSSEFallbackDiagnostic(&partial, req)
+		fallbackDiagnostics = append(fallbackDiagnostics, partial.Diagnostics...)
 	}
 	if raw, usedSDK, err := doOpenAIResponsesSDK(ctx, req, key, headers, body); usedSDK {
 		if err != nil {

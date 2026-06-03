@@ -32,7 +32,39 @@ func TestFindToolUsesFdWhenAvailable(t *testing.T) {
 	if err != nil {
 		t.Fatalf("fd was not invoked: %v", err)
 	}
-	for _, want := range []string{"--hidden", "--glob", "--exclude", ".git", "*.txt", "."} {
+	for _, want := range []string{"--hidden", "--glob", "--no-require-git", "--exclude", ".git", "*.txt", "."} {
+		if !strings.Contains(string(args), want) {
+			t.Fatalf("fd args missing %q: %s", want, args)
+		}
+	}
+	if strings.Contains(string(args), "--full-path") {
+		t.Fatalf("basename glob should not request --full-path: %s", args)
+	}
+}
+
+func TestFindToolFdUsesFullPathForPathGlob(t *testing.T) {
+	root := t.TempDir()
+	bin := t.TempDir()
+	logPath := filepath.Join(root, "fd.args")
+	fdPath := filepath.Join(bin, "fd")
+	script := "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$FD_ARGS_LOG\"\nprintf 'src/app.ts\\n'\n"
+	if err := os.WriteFile(fdPath, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("FD_ARGS_LOG", logPath)
+
+	res := FindTool{CWD: root, BinDir: bin}.Execute(context.Background(), raw(map[string]any{"pattern": "src/**/*.ts"}), nil)
+	if res.IsError {
+		t.Fatalf("find returned error: %s", toolText(res.Content))
+	}
+	if got := strings.TrimSpace(toolText(res.Content)); got != "src/app.ts" {
+		t.Fatalf("find output=%q, want fake fd output", got)
+	}
+	args, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("fd was not invoked: %v", err)
+	}
+	for _, want := range []string{"--glob", "--no-require-git", "--full-path", "src/**/*.ts", "."} {
 		if !strings.Contains(string(args), want) {
 			t.Fatalf("fd args missing %q: %s", want, args)
 		}

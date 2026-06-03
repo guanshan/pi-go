@@ -350,11 +350,13 @@ func (r *AgentSessionRuntime) snapshot() (CreateAgentSessionRuntimeFactory, *Age
 		return nil, nil, nil, nil, nil, ai.Model{}, "", fmt.Errorf("runtime services are unavailable")
 	}
 	if r.session != nil {
-		if r.session.Model.Provider != "" {
-			r.lastActiveModel = r.session.Model
+		currentModel := r.session.CurrentModel()
+		if currentModel.Provider != "" {
+			r.lastActiveModel = currentModel
 		}
-		if r.session.ThinkingLevel != "" {
-			r.lastActiveThinking = r.session.ThinkingLevel
+		currentThinking := r.session.CurrentThinkingLevel()
+		if currentThinking != "" {
+			r.lastActiveThinking = currentThinking
 		}
 	}
 	return r.createRuntime, r.session, r.services, r.beforeSessionInvalidate, r.rebindSession, r.lastActiveModel, r.lastActiveThinking, nil

@@ -392,7 +392,8 @@ func (a *AgentSession) retryablePromptError(messages []agentcore.AgentMessage, m
 	if !ok || assistant.StopReason != "error" {
 		return ""
 	}
-	if ai.IsContextOverflow(assistant, a.Model.ContextWindow) {
+	model := a.CurrentModel()
+	if ai.IsContextOverflow(assistant, model.ContextWindow) {
 		return ""
 	}
 	msg := firstNonEmpty(strings.TrimSpace(assistant.ErrorMessage), strings.TrimSpace(ai.MessageText(last)), "assistant error")
@@ -411,7 +412,8 @@ func (a *AgentSession) contextOverflowPromptError(messages []agentcore.AgentMess
 	}
 	last := messages[len(messages)-1]
 	assistant, ok := ai.AsAssistantMessage(last)
-	if !ok || assistant.StopReason != "error" || !ai.IsContextOverflow(assistant, a.Model.ContextWindow) {
+	model := a.CurrentModel()
+	if !ok || assistant.StopReason != "error" || !ai.IsContextOverflow(assistant, model.ContextWindow) {
 		return ""
 	}
 	return firstNonEmpty(strings.TrimSpace(assistant.ErrorMessage), strings.TrimSpace(ai.MessageText(last)), "context overflow")
@@ -525,7 +527,8 @@ func (a *AgentSession) compactInternal(ctx context.Context, reason CompactionRea
 	}
 	var err error
 	if compacted == nil {
-		compacted, err = runCompaction(compactionCtx, a.Registry, a.Model, a.ThinkingLevel, preparation, customInstructions)
+		snapshot := a.modelSnapshot()
+		compacted, err = runCompaction(compactionCtx, a.Registry, snapshot.Model, snapshot.ThinkingLevel, preparation, customInstructions)
 	}
 	if err == nil && compacted == nil {
 		emit(sink, ai.Event{"type": "compaction_end", "reason": string(reason), "result": nil, "aborted": false, "willRetry": willRetry})
@@ -660,7 +663,7 @@ func (a *AgentSession) SetScopedModels(models []ScopedModel) {
 	a.scopedModels = append([]ScopedModel(nil), models...)
 }
 
-func (a *AgentSession) availableModels() []ai.Model {
+func (a *AgentSession) availableModelsWithScoped() ([]ai.Model, bool) {
 	a.mu.Lock()
 	scoped := append([]ScopedModel(nil), a.scopedModels...)
 	a.mu.Unlock()
@@ -673,17 +676,32 @@ func (a *AgentSession) availableModels() []ai.Model {
 			models = append(models, scopedModel.Model)
 		}
 		if len(models) > 0 {
-			return models
+			return models, true
 		}
 	}
 	if a.Registry == nil {
-		return nil
+		return nil, false
 	}
-	return a.Registry.AvailableConfigured()
+	return a.Registry.AvailableConfigured(), false
+}
+
+func (a *AgentSession) availableModels() []ai.Model {
+	models, _ := a.availableModelsWithScoped()
+	return models
+}
+
+func (a *AgentSession) hasScopedModels() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return len(a.scopedModels) > 0
 }
 
 func (a *AgentSession) GetAvailableThinkingLevels() []ai.ThinkingLevel {
-	levels := append([]ai.ThinkingLevel(nil), a.Model.ThinkingLevels...)
+	return availableThinkingLevelsForModel(a.CurrentModel())
+}
+
+func availableThinkingLevelsForModel(model ai.Model) []ai.ThinkingLevel {
+	levels := append([]ai.ThinkingLevel(nil), model.ThinkingLevels...)
 	if len(levels) == 0 {
 		levels = []ai.ThinkingLevel{ai.ThinkingOff, ai.ThinkingMinimal, ai.ThinkingLow, ai.ThinkingMedium, ai.ThinkingHigh}
 	}
@@ -691,8 +709,12 @@ func (a *AgentSession) GetAvailableThinkingLevels() []ai.ThinkingLevel {
 }
 
 func (a *AgentSession) SupportsThinking() bool {
-	levels := a.GetAvailableThinkingLevels()
-	return a.Model.Reasoning || len(levels) > 1 || (len(levels) == 1 && levels[0] != ai.ThinkingOff)
+	return modelSupportsThinking(a.CurrentModel())
+}
+
+func modelSupportsThinking(model ai.Model) bool {
+	levels := availableThinkingLevelsForModel(model)
+	return model.Reasoning || len(levels) > 1 || (len(levels) == 1 && levels[0] != ai.ThinkingOff)
 }
 
 func (a *AgentSession) SetSteeringMode(mode agentcore.QueueMode) {

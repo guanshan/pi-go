@@ -83,6 +83,7 @@ func (r *ModelRegistry) runOpenAIResponsesChatStream(ctx context.Context, req Ch
 		recordOpenAICodexWebSocketSSEFallback(req.SessionID)
 	} else if req.Model.API == "openai-codex-responses" && req.Transport != "sse" && openAICodexWebSocketSSEFallbackActive(req.SessionID) {
 		recordOpenAICodexWebSocketSSEFallback(req.SessionID)
+		appendOpenAICodexSSEFallbackDiagnostic(&partial, req)
 	}
 	sdkStream, usedSDK := aiproviders.OpenAIResponsesSDKStream(ctx, openAISDKRequest(req, key, headers, body, true))
 	if !usedSDK {
@@ -122,6 +123,7 @@ func (r *ModelRegistry) runOpenAIResponsesChatStream(ctx context.Context, req Ch
 	}
 	parsed := openAIResponsesParsedWithRequestDefaults(state.Parsed(), req)
 	message, _ := openAIResponsesMessage(parsed, req.Model)
+	message.Diagnostics = append(partial.Diagnostics, message.Diagnostics...)
 	if message.StopReason == "error" {
 		if message.ErrorMessage == "" {
 			message.ErrorMessage = "Provider returned an error stop reason"

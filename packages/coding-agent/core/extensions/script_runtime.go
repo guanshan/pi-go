@@ -83,6 +83,14 @@ type scriptRuntime struct {
 	// time (so a handler bound after load — e.g. by the TUI — is still seen). nil
 	// when the host wired none.
 	uiHandler func() UIRequestHandler
+
+	// hasUI* carry the latest ctx.hasUI capability to hasUIWriteLoop without
+	// blocking the caller: sendSetHasUI records the seq-stamped state under
+	// hasUIMu and wakes the loop via the buffered(1) hasUIWake; see ui_bridge.go.
+	hasUIMu      sync.Mutex
+	hasUISeq     uint64
+	hasUIPending bool
+	hasUIWake    chan struct{}
 }
 
 func LoadScriptExtensions(ctx context.Context, api *API, paths []string, flagValues map[string]any) []error {
@@ -227,17 +235,21 @@ func startScriptRuntime(ctx context.Context, path string, flagValues map[string]
 		cmd:       cmd,
 		stdin:     stdin,
 		stderr:    stderr,
-		pending:   make(map[int64]chan scriptResponseMessage),
-		readDone:  make(chan struct{}),
-		ctx:       runtimeCtx,
-		cancel:    cancel,
-		uiHandler: uiHandler,
+		pending:     make(map[int64]chan scriptResponseMessage),
+		readDone:    make(chan struct{}),
+		ctx:         runtimeCtx,
+		cancel:      cancel,
+		uiHandler:   uiHandler,
+		hasUIWake:   make(chan struct{}, 1),
 	}
 	// uiHandler is set above, before the reader goroutine starts, so the
 	// readLoop-spawned handleUIRequest never races the assignment.
 	// The ready message was already consumed above; the reader goroutine takes
 	// over the scanner for all subsequent response lines.
 	go r.readLoop(scanner)
+	// Dedicated writer for set_has_ui frames so late handler binds never block the
+	// host; exits when runtimeCtx is cancelled (Shutdown).
+	go r.hasUIWriteLoop()
 	return r, ready, nil
 }
 
