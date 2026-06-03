@@ -511,7 +511,7 @@ func readOpenAICodexWebSocketEvent(ctx context.Context, conn *websocket.Conn, id
 		}
 		var event map[string]any
 		if err := json.Unmarshal(raw, &event); err != nil {
-			return nil, false, &openAICodexNonTransportError{err: fmt.Errorf("Invalid Codex WebSocket JSON: %w", err)}
+			return nil, false, &openAICodexNonTransportError{err: fmt.Errorf("invalid Codex WebSocket JSON: %w", err)}
 		}
 		eventType, _ := event["type"].(string)
 		terminal := eventType == "response.completed" || eventType == "response.done" || eventType == "response.incomplete"
@@ -555,7 +555,7 @@ func normalizeOpenAICodexWebSocketEvent(event map[string]any) error {
 			raw, _ := json.Marshal(event)
 			message = string(raw)
 		}
-		return &openAICodexNonTransportError{err: fmt.Errorf("Codex error: %s", message)}
+		return &openAICodexNonTransportError{err: fmt.Errorf("codex error: %s", message)}
 	case "response.failed":
 		message := "Codex response failed"
 		code := ""

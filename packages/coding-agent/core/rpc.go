@@ -116,7 +116,7 @@ func (b *rpcUIBroker) handle(ctx context.Context, method string, params json.Raw
 		"type":   "ui_request",
 		"uiId":   uiID,
 		"method": method,
-		"params": json.RawMessage(params),
+		"params": params,
 	}
 	if len(params) == 0 {
 		payload["params"] = map[string]any{}

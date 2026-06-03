@@ -135,8 +135,8 @@ func (r *scriptRuntime) handleUIRequest(req uiRequestMessage) {
 	if r.uiHandler != nil {
 		handler = r.uiHandler()
 	}
-	switch {
-	case handler == nil:
+	switch handler {
+	case nil:
 		resp.Error = "pi.ui." + req.Method + " requires an interactive host, which is not available"
 	default:
 		result, err := handler(r.ctx, req.Method, req.Params)

@@ -235,12 +235,12 @@ func startScriptRuntime(ctx context.Context, path string, flagValues map[string]
 		cmd:       cmd,
 		stdin:     stdin,
 		stderr:    stderr,
-		pending:     make(map[int64]chan scriptResponseMessage),
-		readDone:    make(chan struct{}),
-		ctx:         runtimeCtx,
-		cancel:      cancel,
-		uiHandler:   uiHandler,
-		hasUIWake:   make(chan struct{}, 1),
+		pending:   make(map[int64]chan scriptResponseMessage),
+		readDone:  make(chan struct{}),
+		ctx:       runtimeCtx,
+		cancel:    cancel,
+		uiHandler: uiHandler,
+		hasUIWake: make(chan struct{}, 1),
 	}
 	// uiHandler is set above, before the reader goroutine starts, so the
 	// readLoop-spawned handleUIRequest never races the assignment.

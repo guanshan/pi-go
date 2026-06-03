@@ -14,6 +14,7 @@ require (
 	github.com/aws/smithy-go v1.25.1
 	github.com/charmbracelet/x/term v0.2.2
 	github.com/google/uuid v1.6.0
+	github.com/gorilla/websocket v1.5.3
 	github.com/openai/openai-go/v3 v3.37.0
 	github.com/rivo/uniseg v0.4.7
 	github.com/yuin/goldmark v1.8.2
@@ -53,7 +54,6 @@ require (
 	github.com/google/go-cmp v0.6.0 // indirect
 	github.com/google/s2a-go v0.1.8 // indirect
 	github.com/googleapis/enterprise-certificate-proxy v0.3.4 // indirect
-	github.com/gorilla/websocket v1.5.3 // indirect
 	github.com/invopop/jsonschema v0.13.0 // indirect
 	github.com/kr/text v0.2.0 // indirect
 	github.com/lucasb-eyer/go-colorful v1.4.0 // indirect
