@@ -446,6 +446,12 @@ func ExamplesPath() string { return resolvePackagePath("examples") }
 
 func resolvePackagePath(rel string) string {
 	p := filepath.Join(GetPackageDir(), rel)
+	if envDir := os.Getenv("PI_PACKAGE_DIR"); envDir != "" {
+		cleanEnv := filepath.Clean(envDir)
+		if filepath.IsAbs(cleanEnv) || strings.HasPrefix(filepath.ToSlash(cleanEnv), "/") {
+			return p
+		}
+	}
 	if abs, err := filepath.Abs(p); err == nil {
 		return abs
 	}
