@@ -4,6 +4,7 @@ import (
 	"regexp"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestUUIDv7Shape(t *testing.T) {
@@ -22,6 +23,21 @@ func TestUUIDv7MonotonicEnough(t *testing.T) {
 			t.Fatalf("uuid order regressed: %s >= %s", previous, next)
 		}
 		previous = next
+	}
+}
+
+// TestCreateTimestampMatchesToISOString locks CreateTimestamp to the JS
+// Date.toISOString() shape: UTC, exactly three fractional-second digits, and a
+// trailing Z (no nanosecond precision, no trailing-zero trimming).
+func TestCreateTimestampMatchesToISOString(t *testing.T) {
+	ts := CreateTimestamp()
+	matched := regexp.MustCompile(`^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$`).MatchString(ts)
+	if !matched {
+		t.Fatalf("CreateTimestamp() = %q, want ISO8601 with exactly 3 ms digits and Z", ts)
+	}
+	// Must round-trip through the RFC3339Nano parser used to read timestamps back.
+	if _, err := time.Parse(time.RFC3339Nano, ts); err != nil {
+		t.Fatalf("CreateTimestamp() = %q is not parseable: %v", ts, err)
 	}
 }
 

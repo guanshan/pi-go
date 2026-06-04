@@ -56,6 +56,9 @@ func TestDefaultResourceLoaderLoadsTSStyleResources(t *testing.T) {
 	if !hasTheme(loader.GetThemes().Themes, "quiet") {
 		t.Fatalf("themes=%#v", loader.GetThemes().Themes)
 	}
+	if theme, ok := findTheme(loader.GetThemes().Themes, "quiet"); !ok || theme.Config["name"] != "quiet" || !strings.Contains(theme.Raw, `"name":"quiet"`) {
+		t.Fatalf("theme was not parsed from JSON: %#v ok=%v", theme, ok)
+	}
 	if !hasExtension(loader.GetExtensions().Extensions, filepath.Join(agentDir, "extensions", "one.js")) {
 		t.Fatalf("extensions=%#v", loader.GetExtensions().Extensions)
 	}
@@ -255,12 +258,17 @@ func hasPrompt(prompts []core.PromptTemplate, name, content string) bool {
 }
 
 func hasTheme(themes []Theme, name string) bool {
+	_, ok := findTheme(themes, name)
+	return ok
+}
+
+func findTheme(themes []Theme, name string) (Theme, bool) {
 	for _, theme := range themes {
 		if theme.Name == name {
-			return true
+			return theme, true
 		}
 	}
-	return false
+	return Theme{}, false
 }
 
 func hasExtension(extensions []LoadedExtension, path string) bool {

@@ -63,7 +63,7 @@ selector/dialog/overlay state machine the section above calls for:
 | `/settings` | dumps JSON | editable settings list |
 | `/resume` | numbered list prompt | navigable session picker |
 | `/tree`, `/fork` | text tree / argument flow | interactive tree navigation |
-| `/login` | line-based prompt | OAuth selector overlay |
+| `/login` | OAuth prompts routed through the input/select overlay | OAuth selector overlay |
 | `pi config` | numeric line selection | navigable settings list |
 | autocomplete | slash / model / prompt / skill prefix match | + path, `@`-refs, extension providers, navigable dropdown |
 | keybindings | a few hardcoded keys (Esc/Ctrl+C, double-Esc) | `KeybindingsManager` + user `keybindings.json` |

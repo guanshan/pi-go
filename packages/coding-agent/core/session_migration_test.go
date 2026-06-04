@@ -3,6 +3,7 @@ package core
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/guanshan/pi-go/packages/ai"
@@ -43,6 +44,13 @@ func TestOpenSessionMigratesLegacyV1(t *testing.T) {
 	}
 
 	// The file should have been rewritten at the current version.
+	rewritten, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(rewritten), `"fromHook"`) {
+		t.Fatalf("legacy migration should preserve missing fromHook field:\n%s", rewritten)
+	}
 	reopened, err := OpenSession(path, "/fallback")
 	if err != nil {
 		t.Fatal(err)

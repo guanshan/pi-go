@@ -47,6 +47,65 @@ func TestRunAgentLoopEventSequence(t *testing.T) {
 	}
 }
 
+// TestRunAgentLoopAPIKeyFallback verifies the TS precedence
+// `(getApiKey ? getApiKey() : undefined) || config.apiKey` (agent-loop.ts:302):
+// GetAPIKey wins when it returns a non-empty value, and the static APIKey is the
+// fallback when GetAPIKey is unset or returns an empty string.
+func TestRunAgentLoopAPIKeyFallback(t *testing.T) {
+	model := ai.Model{Provider: "faux", ID: "faux", API: "faux"}
+	newStreamFn := func(captured *string) StreamFn {
+		return func(ctx context.Context, model ai.Model, agentContext ai.Context, opts ai.StreamOptions) AssistantStream {
+			*captured = opts.APIKey
+			stream := ai.NewAssistantMessageEventStream(4)
+			go func() {
+				msg := ai.NewAssistantMessageForModel(model, ai.TextBlocks("ok"), ai.Usage{}, "stop")
+				stream.Push(ai.AssistantMessageEvent{Type: "start", Partial: msg})
+				stream.Push(ai.AssistantMessageEvent{Type: "done", Reason: "stop", Message: msg})
+			}()
+			return stream
+		}
+	}
+	sink := func(ctx context.Context, ev AgentEvent) error { return nil }
+
+	// GetAPIKey empty + APIKey set => fallback to APIKey.
+	var got string
+	if _, err := RunAgentLoop(context.Background(), []AgentMessage{ai.NewUserMessage("hi", nil)}, AgentContext{}, AgentLoopConfig{
+		Model:     model,
+		GetAPIKey: func(string) (string, error) { return "", nil },
+		APIKey:    "static-key",
+	}, sink, newStreamFn(&got)); err != nil {
+		t.Fatal(err)
+	}
+	if got != "static-key" {
+		t.Fatalf("APIKey=%q, want fallback static-key when GetAPIKey returns empty", got)
+	}
+
+	// GetAPIKey non-empty => wins over APIKey.
+	got = ""
+	if _, err := RunAgentLoop(context.Background(), []AgentMessage{ai.NewUserMessage("hi", nil)}, AgentContext{}, AgentLoopConfig{
+		Model:     model,
+		GetAPIKey: func(string) (string, error) { return "dynamic-key", nil },
+		APIKey:    "static-key",
+	}, sink, newStreamFn(&got)); err != nil {
+		t.Fatal(err)
+	}
+	if got != "dynamic-key" {
+		t.Fatalf("APIKey=%q, want dynamic-key (GetAPIKey wins when non-empty)", got)
+	}
+
+	// GetAPIKey unset => use APIKey.
+	got = ""
+	if _, err := RunAgentLoop(context.Background(), []AgentMessage{ai.NewUserMessage("hi", nil)}, AgentContext{}, AgentLoopConfig{
+		Model:  model,
+		APIKey: "static-key",
+	}, sink, newStreamFn(&got)); err != nil {
+		t.Fatal(err)
+	}
+	if got != "static-key" {
+		t.Fatalf("APIKey=%q, want static-key when GetAPIKey is unset", got)
+	}
+}
+
 func TestRunAgentLoopTransformErrorEmitsFailureSequence(t *testing.T) {
 	model := ai.Model{Provider: "faux", ID: "faux", API: "faux"}
 	expected := errors.New("context hook failed")

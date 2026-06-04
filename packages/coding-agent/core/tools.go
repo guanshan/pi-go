@@ -13,7 +13,15 @@ const DefaultAgentMaxLoop = 25
 type ToolSet map[string]catools.RuntimeTool
 
 func BuiltinTools(cwd string, settings *SettingsManager) ToolSet {
-	options := catools.BuiltinToolOptions{AutoResize: true, BinDir: BinDir()}
+	// Default to vision-capable so callers without a concrete model keep the prior
+	// behavior (no spurious non-vision image note).
+	return BuiltinToolsForModel(cwd, settings, true)
+}
+
+// BuiltinToolsForModel builds the builtin toolset with the active model's image
+// capability so the read tool can mirror read.ts getNonVisionImageNote.
+func BuiltinToolsForModel(cwd string, settings *SettingsManager, modelSupportsImages bool) ToolSet {
+	options := catools.BuiltinToolOptions{AutoResize: true, BinDir: BinDir(), ModelSupportsImages: modelSupportsImages}
 	if settings != nil {
 		options.ShellPath = settings.mergedString(settings.Global.ShellPath, settings.Project.ShellPath, "")
 		options.CommandPrefix = settings.ShellCommandPrefix()

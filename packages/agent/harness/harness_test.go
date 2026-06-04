@@ -705,7 +705,13 @@ func TestAgentHarnessPrepareNextTurnReturnsNilWhenStateUnchanged(t *testing.T) {
 	}
 }
 
-func TestAgentHarnessRestoresActiveToolsFromSessionContext(t *testing.T) {
+// TestAgentHarnessDoesNotRestoreActiveToolsFromSessionContext locks the TS
+// behavior (agent-harness.ts:331-363): createTurnState uses the in-memory
+// activeToolNames, NOT the session BuildContext's activeToolNames. A session that
+// recorded an active_tools_change does not retroactively restrict the turn's
+// tools — only construction-time options or SetTools/SetActiveTools change them.
+// (Item 1: the previous Go writeback from BuildContext polluted live state.)
+func TestAgentHarnessDoesNotRestoreActiveToolsFromSessionContext(t *testing.T) {
 	ctx := context.Background()
 	model := ai.Model{Provider: "test", ID: "m", API: "test"}
 	sess, err := session.NewMemory(session.Metadata{ID: "s1"}, nil)
@@ -718,13 +724,16 @@ func TestAgentHarnessRestoresActiveToolsFromSessionContext(t *testing.T) {
 	h, err := New(Options{
 		Session: sess,
 		Model:   model,
+		// No ActiveToolNames option => the harness default-activates all tools.
 		Tools: []agent.AgentTool{
 			namedHarnessTool{name: "alpha"},
 			namedHarnessTool{name: "beta"},
 		},
 		StreamFn: func(ctx context.Context, model ai.Model, aiCtx ai.Context, opts ai.StreamOptions) agent.AssistantStream {
-			if len(aiCtx.Tools) != 1 || aiCtx.Tools[0].Name != "beta" {
-				t.Errorf("tools=%#v", aiCtx.Tools)
+			// The session's active_tools_change(beta) must NOT restrict the turn:
+			// both tools remain active because the in-memory set is the default.
+			if len(aiCtx.Tools) != 2 || aiCtx.Tools[0].Name != "alpha" || aiCtx.Tools[1].Name != "beta" {
+				t.Errorf("tools=%#v, want both alpha and beta (session context must not restrict)", aiCtx.Tools)
 			}
 			stream := ai.NewAssistantMessageEventStream(4)
 			go func() {
@@ -740,6 +749,10 @@ func TestAgentHarnessRestoresActiveToolsFromSessionContext(t *testing.T) {
 	}
 	if _, err := h.Prompt(ctx, "main", PromptOptions{}); err != nil {
 		t.Fatal(err)
+	}
+	// The harness in-memory active tools are unchanged by the turn.
+	if active := h.GetActiveTools(); len(active) != 2 {
+		t.Fatalf("active tools after turn = %d, want 2 (session context must not mutate harness)", len(active))
 	}
 }
 
@@ -860,7 +873,7 @@ func TestAgentHarnessQueuesAndBeforeStart(t *testing.T) {
 			t.Fatalf("before start=%#v", ev)
 		}
 		return &BeforeAgentStartResult{
-			SystemPrompt: "overridden",
+			SystemPrompt: stringPtr("overridden"),
 			Messages:     []agent.AgentMessage{ai.NewUserMessage("from before", nil)},
 		}, nil
 	})
@@ -873,6 +886,65 @@ func TestAgentHarnessQueuesAndBeforeStart(t *testing.T) {
 	}
 	if ai.MessageText(final) != "first" || calls != 1 {
 		t.Fatalf("final=%#v calls=%d", final, calls)
+	}
+}
+
+// TestAgentHarnessQueueUpdatePrecedesBeforeAgentStart locks the TS ordering
+// (agent-harness.ts:560-577): the nextTurn queue is drained and queue_update is
+// emitted BEFORE before_agent_start, so the hook observes an already-drained
+// queue and queue_update precedes before_agent_start in the event stream.
+func TestAgentHarnessQueueUpdatePrecedesBeforeAgentStart(t *testing.T) {
+	ctx := context.Background()
+	model := ai.Model{Provider: "test", ID: "m", API: "test"}
+	h, err := New(Options{
+		Model:        model,
+		SystemPrompt: StaticSystemPrompt("system"),
+		StreamFn: func(ctx context.Context, model ai.Model, aiCtx ai.Context, opts ai.StreamOptions) agent.AssistantStream {
+			stream := ai.NewAssistantMessageEventStream(4)
+			go func() {
+				msg := ai.NewAssistantMessageForModel(model, ai.TextBlocks("ok"), ai.Usage{}, "stop")
+				stream.Push(ai.AssistantMessageEvent{Type: "start", Partial: msg})
+				stream.Push(ai.AssistantMessageEvent{Type: "done", Reason: "stop", Message: msg})
+			}()
+			return stream
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var queueUpdateFired bool
+	var order []string
+	h.SubscribeHarness(func(ctx context.Context, ev HarnessEvent) error {
+		if _, ok := ev.(QueueUpdateEvent); ok {
+			queueUpdateFired = true
+			order = append(order, "queue_update")
+		}
+		return nil
+	})
+	var beforeSawDrainedQueue bool
+	h.OnBeforeAgentStart(func(ctx context.Context, ev BeforeAgentStartEvent) (*BeforeAgentStartResult, error) {
+		order = append(order, "before_agent_start")
+		// The nextTurn queue must already be drained by the time the hook fires.
+		beforeSawDrainedQueue = !h.nextTurnQueue.HasItems()
+		return nil, nil
+	})
+	if err := h.NextTurn(ctx, "queued", PromptOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	// NextTurn itself emits a queue_update; reset tracking for the prompt run.
+	queueUpdateFired = false
+	order = nil
+	if _, err := h.Prompt(ctx, "main", PromptOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if !queueUpdateFired {
+		t.Fatal("queue_update should fire when draining a non-empty nextTurn queue")
+	}
+	if !beforeSawDrainedQueue {
+		t.Fatal("before_agent_start must observe an already-drained nextTurn queue")
+	}
+	if len(order) < 2 || order[0] != "queue_update" || order[1] != "before_agent_start" {
+		t.Fatalf("order=%v, want queue_update before before_agent_start", order)
 	}
 }
 

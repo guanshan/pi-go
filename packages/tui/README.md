@@ -6,6 +6,14 @@ Go port of [`@earendil-works/pi-tui`](https://www.npmjs.com/package/@earendil-wo
 
 ## Decision record (route A)
 
+> **"Kept" means ported into this library, not wired into production.** Most kept
+> symbols are available for embedders but are not yet consumed by the interactive
+> coding-agent UI. The exact set production code (cmd/ + packages/coding-agent) is
+> allowed to import is the `wiredTUIComponents` allowlist in
+> [`scripts/check_arch.go`](../../scripts/check_arch.go); everything else is
+> "ported but not wired" under route A. See [`docs/TUI_DESIGN.md`](../../docs/TUI_DESIGN.md)
+> and `docs/TS_COMPATIBILITY.md` for the wiring status.
+
 | | Upstream TS | This package |
 |---|---|---|
 | Event loop | `Terminal.start(onInput, onResize)` + raw-mode stdin + Kitty negotiation | **Removed.** ProcessTerminal is output-only. Embedders use Bubble Tea. |

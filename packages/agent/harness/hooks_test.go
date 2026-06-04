@@ -61,7 +61,43 @@ func TestHarnessContextHookReceivesCopiedMessages(t *testing.T) {
 	}
 }
 
-func TestHarnessToolResultHooksChainPatches(t *testing.T) {
+// TestHarnessContextHooksLastWins locks TS lastResult semantics
+// (agent-harness.ts:249-266, 430-433): every context handler sees the same
+// ORIGINAL messages (handler 2 does NOT see handler 1's output), and the last
+// handler returning non-nil messages wins outright.
+func TestHarnessContextHooksLastWins(t *testing.T) {
+	ctx := context.Background()
+	h, err := New(Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := []agent.AgentMessage{ai.NewUserMessage("original", nil)}
+	h.OnContext(func(ctx context.Context, ev ContextEvent) (*ContextResult, error) {
+		return &ContextResult{Messages: []agent.AgentMessage{ai.NewUserMessage("from-first", nil)}}, nil
+	})
+	var secondSawOriginal bool
+	h.OnContext(func(ctx context.Context, ev ContextEvent) (*ContextResult, error) {
+		secondSawOriginal = len(ev.Messages) == 1 && ai.MessageText(ev.Messages[0]) == "original"
+		return &ContextResult{Messages: []agent.AgentMessage{ai.NewUserMessage("from-second", nil)}}, nil
+	})
+	out, err := h.transformContext(ctx, source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !secondSawOriginal {
+		t.Fatal("handler 2 must see the original messages, not handler 1's output")
+	}
+	if len(out) != 1 || ai.MessageText(out[0]) != "from-second" {
+		t.Fatalf("out=%#v, want last-wins [from-second]", out)
+	}
+}
+
+// TestHarnessToolResultHooksLastWins locks TS lastResult semantics
+// (agent-harness.ts:249-266, 443-455): every tool_result handler sees the same
+// ORIGINAL event (handler 2 does NOT see handler 1's patch), and the last handler
+// returning a non-nil patch wins outright — patches are not merged across
+// handlers.
+func TestHarnessToolResultHooksLastWins(t *testing.T) {
 	ctx := context.Background()
 	h, err := New(Options{})
 	if err != nil {
@@ -74,17 +110,16 @@ func TestHarnessToolResultHooksChainPatches(t *testing.T) {
 		isError := false
 		return &ToolResultPatch{
 			Content: ai.TextBlocks("patched"),
-			Details: &AnyValue{
-				V: "detail",
-			},
+			Details: &AnyValue{V: "detail"},
 			IsError: &isError,
 		}, nil
 	})
-	var secondSawPatch bool
+	var secondSawOriginal bool
 	h.OnToolResult(func(ctx context.Context, ev ToolResultEvent) (*ToolResultPatch, error) {
-		secondSawPatch = !ev.IsError &&
-			ev.Details == "detail" &&
-			ai.MessageText(ai.NewToolResultMessage(ev.ToolCallID, ev.ToolName, ev.Content, ev.Details, ev.IsError)) == "patched"
+		// Handler 2 must observe the ORIGINAL event, NOT handler 1's patch.
+		secondSawOriginal = ev.IsError &&
+			ev.Details == "raw-detail" &&
+			ai.MessageText(ai.NewToolResultMessage(ev.ToolCallID, ev.ToolName, ev.Content, ev.Details, ev.IsError)) == "raw"
 		terminate := true
 		return &ToolResultPatch{Terminate: &terminate}, nil
 	})
@@ -99,11 +134,16 @@ func TestHarnessToolResultHooksChainPatches(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if patch == nil || !secondSawPatch || patch.IsError == nil || *patch.IsError || patch.Terminate == nil || !*patch.Terminate {
-		t.Fatalf("patch=%#v secondSawPatch=%v", patch, secondSawPatch)
+	if !secondSawOriginal {
+		t.Fatal("handler 2 must see the original (unpatched) event, not handler 1's patch")
 	}
-	if ai.MessageText(ai.NewToolResultMessage("call-1", "lookup", patch.Content, patch.Details.V, *patch.IsError)) != "patched" || patch.Details.V != "detail" {
-		t.Fatalf("patch=%#v", patch)
+	// Last-wins: only handler 2's patch survives (just Terminate); handler 1's
+	// Content/Details/IsError are NOT merged in.
+	if patch == nil || patch.Terminate == nil || !*patch.Terminate {
+		t.Fatalf("patch=%#v, want last patch (Terminate=true)", patch)
+	}
+	if patch.Content != nil || patch.Details != nil || patch.IsError != nil {
+		t.Fatalf("patch=%#v, last-wins must not merge handler 1's fields", patch)
 	}
 }
 
@@ -130,51 +170,74 @@ func TestHarnessEventSubscriptionUnsubscribeAndError(t *testing.T) {
 	}
 }
 
-// TestHarnessBeforeAgentStartHooksChainAndAppend locks the documented intentional
-// divergence (docs/TS_COMPATIBILITY.md "Harness hook dispatch is chain/merge, not
-// last-wins"): the Go harness runs every before_agent_start handler, chaining the
-// accumulated SystemPrompt into each handler's event, taking the last non-empty
-// SystemPrompt, and appending every handler's Messages in order. TS instead lets
-// "the last non-undefined result win".
-func TestHarnessBeforeAgentStartHooksChainAndAppend(t *testing.T) {
+func stringPtr(s string) *string { return &s }
+
+// TestHarnessBeforeAgentStartHooksLastWins locks the TS lastResult semantics
+// (agent-harness.ts:249-266): every before_agent_start handler sees the same
+// ORIGINAL event (handler 2 does NOT see handler 1's SystemPrompt), and the last
+// handler returning a non-nil result wins outright — its Messages and
+// SystemPrompt fully replace earlier handlers' (no chaining/appending).
+func TestHarnessBeforeAgentStartHooksLastWins(t *testing.T) {
 	ctx := context.Background()
 	h, err := New(Options{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	var secondSawFirstSystemPrompt bool
+	var secondSawOriginalSystemPrompt bool
 	h.OnBeforeAgentStart(func(ctx context.Context, ev BeforeAgentStartEvent) (*BeforeAgentStartResult, error) {
 		return &BeforeAgentStartResult{
-			SystemPrompt: "FIRST",
+			SystemPrompt: stringPtr("FIRST"),
 			Messages:     []agent.AgentMessage{ai.NewUserMessage("m1", nil)},
 		}, nil
 	})
 	h.OnBeforeAgentStart(func(ctx context.Context, ev BeforeAgentStartEvent) (*BeforeAgentStartResult, error) {
-		secondSawFirstSystemPrompt = ev.SystemPrompt == "FIRST"
+		secondSawOriginalSystemPrompt = ev.SystemPrompt == "ORIG"
 		return &BeforeAgentStartResult{
-			SystemPrompt: "SECOND",
+			SystemPrompt: stringPtr("SECOND"),
 			Messages:     []agent.AgentMessage{ai.NewUserMessage("m2", nil)},
 		}, nil
 	})
-	out, err := h.emitBeforeAgentStart(ctx, BeforeAgentStartEvent{Prompt: "go"})
+	out, err := h.emitBeforeAgentStart(ctx, BeforeAgentStartEvent{Prompt: "go", SystemPrompt: "ORIG"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if out == nil || !secondSawFirstSystemPrompt {
-		t.Fatalf("out=%#v secondSawFirstSystemPrompt=%v", out, secondSawFirstSystemPrompt)
+	if out == nil || !secondSawOriginalSystemPrompt {
+		t.Fatalf("out=%#v secondSawOriginalSystemPrompt=%v (handler 2 must see the original event, not handler 1's output)", out, secondSawOriginalSystemPrompt)
 	}
-	if out.SystemPrompt != "SECOND" {
-		t.Fatalf("SystemPrompt = %q, want last-non-empty SECOND", out.SystemPrompt)
+	if out.SystemPrompt == nil || *out.SystemPrompt != "SECOND" {
+		t.Fatalf("SystemPrompt = %v, want last-wins SECOND", out.SystemPrompt)
 	}
-	if len(out.Messages) != 2 || ai.MessageText(out.Messages[0]) != "m1" || ai.MessageText(out.Messages[1]) != "m2" {
-		t.Fatalf("Messages = %#v, want appended [m1 m2]", out.Messages)
+	if len(out.Messages) != 1 || ai.MessageText(out.Messages[0]) != "m2" {
+		t.Fatalf("Messages = %#v, want last-wins [m2] (not appended)", out.Messages)
 	}
 }
 
-// TestHarnessToolCallHookShortCircuitsOnBlock locks the documented intentional
-// divergence: a blocking tool_call result short-circuits the remaining handlers
-// rather than continuing to a "last result wins" merge.
-func TestHarnessToolCallHookShortCircuitsOnBlock(t *testing.T) {
+// TestHarnessBeforeAgentStartEmptySystemPromptClears verifies a handler returning
+// SystemPrompt: "" (non-nil pointer to empty) is treated as an override (TS `??`
+// adopts the empty string), distinct from nil = preserve.
+func TestHarnessBeforeAgentStartEmptySystemPromptClears(t *testing.T) {
+	ctx := context.Background()
+	h, err := New(Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.OnBeforeAgentStart(func(ctx context.Context, ev BeforeAgentStartEvent) (*BeforeAgentStartResult, error) {
+		return &BeforeAgentStartResult{SystemPrompt: stringPtr("")}, nil
+	})
+	out, err := h.emitBeforeAgentStart(ctx, BeforeAgentStartEvent{Prompt: "go", SystemPrompt: "ORIG"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out == nil || out.SystemPrompt == nil || *out.SystemPrompt != "" {
+		t.Fatalf("out=%#v, want a non-nil SystemPrompt pointer to \"\" (clear)", out)
+	}
+}
+
+// TestHarnessToolCallHookLastWins locks TS lastResult semantics: every tool_call
+// handler runs (no short-circuit on a block result) and the last non-nil result
+// wins. Handler 1 blocks, handler 2 returns nil, so the block survives because it
+// is the last (only) non-nil result; but handler 2 must still have been invoked.
+func TestHarnessToolCallHookLastWins(t *testing.T) {
 	ctx := context.Background()
 	h, err := New(Options{})
 	if err != nil {
@@ -192,10 +255,33 @@ func TestHarnessToolCallHookShortCircuitsOnBlock(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result == nil || !result.Block || result.Reason != "denied" {
-		t.Fatalf("result=%#v, want Block with reason denied", result)
+	if !secondCalled {
+		t.Fatal("second tool_call handler must run even after a block (no short-circuit)")
 	}
-	if secondCalled {
-		t.Fatal("second tool_call handler should not run after a block")
+	if result == nil || !result.Block || result.Reason != "denied" {
+		t.Fatalf("result=%#v, want last non-nil result (block denied) to win", result)
+	}
+}
+
+// TestHarnessToolCallHookLastResultReplaces verifies that when a later handler
+// returns a non-nil result, it replaces an earlier handler's block.
+func TestHarnessToolCallHookLastResultReplaces(t *testing.T) {
+	ctx := context.Background()
+	h, err := New(Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.OnToolCall(func(ctx context.Context, ev ToolCallEvent) (*ToolCallResult, error) {
+		return &ToolCallResult{Block: true, Reason: "denied"}, nil
+	})
+	h.OnToolCall(func(ctx context.Context, ev ToolCallEvent) (*ToolCallResult, error) {
+		return &ToolCallResult{Block: false}, nil
+	})
+	result, err := h.emitToolCall(ctx, ToolCallEvent{ToolCallID: "c1", ToolName: "bash"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result == nil || result.Block {
+		t.Fatalf("result=%#v, want last handler's non-blocking result to win", result)
 	}
 }

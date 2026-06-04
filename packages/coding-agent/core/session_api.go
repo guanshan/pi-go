@@ -156,10 +156,11 @@ type NavigateTreeOptions struct {
 }
 
 type BranchSummaryEntry struct {
-	Type    string `json:"type"`
-	FromID  string `json:"fromId"`
-	Summary string `json:"summary"`
-	Details any    `json:"details,omitempty"`
+	Type     string `json:"type"`
+	FromID   string `json:"fromId"`
+	Summary  string `json:"summary"`
+	Details  any    `json:"details,omitempty"`
+	FromHook bool   `json:"fromHook,omitempty"`
 }
 
 type NavigateTreeResult struct {

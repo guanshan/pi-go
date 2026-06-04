@@ -300,18 +300,24 @@ func detectOpenAICompletionsCompat(model Model) OpenAICompletionsCompat {
 	provider := model.Provider
 	baseURL := model.BaseURL
 	baseLower := strings.ToLower(baseURL)
-	isZai := provider == "zai" || strings.Contains(baseLower, "api.z.ai")
+	isZai := provider == "zai" ||
+		provider == "zai-coding-cn" ||
+		strings.Contains(baseLower, "api.z.ai") ||
+		strings.Contains(baseLower, "open.bigmodel.cn")
 	isTogether := provider == "together" || strings.Contains(baseLower, "api.together.ai") || strings.Contains(baseLower, "api.together.xyz")
 	isMoonshot := provider == "moonshotai" || provider == "moonshotai-cn" || strings.Contains(baseLower, "api.moonshot.")
 	isCloudflareWorkersAI := provider == "cloudflare-workers-ai" || strings.Contains(baseLower, "api.cloudflare.com")
 	isCloudflareAIGateway := provider == "cloudflare-ai-gateway" || strings.Contains(baseLower, "gateway.ai.cloudflare.com")
 	isOpenRouter := provider == "openrouter" || strings.Contains(baseLower, "openrouter.ai")
+	isNvidia := provider == "nvidia" || strings.Contains(baseLower, "integrate.api.nvidia.com")
+	isAntLing := provider == "ant-ling" || strings.Contains(baseLower, "api.ant-ling.com")
 	// Mirrors openai-completions.ts detectCompat: isDeepSeek is provider/baseURL
 	// based only. DeepSeek V4 served through other providers (e.g. OpenRouter)
 	// carries its requiresReasoningContentOnAssistantMessages/thinkingFormat in
 	// the generated catalog compat instead of being inferred from the model id.
 	isDeepSeekThinkingFormat := provider == "deepseek" || strings.Contains(baseLower, "deepseek.com")
-	isNonStandard := provider == "cerebras" ||
+	isNonStandard := isNvidia ||
+		provider == "cerebras" ||
 		strings.Contains(baseLower, "cerebras.ai") ||
 		provider == "xai" ||
 		strings.Contains(baseLower, "api.x.ai") ||
@@ -323,9 +329,15 @@ func detectOpenAICompletionsCompat(model Model) OpenAICompletionsCompat {
 		provider == "opencode" ||
 		strings.Contains(baseLower, "opencode.ai") ||
 		isCloudflareWorkersAI ||
-		isCloudflareAIGateway
-	useMaxTokens := strings.Contains(baseLower, "chutes.ai") || isMoonshot || isCloudflareAIGateway || isTogether
+		isCloudflareAIGateway ||
+		isAntLing
+	useMaxTokens := strings.Contains(baseLower, "chutes.ai") || isMoonshot || isCloudflareAIGateway || isTogether || isNvidia || isAntLing
 	isGrok := provider == "xai" || strings.Contains(baseLower, "api.x.ai")
+	// OpenRouter openai/* and anthropic/* reasoning models use the `developer`
+	// role; all other OpenRouter backends reject it and use `system`. Mirrors
+	// openai-completions.ts isOpenRouterDeveloperRoleModel.
+	isOpenRouterDeveloperRoleModel := isOpenRouter &&
+		(strings.HasPrefix(model.ID, "anthropic/") || strings.HasPrefix(model.ID, "openai/"))
 	cacheControlFormat := ""
 	if provider == "openrouter" && strings.HasPrefix(model.ID, "anthropic/") {
 		cacheControlFormat = "anthropic"
@@ -342,16 +354,19 @@ func detectOpenAICompletionsCompat(model Model) OpenAICompletionsCompat {
 		thinkingFormat = "zai"
 	case isTogether:
 		thinkingFormat = "together"
+	case isAntLing:
+		thinkingFormat = "ant-ling"
 	case isOpenRouter:
 		thinkingFormat = "openrouter"
 	}
 	return OpenAICompletionsCompat{
 		SupportsStore: !isNonStandard,
-		// OpenRouter reasoning models use the standard `system` role, not
-		// `developer` (most OpenRouter backends reject developer). Mirrors
-		// openai-completions.ts: supportsDeveloperRole: !isNonStandard && !isOpenRouter.
-		SupportsDeveloperRole:                       !isNonStandard && !isOpenRouter,
-		SupportsReasoningEffort:                     !isGrok && !isZai && !isMoonshot && !isTogether && !isCloudflareAIGateway,
+		// OpenRouter openai/* and anthropic/* reasoning models use the
+		// `developer` role; every other OpenRouter backend rejects it. Mirrors
+		// openai-completions.ts: supportsDeveloperRole:
+		// isOpenRouterDeveloperRoleModel || (!isNonStandard && !isOpenRouter).
+		SupportsDeveloperRole:                       isOpenRouterDeveloperRoleModel || (!isNonStandard && !isOpenRouter),
+		SupportsReasoningEffort:                     !isGrok && !isZai && !isMoonshot && !isTogether && !isCloudflareAIGateway && !isNvidia && !isAntLing,
 		SupportsUsageInStreaming:                    true,
 		MaxTokensField:                              maxTokensField,
 		RequiresToolResultName:                      false,
@@ -362,10 +377,10 @@ func detectOpenAICompletionsCompat(model Model) OpenAICompletionsCompat {
 		OpenRouterRouting:                           map[string]any{},
 		VercelGatewayRouting:                        map[string]any{},
 		ZaiToolStream:                               false,
-		SupportsStrictMode:                          !isMoonshot && !isTogether && !isCloudflareAIGateway,
+		SupportsStrictMode:                          !isMoonshot && !isTogether && !isCloudflareAIGateway && !isNvidia,
 		CacheControlFormat:                          cacheControlFormat,
 		SendSessionAffinityHeaders:                  false,
-		SupportsLongCacheRetention:                  !isTogether && !isCloudflareWorkersAI && !isCloudflareAIGateway,
+		SupportsLongCacheRetention:                  !isTogether && !isCloudflareWorkersAI && !isCloudflareAIGateway && !isNvidia && !isAntLing,
 	}
 }
 

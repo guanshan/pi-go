@@ -678,6 +678,142 @@ func TestOpenAICodexResponsesStreamEmitsDeltas(t *testing.T) {
 	}
 }
 
+func TestOpenAICodexResponsesSSERetriesRetryAfterBeforeStart(t *testing.T) {
+	var attempts atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if attempts.Add(1) == 1 {
+			w.Header().Set("Retry-After-Ms", "1")
+			http.Error(w, "temporary overload", http.StatusServiceUnavailable)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte(
+			`data: {"type":"response.output_text.delta","delta":"ok","output_index":0,"item_id":"msg_retry"}` + "\n\n" +
+				`data: {"type":"response.completed","response":{"id":"resp_retry","status":"completed","usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}` + "\n\n",
+		))
+	}))
+	defer server.Close()
+
+	registry := NewModelRegistry(t.TempDir(), NewAuthStorage(t.TempDir()))
+	registry.Auth.SetRuntime("openai-codex", codexTestJWT("acct-123"))
+	stream := registry.StreamChat(context.Background(), ChatRequest{
+		Model: Model{
+			Provider: "openai-codex",
+			ID:       "gpt-5-codex",
+			API:      "openai-codex-responses",
+			BaseURL:  server.URL + "/backend-api",
+			Input:    []string{"text"},
+		},
+		Messages:   []Message{NewUserMessage("hi", nil)},
+		Transport:  "sse",
+		MaxRetries: 1,
+	})
+	for range stream.Events() {
+	}
+	message := stream.Result()
+	if attempts.Load() != 2 {
+		t.Fatalf("attempts=%d want 2", attempts.Load())
+	}
+	if message.StopReason != "stop" || MessageText(message) != "ok" {
+		t.Fatalf("message=%#v", message)
+	}
+}
+
+func TestOpenAICodexResponsesUsageLimitFriendlyErrorDoesNotRetry(t *testing.T) {
+	var attempts atomic.Int32
+	resetAt := time.Now().Add(2 * time.Minute).Unix()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = fmt.Fprintf(w, `{"error":{"code":"usage_limit_reached","message":"Monthly usage limit reached","plan_type":"plus","resets_at":%d}}`, resetAt)
+	}))
+	defer server.Close()
+
+	registry := NewModelRegistry(t.TempDir(), NewAuthStorage(t.TempDir()))
+	registry.Auth.SetRuntime("openai-codex", codexTestJWT("acct-123"))
+	stream := registry.StreamChat(context.Background(), ChatRequest{
+		Model: Model{
+			Provider: "openai-codex",
+			ID:       "gpt-5-codex",
+			API:      "openai-codex-responses",
+			BaseURL:  server.URL + "/backend-api",
+			Input:    []string{"text"},
+		},
+		Messages:   []Message{NewUserMessage("hi", nil)},
+		Transport:  "sse",
+		MaxRetries: 3,
+	})
+	for range stream.Events() {
+	}
+	message := stream.Result()
+	if attempts.Load() != 1 {
+		t.Fatalf("attempts=%d want 1", attempts.Load())
+	}
+	if message.StopReason != "error" || !strings.Contains(message.ErrorMessage, "You have hit your ChatGPT usage limit (plus plan).") || !strings.Contains(message.ErrorMessage, "Try again in ~") {
+		t.Fatalf("message=%#v", message)
+	}
+}
+
+func TestOpenAICodexResponsesStreamlessUsageLimitFriendlyError(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"error":{"code":"usage_not_included","message":"usage not included","plan_type":"free"}}`))
+	}))
+	defer server.Close()
+
+	registry := NewModelRegistry(t.TempDir(), NewAuthStorage(t.TempDir()))
+	registry.Auth.SetRuntime("openai-codex", codexTestJWT("acct-123"))
+	_, err := registry.StreamlessChat(context.Background(), ChatRequest{
+		Model: Model{
+			Provider: "openai-codex",
+			ID:       "gpt-5-codex",
+			API:      "openai-codex-responses",
+			BaseURL:  server.URL + "/backend-api",
+			Input:    []string{"text"},
+		},
+		Messages:  []Message{NewUserMessage("hi", nil)},
+		Transport: "sse",
+	})
+	if err == nil || !strings.Contains(err.Error(), "You have hit your ChatGPT usage limit (free plan).") {
+		t.Fatalf("err=%v", err)
+	}
+}
+
+func TestOpenAICodexResponsesSSEHeaderTimeout(t *testing.T) {
+	old := openAICodexSSEHeaderTimeout
+	openAICodexSSEHeaderTimeout = 10 * time.Millisecond
+	t.Cleanup(func() { openAICodexSSEHeaderTimeout = old })
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(100 * time.Millisecond)
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte(`data: {"type":"response.completed","response":{"id":"late","status":"completed"}}` + "\n\n"))
+	}))
+	defer server.Close()
+
+	registry := NewModelRegistry(t.TempDir(), NewAuthStorage(t.TempDir()))
+	registry.Auth.SetRuntime("openai-codex", codexTestJWT("acct-123"))
+	stream := registry.StreamChat(context.Background(), ChatRequest{
+		Model: Model{
+			Provider: "openai-codex",
+			ID:       "gpt-5-codex",
+			API:      "openai-codex-responses",
+			BaseURL:  server.URL + "/backend-api",
+			Input:    []string{"text"},
+		},
+		Messages:  []Message{NewUserMessage("hi", nil)},
+		Transport: "sse",
+	})
+	for range stream.Events() {
+	}
+	message := stream.Result()
+	if message.StopReason != "error" || !strings.Contains(message.ErrorMessage, "Codex SSE response headers timed out after 10ms") {
+		t.Fatalf("message=%#v", message)
+	}
+}
+
 func TestValidateOpenAICodexResponsesTransport(t *testing.T) {
 	codex := Model{API: "openai-codex-responses"}
 	for _, accepted := range []string{"", "auto", "sse", "websocket", "websocket-cached"} {

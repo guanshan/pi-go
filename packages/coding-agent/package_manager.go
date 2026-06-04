@@ -190,11 +190,9 @@ func (m *DefaultPackageManager) Install(source string, local bool, progress Prog
 			return core.PackageRecord{}, err
 		}
 		defer os.RemoveAll(staged)
-		args := []string{"clone"}
-		if parsed.Ref == "" {
-			args = append(args, "--depth", "1")
-		}
-		args = append(args, gitSource.Repo, staged)
+		// Full clone (no --depth 1) to match TS, so the later `git checkout <ref>`
+		// and Update's `git pull --ff-only` work on arbitrary history.
+		args := []string{"clone", gitSource.Repo, staged}
 		if err := runPM("", "git", args...); err != nil {
 			return core.PackageRecord{}, err
 		}
@@ -812,6 +810,9 @@ func runPM(dir, name string, args ...string) error {
 	}
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
+	// Suppress the Windows console window for package-manager / git spawns,
+	// mirroring TS's windowsHide: true; no-op on other platforms.
+	hidePMWindow(cmd)
 	return cmd.Run()
 }
 

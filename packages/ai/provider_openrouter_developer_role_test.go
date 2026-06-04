@@ -8,12 +8,10 @@ import (
 	"testing"
 )
 
-// TestOpenRouterReasoningUsesSystemRole locks the parity fix for P1-6: OpenRouter
-// reasoning models must send the system prompt with the standard `system` role,
-// not `developer`. Mirrors openai-completions.ts:
-//
-//	supportsDeveloperRole: !isNonStandard && !isOpenRouter
-func TestOpenRouterReasoningUsesSystemRole(t *testing.T) {
+// openRouterSystemRole captures the system-prompt role an OpenRouter reasoning
+// model emits for the given model id.
+func openRouterSystemRole(t *testing.T, modelID string) string {
+	t.Helper()
 	var captured map[string]any
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if err := json.NewDecoder(r.Body).Decode(&captured); err != nil {
@@ -29,7 +27,7 @@ func TestOpenRouterReasoningUsesSystemRole(t *testing.T) {
 	_, err := registry.StreamlessChat(context.Background(), ChatRequest{
 		Model: Model{
 			Provider:  "openrouter",
-			ID:        "openai/o3-mini",
+			ID:        modelID,
 			API:       "openai-completions",
 			BaseURL:   server.URL,
 			Reasoning: true,
@@ -45,9 +43,28 @@ func TestOpenRouterReasoningUsesSystemRole(t *testing.T) {
 	if !ok || len(messages) == 0 {
 		t.Fatalf("messages=%#v", captured["messages"])
 	}
-	first := messages[0].(map[string]any)
-	if first["role"] != "system" {
-		t.Fatalf("OpenRouter reasoning system prompt role=%q want system (not developer)", first["role"])
+	return messages[0].(map[string]any)["role"].(string)
+}
+
+// TestOpenRouterReasoningDeveloperRole locks the parity fix: OpenRouter
+// reasoning models whose id is prefixed openai/ or anthropic/ DO use the
+// `developer` role (those backends accept it), while every other OpenRouter
+// reasoning backend rejects developer and must use the standard `system` role.
+// Mirrors openai-completions.ts:
+//
+//	const isOpenRouterDeveloperRoleModel =
+//	    isOpenRouter && (model.id.startsWith("anthropic/") || model.id.startsWith("openai/"));
+//	supportsDeveloperRole: isOpenRouterDeveloperRoleModel || (!isNonStandard && !isOpenRouter)
+func TestOpenRouterReasoningDeveloperRole(t *testing.T) {
+	if role := openRouterSystemRole(t, "openai/o3-mini"); role != "developer" {
+		t.Fatalf("OpenRouter openai/* reasoning role=%q want developer", role)
+	}
+	if role := openRouterSystemRole(t, "anthropic/claude-opus-4-1"); role != "developer" {
+		t.Fatalf("OpenRouter anthropic/* reasoning role=%q want developer", role)
+	}
+	// A non-prefixed OpenRouter reasoning backend must fall back to system.
+	if role := openRouterSystemRole(t, "qwen/qwen3-235b-a22b-thinking"); role != "system" {
+		t.Fatalf("OpenRouter non-prefixed reasoning role=%q want system", role)
 	}
 }
 

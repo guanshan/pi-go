@@ -72,7 +72,11 @@ func MigrateAuthToAuthJSON(agentDirOpt ...string) ([]string, error) {
 					providers = append(providers, provider)
 				}
 				delete(settings, "apiKeys")
-				if err := writeIndentedJSON(settingsPath, settings, 0o600); err != nil {
+				// settings.json is rewritten with default perms (0644) and does not
+				// tighten the agent dir to 0700, matching TS migrations.ts:62
+				// (writeFileSync with no mode). Only auth.json keeps the 0600/0700
+				// credential boundary below.
+				if err := writeIndentedJSON(settingsPath, settings, 0o644); err != nil {
 					return providers, err
 				}
 			}

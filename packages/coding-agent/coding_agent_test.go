@@ -239,6 +239,39 @@ func TestMainSkipsMigrationsForVersion(t *testing.T) {
 	}
 }
 
+// TestMainRunsMigrationsForHelp mirrors TS main.ts ordering: runMigrations
+// (main.ts:542) executes before printHelp (main.ts:690), so a `--help`
+// invocation still runs startup migrations. A legacy session file at the agent
+// root must be relocated into sessions/--<project>--/ even when only printing
+// help. (--version, by contrast, exits before migrations.)
+func TestMainRunsMigrationsForHelp(t *testing.T) {
+	cwd := t.TempDir()
+	agentDir := t.TempDir()
+	oldwd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(cwd); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = os.Chdir(oldwd)
+	})
+	t.Setenv(core.EnvAgentDir, agentDir)
+
+	session := `{"type":"session","cwd":"/root/project"}` + "\n"
+	if err := os.WriteFile(filepath.Join(agentDir, "s.jsonl"), []byte(session), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := Main(context.Background(), []string{"--help"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(agentDir, "sessions", "--root-project--", "s.jsonl")); err != nil {
+		t.Fatalf("--help should run migrations and relocate the legacy session: %v", err)
+	}
+}
+
 func TestHandleConfigCommandListsResources(t *testing.T) {
 	cwd := t.TempDir()
 	agentDir := t.TempDir()

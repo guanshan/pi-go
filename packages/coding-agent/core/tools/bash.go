@@ -16,12 +16,13 @@ import (
 
 func (BashTool) Name() string { return "bash" }
 func (BashTool) Description() string {
-	return "Execute a shell command in the current working directory. Returns stdout and stderr, truncated to the last 2000 lines or 50KB."
+	// Byte-exact with bash.ts:279.
+	return "Execute a bash command in the current working directory. Returns stdout and stderr. Output is truncated to last 2000 lines or 50KB (whichever is hit first). If truncated, full output is saved to a temp file. Optionally provide a timeout in seconds."
 }
 func (BashTool) Schema() map[string]any {
 	return objectSchema(map[string]any{
 		"command": stringSchema("Bash command to execute"),
-		"timeout": numberSchema("Timeout in seconds"),
+		"timeout": numberSchema("Timeout in seconds (optional, no default timeout)"),
 	}, []string{"command"})
 }
 
@@ -126,6 +127,16 @@ func (t BashTool) Execute(ctx context.Context, raw json.RawMessage, onUpdate Too
 	cmd.Stderr = writer
 
 	var timedOut, aborted atomic.Bool
+	// If the outer context was already cancelled before we could spawn, report
+	// "Command aborted" (mirroring bash.ts's aborted path) rather than the raw
+	// "Failed to start command: context canceled" surfaced by exec. Check the
+	// original ctx (not execCtx) and after acc exists so snapshot()/details() are
+	// valid (the precancel snapshot has empty text).
+	if cerr := ctx.Err(); cerr != nil {
+		acc.finish()
+		snap := acc.snapshot()
+		return ai.ToolResult{Content: ai.TextBlocks(appendStatus(formatBashOutput(snap, ""), "Command aborted")), Details: snap.details(), IsError: true}
+	}
 	if err := cmd.Start(); err != nil {
 		return toolError(fmt.Sprintf("Failed to start command: %v", err))
 	}
@@ -192,7 +203,14 @@ func (t BashTool) Execute(ctx context.Context, raw json.RawMessage, onUpdate Too
 		if errors.As(runErr, &exit) {
 			code = exit.ExitCode()
 		}
-		return ai.ToolResult{Content: ai.TextBlocks(appendStatus(text, fmt.Sprintf("Command exited with code %d", code))), Details: details, IsError: true}
+		// Mirror bash.ts:397 `exitCode !== 0 && exitCode !== null`: a process
+		// terminated by a signal reports exitCode null in Node (ExitCode()==-1 in
+		// Go). This is not the aborted/timed-out path (handled above), so treat it
+		// as success and return the output without an error status, e.g. when a
+		// command is killed by an external signal rather than our cancellation.
+		if code != -1 {
+			return ai.ToolResult{Content: ai.TextBlocks(appendStatus(text, fmt.Sprintf("Command exited with code %d", code))), Details: details, IsError: true}
+		}
 	}
 	return ai.ToolResult{Content: ai.TextBlocks(text), Details: details}
 }

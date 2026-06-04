@@ -291,6 +291,12 @@ func streamAssistantResponse(ctx context.Context, curr *AgentContext, cfg AgentL
 			return ai.AssistantMessage{}, err
 		}
 	}
+	// Fall back to the static config APIKey when GetAPIKey is unset or yields an
+	// empty string, matching TS `(config.getApiKey ? ... : undefined) || config.apiKey`
+	// (agent-loop.ts:302).
+	if apiKey == "" {
+		apiKey = cfg.APIKey
+	}
 	if streamFn == nil {
 		streamFn = DefaultStreamFn(nil)
 	}

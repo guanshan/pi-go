@@ -23,8 +23,14 @@ type BeforeAgentStartEvent struct {
 }
 
 type BeforeAgentStartResult struct {
-	Messages     []agent.AgentMessage
-	SystemPrompt string
+	Messages []agent.AgentMessage
+	// SystemPrompt is a pointer so that "unset" (nil, preserve the turn's
+	// systemPrompt) is distinguishable from "set to empty string" (clear it).
+	// TS uses createContext(turnState, beforeResult?.systemPrompt) with a `??`
+	// fallback, so a handler returning systemPrompt: "" adopts the empty string
+	// and clears the prompt (agent-harness.ts:370,589). A nil pointer here means
+	// the handler did not set systemPrompt.
+	SystemPrompt *string
 }
 
 type ContextResult struct {
@@ -260,12 +266,19 @@ func addHarnessHandler[T any](mu *sync.Mutex, handlers *[]T, f T) func() {
 	}
 }
 
+// emitBeforeAgentStart mirrors TS emitHook lastResult semantics
+// (agent-harness.ts:249-266): every handler sees the unchanged original event
+// (no chaining/accumulation between handlers), and the last handler that returns
+// a non-nil result wins outright — its Messages and SystemPrompt fully replace
+// any earlier handler's (they are not appended/merged). A nil SystemPrompt on
+// the winning result means "preserve" (TS undefined); a non-nil pointer (even to
+// "") is an override that the caller applies, so an empty string clears the
+// prompt.
 func (h *AgentHarness) emitBeforeAgentStart(ctx context.Context, ev BeforeAgentStartEvent) (*BeforeAgentStartResult, error) {
 	h.mu.Lock()
 	handlers := append([]func(context.Context, BeforeAgentStartEvent) (*BeforeAgentStartResult, error)(nil), h.beforeAgentStartHandlers...)
 	h.mu.Unlock()
-	var out BeforeAgentStartResult
-	var changed bool
+	var last *BeforeAgentStartResult
 	for _, handler := range handlers {
 		if handler == nil {
 			continue
@@ -273,49 +286,43 @@ func (h *AgentHarness) emitBeforeAgentStart(ctx context.Context, ev BeforeAgentS
 		current := BeforeAgentStartEvent{
 			Prompt:       ev.Prompt,
 			Images:       append([]ai.ContentBlock(nil), ev.Images...),
-			SystemPrompt: firstString(out.SystemPrompt, ev.SystemPrompt),
+			SystemPrompt: ev.SystemPrompt,
 			Resources:    cloneResources(ev.Resources),
 		}
 		result, err := handler(ctx, current)
 		if err != nil {
 			return nil, err
 		}
-		if result == nil {
-			continue
-		}
-		if result.SystemPrompt != "" {
-			out.SystemPrompt = result.SystemPrompt
-			changed = true
-		}
-		if result.Messages != nil {
-			out.Messages = append(out.Messages, result.Messages...)
-			changed = true
+		if result != nil {
+			last = result
 		}
 	}
-	if !changed {
-		return nil, nil
-	}
-	return &out, nil
+	return last, nil
 }
 
+// transformContext mirrors TS lastResult semantics (agent-harness.ts:249-266,
+// 430-433): each handler receives the same ORIGINAL messages (no chaining of one
+// handler's output into the next), and the last handler returning a non-nil
+// result.Messages wins. If no handler returns messages, the original messages
+// pass through unchanged (TS `result?.messages ?? messages`).
 func (h *AgentHarness) transformContext(ctx context.Context, msgs []agent.AgentMessage) ([]agent.AgentMessage, error) {
 	h.mu.Lock()
 	handlers := append([]func(context.Context, ContextEvent) (*ContextResult, error)(nil), h.contextHandlers...)
 	h.mu.Unlock()
-	current := append([]agent.AgentMessage(nil), msgs...)
+	result := append([]agent.AgentMessage(nil), msgs...)
 	for _, handler := range handlers {
 		if handler == nil {
 			continue
 		}
-		result, err := handler(ctx, ContextEvent{Messages: append([]agent.AgentMessage(nil), current...)})
+		out, err := handler(ctx, ContextEvent{Messages: append([]agent.AgentMessage(nil), msgs...)})
 		if err != nil {
-			return current, err
+			return result, err
 		}
-		if result != nil && result.Messages != nil {
-			current = append([]agent.AgentMessage(nil), result.Messages...)
+		if out != nil && out.Messages != nil {
+			result = append([]agent.AgentMessage(nil), out.Messages...)
 		}
 	}
-	return current, nil
+	return result, nil
 }
 
 func (h *AgentHarness) beforeToolCall(ctx context.Context, tc agent.BeforeToolCallContext) (agent.BeforeToolCallResult, error) {
@@ -431,76 +438,63 @@ func (h *AgentHarness) emitAfterProviderResponse(ctx context.Context, resp ai.Pr
 	return nil
 }
 
+// emitToolCall mirrors TS lastResult semantics (agent-harness.ts:249-266,
+// 434-442): every handler sees the same original tool_call event and the last
+// handler returning a non-nil result wins (its Block/Reason are used). It does
+// NOT short-circuit on the first non-nil result or on Block — TS runs all
+// handlers and keeps the last one's result.
 func (h *AgentHarness) emitToolCall(ctx context.Context, ev ToolCallEvent) (*ToolCallResult, error) {
 	h.mu.Lock()
 	handlers := append([]func(context.Context, ToolCallEvent) (*ToolCallResult, error)(nil), h.toolCallHandlers...)
 	h.mu.Unlock()
+	var last *ToolCallResult
 	for _, handler := range handlers {
 		if handler == nil {
 			continue
 		}
 		current := ToolCallEvent{ToolCallID: ev.ToolCallID, ToolName: ev.ToolName, Input: mergeAnyMaps(ev.Input)}
 		result, err := handler(ctx, current)
-		if err != nil || result == nil {
-			return result, err
+		if err != nil {
+			return nil, err
 		}
-		if result.Block {
-			return result, nil
+		if result != nil {
+			last = result
 		}
 	}
-	return nil, nil
+	return last, nil
 }
 
+// emitToolResult mirrors TS lastResult semantics (agent-harness.ts:249-266,
+// 443-455): every handler sees the same ORIGINAL tool_result event (no
+// current<-patch chaining between handlers), and the last handler returning a
+// non-nil patch wins outright — its patch fields are used as-is, not merged with
+// earlier handlers' patches.
 func (h *AgentHarness) emitToolResult(ctx context.Context, ev ToolResultEvent) (*ToolResultPatch, error) {
 	h.mu.Lock()
 	handlers := append([]func(context.Context, ToolResultEvent) (*ToolResultPatch, error)(nil), h.toolResultHandlers...)
 	h.mu.Unlock()
-	current := ev
-	var out ToolResultPatch
-	var changed bool
+	var last *ToolResultPatch
 	for _, handler := range handlers {
 		if handler == nil {
 			continue
 		}
 		next := ToolResultEvent{
-			ToolCallID: current.ToolCallID,
-			ToolName:   current.ToolName,
-			Input:      mergeAnyMaps(current.Input),
-			Content:    append([]ai.ContentBlock(nil), current.Content...),
-			Details:    current.Details,
-			IsError:    current.IsError,
+			ToolCallID: ev.ToolCallID,
+			ToolName:   ev.ToolName,
+			Input:      mergeAnyMaps(ev.Input),
+			Content:    append([]ai.ContentBlock(nil), ev.Content...),
+			Details:    ev.Details,
+			IsError:    ev.IsError,
 		}
 		patch, err := handler(ctx, next)
 		if err != nil {
 			return nil, err
 		}
-		if patch == nil {
-			continue
-		}
-		if patch.Content != nil {
-			current.Content = append([]ai.ContentBlock(nil), patch.Content...)
-			out.Content = append([]ai.ContentBlock(nil), patch.Content...)
-			changed = true
-		}
-		if patch.Details != nil {
-			current.Details = patch.Details.V
-			out.Details = patch.Details
-			changed = true
-		}
-		if patch.IsError != nil {
-			current.IsError = *patch.IsError
-			out.IsError = patch.IsError
-			changed = true
-		}
-		if patch.Terminate != nil {
-			out.Terminate = patch.Terminate
-			changed = true
+		if patch != nil {
+			last = patch
 		}
 	}
-	if !changed {
-		return nil, nil
-	}
-	return &out, nil
+	return last, nil
 }
 
 func (h *AgentHarness) emitSessionBeforeCompact(ctx context.Context, ev SessionBeforeCompactEvent) (*SessionBeforeCompactResult, error) {

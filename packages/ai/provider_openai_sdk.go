@@ -144,19 +144,29 @@ func (r *ModelRegistry) runOpenAIResponsesHTTPStream(ctx context.Context, req Ch
 	if err != nil {
 		return openAIStreamError(partial, err, stream)
 	}
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(rawBody))
-	if err != nil {
-		return openAIStreamError(partial, err, stream)
+	var resp *http.Response
+	var cleanup context.CancelFunc = func() {}
+	if req.Model.API == "openai-codex-responses" {
+		resp, cleanup, err = r.openAICodexResponsesHTTPStreamResponse(ctx, req, url, headers, rawBody)
+		if err != nil {
+			return openAIStreamError(partial, err, stream)
+		}
+	} else {
+		httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(rawBody))
+		if err != nil {
+			return openAIStreamError(partial, err, stream)
+		}
+		httpReq.Header.Set("Content-Type", "application/json")
+		httpReq.Header.Set("User-Agent", "pi-go/"+Version)
+		for k, v := range headers {
+			httpReq.Header.Set(k, v)
+		}
+		resp, err = providerHTTPClient(req).Do(httpReq)
+		if err != nil {
+			return openAIStreamError(partial, err, stream)
+		}
 	}
-	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("User-Agent", "pi-go/"+Version)
-	for k, v := range headers {
-		httpReq.Header.Set(k, v)
-	}
-	resp, err := providerHTTPClient(req).Do(httpReq)
-	if err != nil {
-		return openAIStreamError(partial, err, stream)
-	}
+	defer cleanup()
 	defer resp.Body.Close()
 	if req.OnResponse != nil {
 		if err := req.OnResponse(ProviderResponse{Status: resp.StatusCode, Headers: aiproviders.HeadersRecord(resp.Header)}, req.Model); err != nil {

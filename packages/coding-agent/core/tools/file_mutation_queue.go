@@ -1,12 +1,14 @@
 package tools
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"runtime"
 	"sort"
 	"strings"
 	"sync"
+	"syscall"
 
 	"github.com/guanshan/pi-go/packages/ai"
 )
@@ -104,6 +106,14 @@ func atomicWriteFile(path string, data []byte, perm os.FileMode) error {
 	}
 	tmp, err := os.CreateTemp(filepath.Dir(target), "."+filepath.Base(target)+".tmp-*")
 	if err != nil {
+		// When the parent directory is read-only/permission-denied we cannot create
+		// a temp sibling, but the target file itself may still be writable. TS uses
+		// a plain writeFile here, so fall back to an in-place write to preserve that
+		// success path (a writable file inside a read-only dir). This trades the
+		// atomic-rename crash-safety for parity in that corner case only.
+		if isWriteFallbackError(err) {
+			return os.WriteFile(target, data, perm)
+		}
 		return err
 	}
 	tmpName := tmp.Name()
@@ -136,4 +146,16 @@ func fileWriteMode(path string, fallback os.FileMode) os.FileMode {
 		return info.Mode().Perm()
 	}
 	return fallback
+}
+
+// isWriteFallbackError reports whether a CreateTemp failure indicates the parent
+// directory is not writable (permission denied, read-only filesystem, or not a
+// directory) — the cases where TS's plain writeFile would still succeed on a
+// writable target inside it, so atomicWriteFile falls back to an in-place write.
+func isWriteFallbackError(err error) bool {
+	return errors.Is(err, os.ErrPermission) ||
+		errors.Is(err, syscall.EACCES) ||
+		errors.Is(err, syscall.EPERM) ||
+		errors.Is(err, syscall.EROFS) ||
+		errors.Is(err, syscall.ENOTDIR)
 }

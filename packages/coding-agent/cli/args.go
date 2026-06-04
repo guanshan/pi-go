@@ -105,11 +105,11 @@ func ParseArgs(argv []string) Args {
 			result.Version = true
 		case arg == "--mode":
 			if v, ok := next(); ok {
+				// Matches args.ts:77-81: only recognized modes set result.Mode;
+				// unrecognized values are silently ignored (Mode stays default text).
 				switch Mode(v) {
 				case ModeText, ModeJSON, ModeRPC:
 					result.Mode = Mode(v)
-				default:
-					result.Diagnostics = append(result.Diagnostics, Diagnostic{Type: "error", Message: fmt.Sprintf("Invalid mode %q", v)})
 				}
 			}
 		case arg == "--continue" || arg == "-c":
@@ -404,6 +404,7 @@ Examples:
 Environment Variables:
   ANTHROPIC_API_KEY                - Anthropic Claude API key
   ANTHROPIC_OAUTH_TOKEN            - Anthropic OAuth token (alternative to API key)
+  ANT_LING_API_KEY                 - Ant Ling API key
   OPENAI_API_KEY                   - OpenAI GPT API key
   AZURE_OPENAI_API_KEY             - Azure OpenAI API key
   AZURE_OPENAI_BASE_URL            - Azure OpenAI/Cognitive Services base URL (e.g. https://{resource}.openai.azure.com)
@@ -411,6 +412,7 @@ Environment Variables:
   AZURE_OPENAI_API_VERSION         - Azure OpenAI API version (default: v1)
   AZURE_OPENAI_DEPLOYMENT_NAME_MAP - Azure OpenAI model=deployment map (comma-separated)
   DEEPSEEK_API_KEY                 - DeepSeek API key
+  NVIDIA_API_KEY                   - NVIDIA NIM API key
   GEMINI_API_KEY                   - Google Gemini API key
   GROQ_API_KEY                     - Groq API key
   CEREBRAS_API_KEY                 - Cerebras API key
@@ -420,6 +422,7 @@ Environment Variables:
   OPENROUTER_API_KEY               - OpenRouter API key
   AI_GATEWAY_API_KEY               - Vercel AI Gateway API key
   ZAI_API_KEY                      - ZAI API key
+  ZAI_CODING_CN_API_KEY            - ZAI Coding Plan API key (China)
   MISTRAL_API_KEY                  - Mistral API key
   MINIMAX_API_KEY                  - MiniMax API key
   MOONSHOT_API_KEY                 - Moonshot AI API key
@@ -437,8 +440,10 @@ Environment Variables:
   AWS_SECRET_ACCESS_KEY            - AWS secret key for Amazon Bedrock
   AWS_BEARER_TOKEN_BEDROCK         - Bedrock API key (bearer token)
   AWS_REGION                       - AWS region for Amazon Bedrock (e.g., us-east-1)
-  PI_AGENT_DIR                     - Config directory (default: ~/.pi/agent)
-  PI_SESSION_DIR                   - Session storage directory (overridden by --session-dir)
+  PI_CODING_AGENT_DIR              - Config directory (default: ~/.pi/agent)
+  PI_CODING_AGENT_SESSION_DIR      - Session storage directory (overridden by --session-dir)
+  PI_AGENT_DIR                     - Short alias for PI_CODING_AGENT_DIR
+  PI_SESSION_DIR                   - Short alias for PI_CODING_AGENT_SESSION_DIR
   PI_PACKAGE_DIR                   - Override package directory (for Nix/Guix store paths)
   PI_OFFLINE                       - Disable startup network operations when set to 1/true/yes
   PI_TELEMETRY                     - Override install telemetry when set to 1/true/yes or 0/false/no

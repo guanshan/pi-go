@@ -7,9 +7,11 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/guanshan/pi-go/packages/ai"
 	"github.com/guanshan/pi-go/packages/coding-agent/cli"
@@ -545,6 +547,27 @@ func handleSlashWithPrompt(ctx context.Context, target any, line string, prompte
 			}
 			fmt.Fprintf(stdout, "Model: %s/%s\n", model.Provider, model.ID)
 		}
+	case "thinking":
+		// /thinking [level] sets the thinking level when given a valid level, else
+		// cycles to the next level. This is the non-Kitty fallback for the Shift+Tab
+		// cycle; success is reported via the printed level (interactive callers also
+		// surface the emitted ThinkingLevelChangedEvent).
+		if arg == "" {
+			level, ok := agent.CycleThinkingLevel()
+			if !ok {
+				fmt.Fprintln(stdout, "No other thinking levels available")
+			} else {
+				fmt.Fprintf(stdout, "Thinking: %s\n", level)
+			}
+		} else {
+			if !ai.IsValidThinkingLevel(arg) {
+				return false, fmt.Errorf("invalid thinking level %q. Valid values: off, minimal, low, medium, high, xhigh", arg)
+			}
+			if err := agent.SetThinkingLevel(ai.ThinkingLevel(arg)); err != nil {
+				return false, err
+			}
+			fmt.Fprintf(stdout, "Thinking: %s\n", agent.CurrentThinkingLevel())
+		}
 	case "scoped-models":
 		for _, model := range agent.Registry.AvailableConfigured() {
 			fmt.Fprintf(stdout, "%s/%s\n", model.Provider, model.ID)
@@ -552,6 +575,15 @@ func handleSlashWithPrompt(ctx context.Context, target any, line string, prompte
 	case "settings":
 		raw, _ := json.MarshalIndent(agent.State(), "", "  ")
 		fmt.Fprintln(stdout, string(raw))
+	case "debug":
+		// Mirror TS interactive-mode handleDebugCommand: dump diagnostics + the
+		// session messages (JSONL) to <agentDir>/pi-debug.log and report the path.
+		// The rendered-line dump (this.ui.render) is a rich-TUI feature and is
+		// intentionally omitted in line/rpc mode, so we dump only the JSONL state.
+		if err := writeDebugLog(agent); err != nil {
+			return false, err
+		}
+		fmt.Fprintf(stdout, "Debug log written\n%s\n", DebugLogPath())
 	case "new":
 		if runtime == nil {
 			return false, fmt.Errorf("/new requires a session runtime")
@@ -829,6 +861,35 @@ func executeExtensionSlashCommand(ctx context.Context, agent *AgentSession, cmd,
 		return "", false, nil
 	}
 	return agent.extensionRuntime.ExecuteCommand(ctx, cmd, arg)
+}
+
+// writeDebugLog dumps session diagnostics and the session messages (one JSON
+// object per line) to DebugLogPath(), mirroring the JSONL portion of TS
+// interactive-mode handleDebugCommand. The terminal render-tree dump is a
+// rich-TUI feature and is intentionally not reproduced here.
+func writeDebugLog(agent *AgentSession) error {
+	if agent == nil || agent.Session == nil {
+		return fmt.Errorf("/debug requires an active session")
+	}
+	path := DebugLogPath()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "Debug output at %s\n", time.Now().UTC().Format(time.RFC3339))
+	if stats, err := json.MarshalIndent(agent.Session.Stats(), "", "  "); err == nil {
+		fmt.Fprintf(&b, "Session: %s\n", stats)
+	}
+	b.WriteString("\n=== Agent messages (JSONL) ===\n")
+	for _, msg := range agent.Session.BuildContext().Messages {
+		raw, err := json.Marshal(msg)
+		if err != nil {
+			continue
+		}
+		b.Write(raw)
+		b.WriteByte('\n')
+	}
+	return os.WriteFile(path, []byte(b.String()), 0o644)
 }
 
 func slashTarget(target any) (*AgentSessionRuntime, *AgentSession, error) {

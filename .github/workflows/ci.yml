@@ -70,6 +70,23 @@ jobs:
             exit $exitCode
           }
 
+      # Run the race detector on Windows for the coding-agent core/tools packages,
+      # where the Windows-specific process/handle paths (bash close-hang, taskkill,
+      # windowsHide) live. Scoped to that subset to keep the Windows job tractable
+      # while still catching Windows-only data races the non-race run would miss.
+      - name: Test (race, coding-agent subset)
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          go test -race -timeout 5m ./packages/coding-agent/core/... 2>&1 | Tee-Object -FilePath race-output.txt
+          $exitCode = $LASTEXITCODE
+          if ($exitCode -ne 0) {
+            $tail = Get-Content race-output.txt -Tail 120 | Out-String
+            $tail = $tail -replace '%', '%25' -replace "`r", '%0D' -replace "`n", '%0A'
+            Write-Host "::error title=Windows -race test failed::$tail"
+            exit $exitCode
+          }
+
       - name: Upload coverage
         if: matrix.os == 'ubuntu-latest'
         uses: actions/upload-artifact@v4

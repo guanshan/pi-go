@@ -109,7 +109,9 @@ func loadSkillsFromDir(ctx context.Context, env harnessenv.ExecutionEnv, dir str
 		return result
 	}
 
-	sort.Slice(entries, func(i, j int) bool { return entries[i].Name < entries[j].Name })
+	// TS orders entries with entries.sort((a, b) => a.name.localeCompare(b.name))
+	// (skills.ts:151); use the ICU root collator instead of byte order.
+	sort.SliceStable(entries, func(i, j int) bool { return localeCompare(entries[i].Name, entries[j].Name) < 0 })
 	for _, entry := range entries {
 		if strings.HasPrefix(entry.Name, ".") || entry.Name == "node_modules" {
 			continue
@@ -227,8 +229,10 @@ func validateSkillName(name string, parentDirName string) []string {
 	if name != parentDirName {
 		errors = append(errors, fmt.Sprintf("name %q does not match parent directory %q", name, parentDirName))
 	}
-	if len(name) > maxSkillNameLength {
-		errors = append(errors, fmt.Sprintf("name exceeds %d characters (%d)", maxSkillNameLength, len(name)))
+	// TS measures name.length in UTF-16 code units (skills.ts:284); use utf16Len
+	// so a non-ASCII name reports the same count/threshold as the TS port.
+	if nlen := utf16Len(name); nlen > maxSkillNameLength {
+		errors = append(errors, fmt.Sprintf("name exceeds %d characters (%d)", maxSkillNameLength, nlen))
 	}
 	if !isValidSkillNameCharacters(name) {
 		errors = append(errors, "name contains invalid characters (must be lowercase a-z, 0-9, hyphens only)")
@@ -262,8 +266,10 @@ func validateSkillDescription(description string) []string {
 	if strings.TrimSpace(description) == "" {
 		return []string{"description is required"}
 	}
-	if len(description) > maxSkillDescriptionLength {
-		return []string{fmt.Sprintf("description exceeds %d characters (%d)", maxSkillDescriptionLength, len(description))}
+	// TS measures description.length in UTF-16 code units for both the threshold
+	// and the reported count (skills.ts:297-298); use utf16Len, not byte length.
+	if dlen := utf16Len(description); dlen > maxSkillDescriptionLength {
+		return []string{fmt.Sprintf("description exceeds %d characters (%d)", maxSkillDescriptionLength, dlen)}
 	}
 	return nil
 }

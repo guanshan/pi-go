@@ -59,8 +59,13 @@ func (r *ModelRegistry) openAIResponsesChat(ctx context.Context, req ChatRequest
 		response.Message.Diagnostics = append(fallbackDiagnostics, response.Message.Diagnostics...)
 		return response, nil
 	}
-	bearerAuth := req.Model.API == "openai-responses" && req.Model.Provider != "cloudflare-ai-gateway"
-	raw, err := aiproviders.DoOpenAISDKJSONWithClient(ctx, url, key, headers, body, bearerAuth, providerHTTPClient(req), providerRequestOptions(req))
+	var raw []byte
+	if req.Model.API == "openai-codex-responses" {
+		raw, err = r.doOpenAICodexResponsesJSON(ctx, req, url, headers, body)
+	} else {
+		bearerAuth := req.Model.API == "openai-responses" && req.Model.Provider != "cloudflare-ai-gateway"
+		raw, err = aiproviders.DoOpenAISDKJSONWithClient(ctx, url, key, headers, body, bearerAuth, providerHTTPClient(req), providerRequestOptions(req))
+	}
 	if err != nil {
 		return ChatResponse{}, err
 	}

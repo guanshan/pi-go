@@ -49,10 +49,86 @@ type SessionEntry struct {
 	Content             any             `json:"content,omitempty"`
 	Display             bool            `json:"display,omitempty"`
 	Details             any             `json:"details,omitempty"`
+	FromHook            bool            `json:"fromHook,omitempty"`
+	FromHookSet         bool            `json:"-"`
 	TargetID            string          `json:"targetId,omitempty"`
 	Label               string          `json:"label,omitempty"`
 	Name                string          `json:"name,omitempty"`
 	Raw                 json.RawMessage `json:"-"`
+}
+
+type sessionEntryRecord struct {
+	Type                string           `json:"type"`
+	ID                  string           `json:"id,omitempty"`
+	ParentID            *string          `json:"parentId"`
+	Timestamp           string           `json:"timestamp,omitempty"`
+	Message             ai.Message       `json:"message,omitempty"`
+	Provider            string           `json:"provider,omitempty"`
+	ModelID             string           `json:"modelId,omitempty"`
+	ThinkingLevel       ai.ThinkingLevel `json:"thinkingLevel,omitempty"`
+	FromID              string           `json:"fromId,omitempty"`
+	Summary             string           `json:"summary,omitempty"`
+	FirstKeptID         string           `json:"firstKeptEntryId,omitempty"`
+	FirstKeptEntryIndex *int             `json:"firstKeptEntryIndex,omitempty"`
+	TokensBefore        int              `json:"tokensBefore,omitempty"`
+	CustomType          string           `json:"customType,omitempty"`
+	Data                json.RawMessage  `json:"data,omitempty"`
+	Content             any              `json:"content,omitempty"`
+	Display             bool             `json:"display,omitempty"`
+	Details             any              `json:"details,omitempty"`
+	FromHook            bool             `json:"fromHook,omitempty"`
+	TargetID            string           `json:"targetId,omitempty"`
+	Label               string           `json:"label,omitempty"`
+	Name                string           `json:"name,omitempty"`
+}
+
+func (e SessionEntry) MarshalJSON() ([]byte, error) {
+	record := sessionEntryRecord{
+		Type:                e.Type,
+		ID:                  e.ID,
+		ParentID:            e.ParentID,
+		Timestamp:           e.Timestamp,
+		Message:             e.Message,
+		Provider:            e.Provider,
+		ModelID:             e.ModelID,
+		ThinkingLevel:       e.ThinkingLevel,
+		FromID:              e.FromID,
+		Summary:             e.Summary,
+		FirstKeptID:         e.FirstKeptID,
+		FirstKeptEntryIndex: e.FirstKeptEntryIndex,
+		TokensBefore:        e.TokensBefore,
+		CustomType:          e.CustomType,
+		Data:                e.Data,
+		Content:             e.Content,
+		Display:             e.Display,
+		Details:             e.Details,
+		FromHook:            e.FromHook,
+		TargetID:            e.TargetID,
+		Label:               e.Label,
+		Name:                e.Name,
+	}
+	data, err := marshalJSONNoHTMLEscape(record)
+	if err != nil {
+		return nil, err
+	}
+	switch e.Type {
+	case "compaction":
+		if e.TokensBefore == 0 {
+			data = insertJSONFieldAfterKey(data, "firstKeptEntryId", `"tokensBefore":0`)
+		}
+		if !e.FromHook && e.FromHookSet {
+			data = appendJSONFieldBeforeClose(data, `"fromHook":false`)
+		}
+	case "branch_summary":
+		if !e.FromHook && e.FromHookSet {
+			data = appendJSONFieldBeforeClose(data, `"fromHook":false`)
+		}
+	case "custom_message":
+		if !e.Display {
+			data = insertJSONFieldAfterKey(data, "content", `"display":false`)
+		}
+	}
+	return data, nil
 }
 
 func (e *SessionEntry) UnmarshalJSON(data []byte) error {
@@ -78,6 +154,7 @@ func (e *SessionEntry) UnmarshalJSON(data []byte) error {
 		}
 		out.Message = msg
 	}
+	_, out.FromHookSet = fields["fromHook"]
 	*e = SessionEntry(out)
 	return nil
 }
@@ -409,6 +486,9 @@ func (s *SessionManager) Append(entry SessionEntry) error {
 		entry.ParentID = s.CurrentID
 		id := entry.ID
 		s.CurrentID = &id
+	}
+	if entry.Type == "compaction" || entry.Type == "branch_summary" {
+		entry.FromHookSet = true
 	}
 	s.Entries = append(s.Entries, entry)
 	if s.InMemory {

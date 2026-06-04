@@ -16,16 +16,21 @@ import (
 
 func (EditTool) Name() string { return "edit" }
 func (EditTool) Description() string {
-	return "Edit one file using exact, unique text replacements. Multiple non-overlapping edits can be sent in one call."
+	// Byte-exact with edit.ts:295.
+	return "Edit a single file using exact text replacement. Every edits[].oldText must match a unique, non-overlapping region of the original file. If two changes affect the same block or nearby lines, merge them into one edit instead of emitting overlapping edits. Do not include large unchanged regions just to connect distant changes."
 }
 func (EditTool) Schema() map[string]any {
 	edit := objectSchema(map[string]any{
-		"oldText": stringSchema("Exact unique text to replace"),
-		"newText": stringSchema("Replacement text"),
+		"oldText": stringSchema("Exact text for one targeted replacement. It must be unique in the original file and must not overlap with any other edits[].oldText in the same call."),
+		"newText": stringSchema("Replacement text for this targeted edit."),
 	}, []string{"oldText", "newText"})
 	return objectSchema(map[string]any{
-		"path":  stringSchema("Path to the file to edit"),
-		"edits": map[string]any{"type": "array", "items": edit},
+		"path": stringSchema("Path to the file to edit (relative or absolute)"),
+		"edits": map[string]any{
+			"type":        "array",
+			"items":       edit,
+			"description": "One or more targeted replacements. Each edit is matched against the original file, not incrementally. Do not include overlapping or nested edits. If two changes touch the same block or nearby lines, merge them into one edit instead.",
+		},
 	}, []string{"path", "edits"})
 }
 func (t EditTool) Execute(ctx context.Context, raw json.RawMessage, _ ToolUpdate) ai.ToolResult {
@@ -53,6 +58,15 @@ func (t EditTool) Execute(ctx context.Context, raw json.RawMessage, _ ToolUpdate
 		data, err := os.ReadFile(abs)
 		if err != nil {
 			return toolError(fmt.Sprintf("Could not edit file: %s. %s.", args.Path, editAccessErrorMessage(err)))
+		}
+		// Write-permission preflight: a readable-but-not-writable file (e.g. 0o444)
+		// would otherwise be silently overwritten via the temp-file replace, since
+		// atomicWriteFile writes a sibling temp in the (writable) directory. TS
+		// reports EACCES for such files (edit.ts:323-331), so probe writability and
+		// surface the same message. This is racy vs the actual write (TOCTOU), but
+		// matches TS which has the same access-then-write race.
+		if perr := checkWritable(abs); perr != nil {
+			return toolError(fmt.Sprintf("Could not edit file: %s. %s.", args.Path, editAccessErrorMessage(perr)))
 		}
 		rawContent := string(data)
 		bom, content := stripBOM(rawContent)
@@ -191,6 +205,22 @@ func fuzzyFindText(content, oldText string) (index, matchLength int, usedFuzzy b
 		return -1, 0, false
 	}
 	return fuzzyIndex, len(fuzzyOldText), true
+}
+
+// checkWritable probes whether the target file can be opened for writing,
+// returning the OS error (e.g. EACCES on a 0o444 file) when it cannot. It opens
+// O_WRONLY without truncation and closes immediately, so it does not mutate the
+// file. A non-existent file yields no error here (creation is handled by the
+// caller); only an existing, unwritable file fails.
+func checkWritable(path string) error {
+	f, err := os.OpenFile(path, os.O_WRONLY, 0)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	return f.Close()
 }
 
 // editAccessErrorMessage mirrors TS edit.ts:328-330: when the underlying error

@@ -294,16 +294,14 @@ func (a *AuthStorage) APIKey(model Model) string {
 				return key
 			}
 		}
-		if key := a.Data[strings.ToUpper(strings.ReplaceAll(model.Provider, "-", "_"))+"_API_KEY"]; key != "" {
-			return key
-		}
 	}
 	if model.EnvKey != "" {
 		if key := os.Getenv(model.EnvKey); key != "" {
 			return key
 		}
 	}
-	for _, env := range ProviderEnvKeys(model.Provider) {
+	envKeys := ProviderEnvKeys(model.Provider)
+	for _, env := range envKeys {
 		if key := os.Getenv(env); key != "" {
 			return key
 		}

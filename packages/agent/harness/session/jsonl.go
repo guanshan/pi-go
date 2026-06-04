@@ -1,6 +1,7 @@
 package session
 
 import (
+	"bytes"
 	"encoding/json"
 
 	"github.com/guanshan/pi-go/packages/ai"
@@ -36,9 +37,9 @@ type entryRecord struct {
 	Raw              json.RawMessage `json:"-"`
 }
 
-// MarshalJSON serializes an entry record. Two shared, omitempty fields must be
-// re-added for specific entry types because the TypeScript parser/reader require
-// them present even when empty:
+// MarshalJSON serializes an entry record. Several shared, omitempty fields must
+// be re-added for specific entry types because the TypeScript writer always
+// emits them and its parser/reader require them present even when empty/zero:
 //   - Leaf entries must always carry an explicit targetId (null for a root leaf
 //     or string otherwise) because the TypeScript parser rejects a leaf whose
 //     targetId field is missing (jsonl-storage.ts:103-105).
@@ -47,9 +48,24 @@ type entryRecord struct {
 //     the reader does [...entry.activeToolNames] (session.ts:36), which throws on
 //     an undefined (omitted) field. SetActiveTools(ctx, nil) is a reachable path
 //     that produces an empty slice that omitempty would otherwise drop.
+//   - compaction entries must always carry tokensBefore (number) and fromHook
+//     (boolean): TS appendCompaction always writes both (session.ts:173-191), so
+//     tokensBefore:0 and fromHook:false must survive Go's omitempty.
+//   - branch_summary entries must always carry fromHook (boolean): TS moveTo
+//     always writes it (session.ts:255-264).
+//   - custom_message entries must always carry display (boolean): TS
+//     appendCustomMessageEntry always writes it (session.ts:204-219).
 //
-// In both cases the field is appended before the closing brace, preserving valid
-// JSON and the existing field order.
+// The re-added fields are inserted at the TS object-literal position (which the
+// shared struct field order already reflects when the field is present):
+//   - compaction: {summary, firstKeptEntryId, tokensBefore, details?, fromHook}
+//   - custom_message: {customType, content, display, details?}
+//   - branch_summary: {fromId, summary, details?, fromHook}
+//
+// tokensBefore is inserted right after firstKeptEntryId (i.e. before an optional
+// details), display right after content, and the trailing fromHook is appended
+// before the closing brace. details is still dropped when nil (TS drops
+// undefined), matching the omitted-field behavior.
 func (r entryRecord) MarshalJSON() ([]byte, error) {
 	type alias entryRecord
 	// Use the no-HTML-escape marshaller so <, >, and & survive in message
@@ -60,13 +76,117 @@ func (r entryRecord) MarshalJSON() ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	if r.Type == "leaf" && r.TargetID == nil && len(data) >= 2 && data[len(data)-1] == '}' {
-		return append(data[:len(data)-1], []byte(`,"targetId":null}`)...), nil
-	}
-	if r.Type == "active_tools_change" && len(r.ActiveToolNames) == 0 && len(data) >= 2 && data[len(data)-1] == '}' {
-		return append(data[:len(data)-1], []byte(`,"activeToolNames":[]}`)...), nil
+	switch r.Type {
+	case "leaf":
+		if r.TargetID == nil {
+			data = appendBeforeClose(data, `"targetId":null`)
+		}
+	case "active_tools_change":
+		if len(r.ActiveToolNames) == 0 {
+			data = appendBeforeClose(data, `"activeToolNames":[]`)
+		}
+	case "compaction":
+		// tokensBefore goes after firstKeptEntryId (before an optional details);
+		// fromHook is the final field.
+		if r.TokensBefore == 0 {
+			data = insertAfterKey(data, "firstKeptEntryId", `"tokensBefore":0`)
+		}
+		if !r.FromHook {
+			data = appendBeforeClose(data, `"fromHook":false`)
+		}
+	case "branch_summary":
+		if !r.FromHook {
+			data = appendBeforeClose(data, `"fromHook":false`)
+		}
+	case "custom_message":
+		if !r.Display {
+			data = insertAfterKey(data, "content", `"display":false`)
+		}
 	}
 	return data, nil
+}
+
+// appendBeforeClose inserts field (a `"key":value` fragment) immediately before
+// the trailing '}' of a JSON object, preserving valid JSON. The object is never
+// empty here (it always carries type/id/parentId/timestamp), so a leading comma
+// is always correct.
+func appendBeforeClose(data []byte, field string) []byte {
+	if len(data) < 2 || data[len(data)-1] != '}' {
+		return data
+	}
+	out := make([]byte, 0, len(data)+len(field)+1)
+	out = append(out, data[:len(data)-1]...)
+	out = append(out, ',')
+	out = append(out, field...)
+	out = append(out, '}')
+	return out
+}
+
+// insertAfterKey inserts field (a `"key":value` fragment) immediately after the
+// value of an existing object key, preserving TS field order when a later
+// optional field (e.g. details) is present. If the anchor key is absent the
+// fragment is appended before the closing brace as a fallback.
+func insertAfterKey(data []byte, key, field string) []byte {
+	marker := []byte(`"` + key + `":`)
+	idx := bytes.Index(data, marker)
+	if idx < 0 {
+		return appendBeforeClose(data, field)
+	}
+	// Walk past the key's value to the comma or closing brace that follows it.
+	i := idx + len(marker)
+	end := scanJSONValueEnd(data, i)
+	if end < 0 {
+		return appendBeforeClose(data, field)
+	}
+	out := make([]byte, 0, len(data)+len(field)+1)
+	out = append(out, data[:end]...)
+	out = append(out, ',')
+	out = append(out, field...)
+	out = append(out, data[end:]...)
+	return out
+}
+
+// scanJSONValueEnd returns the index just past the JSON value starting at start,
+// i.e. the index of the ',' or '}' that terminates it. It handles strings
+// (with escapes) and other scalars/containers by tracking quoting and nesting
+// depth; objects/arrays are skipped wholesale. Returns -1 if malformed.
+func scanJSONValueEnd(data []byte, start int) int {
+	depth := 0
+	inString := false
+	escaped := false
+	for i := start; i < len(data); i++ {
+		c := data[i]
+		if inString {
+			if escaped {
+				escaped = false
+				continue
+			}
+			switch c {
+			case '\\':
+				escaped = true
+			case '"':
+				inString = false
+			}
+			continue
+		}
+		switch c {
+		case '"':
+			inString = true
+		case '{', '[':
+			depth++
+		case '}', ']':
+			if depth == 0 {
+				// Closing brace of the enclosing object (value ended).
+				return i
+			}
+			depth--
+		case ',':
+			if depth == 0 {
+				return i
+			}
+		}
+	}
+	return -1
 }
 
 func (r *entryRecord) UnmarshalJSON(data []byte) error {

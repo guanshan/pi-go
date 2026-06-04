@@ -215,4 +215,69 @@ func TestEditSurfacesEACCESAndEISDIR(t *testing.T) {
 			t.Fatalf("EACCES mismatch:\n got: %q\nwant: %q", out, want)
 		}
 	})
+
+	// EACCES on a readable-but-not-writable file (0o444). ReadFile succeeds, so
+	// without the write-permission preflight the atomic temp-file replace would
+	// silently overwrite the read-only file (the surprising divergence the
+	// preflight fixes). TS reports EACCES here (edit.ts:323-331); assert the same.
+	t.Run("eacces-on-readonly-file", func(t *testing.T) {
+		if runtime.GOOS == "windows" {
+			t.Skip("Windows chmod does not model POSIX write permissions for files")
+		}
+		if !permissionsEnforced(t) {
+			t.Skip("filesystem does not enforce permission bits (likely running as root); cannot trigger EACCES")
+		}
+		cwd := t.TempDir()
+		abs := filepath.Join(cwd, "readonly.txt")
+		if err := os.WriteFile(abs, []byte("hello\n"), 0o444); err != nil {
+			t.Fatal(err)
+		}
+		res := EditTool{CWD: cwd}.Execute(context.Background(), raw(map[string]any{
+			"path":  "readonly.txt",
+			"edits": []map[string]any{{"oldText": "hello", "newText": "world"}},
+		}), nil)
+		out := toolText(res.Content)
+		if want := "Could not edit file: readonly.txt. Error code: EACCES."; !res.IsError || out != want {
+			t.Fatalf("EACCES mismatch:\n got: %q\nwant: %q", out, want)
+		}
+		// The read-only file must remain unchanged.
+		if data, _ := os.ReadFile(abs); string(data) != "hello\n" {
+			t.Fatalf("read-only file was overwritten: %q", data)
+		}
+	})
+}
+
+// TestAtomicWriteFallsBackInReadOnlyDir verifies the atomicWriteFile fallback:
+// when the parent directory is read-only (CreateTemp cannot make a sibling temp)
+// but the target file is writable, the write still succeeds via an in-place
+// os.WriteFile, matching TS's plain writeFile success path.
+func TestAtomicWriteFallsBackInReadOnlyDir(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows directory ACLs do not model POSIX dir write bits the same way")
+	}
+	if !permissionsEnforced(t) {
+		t.Skip("filesystem does not enforce permission bits (likely running as root)")
+	}
+	dir := t.TempDir()
+	target := filepath.Join(dir, "file.txt")
+	if err := os.WriteFile(target, []byte("old"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Make the directory read-only so CreateTemp(dir) fails, but the file itself
+	// stays writable.
+	if err := os.Chmod(dir, 0o555); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o755) })
+
+	if err := atomicWriteFile(target, []byte("new contents"), 0o644); err != nil {
+		t.Fatalf("atomicWriteFile should fall back to in-place write in a read-only dir: %v", err)
+	}
+	data, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "new contents" {
+		t.Fatalf("fallback write did not persist, got %q", data)
+	}
 }

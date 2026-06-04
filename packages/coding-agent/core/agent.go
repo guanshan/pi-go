@@ -524,6 +524,20 @@ func (a *AgentSession) State() AgentSessionState {
 	}
 }
 
+// syncReadToolModelSupportLocked keeps the read tool's non-vision image note in
+// sync with the live model after a /model switch (read.ts reads ctx.model at
+// execute time; the Go tool is a value baked at build time, so re-stamp it).
+// Caller must hold a.mu.
+func (a *AgentSession) syncReadToolModelSupportLocked(model ai.Model) {
+	if a.Tools == nil {
+		return
+	}
+	if rt, ok := a.Tools["read"].(catools.ReadTool); ok {
+		rt.ModelSupportsImages = ai.SupportsInput(model, "image")
+		a.Tools["read"] = rt
+	}
+}
+
 func (a *AgentSession) SetModel(provider, modelID string) (ai.Model, error) {
 	model, ok := a.Registry.Find(provider, modelID)
 	if !ok {
@@ -535,6 +549,7 @@ func (a *AgentSession) SetModel(provider, modelID string) (ai.Model, error) {
 		return ai.Model{}, errorsString("can't switch model while a response is streaming")
 	}
 	a.Model = model
+	a.syncReadToolModelSupportLocked(model)
 	thinkingLevel := a.ThinkingLevel
 	_ = a.Session.AppendModelChange(provider, modelID)
 	// Persist as the global default so a fresh launch remembers the choice,
@@ -582,6 +597,7 @@ func (a *AgentSession) cycleModelInDirection(step int) (map[string]any, bool) {
 	// Euclidean modulo so a backward step from index 0 wraps to the last model.
 	next := models[((idx+step)%len(models)+len(models))%len(models)]
 	a.Model = next
+	a.syncReadToolModelSupportLocked(next)
 	_ = a.Session.AppendModelChange(next.Provider, next.ID)
 	// Persist the cycled model as the global default, mirroring
 	// agent-session.ts:1485/1513 (_cycleScopedModel/_cycleAvailableModel ->

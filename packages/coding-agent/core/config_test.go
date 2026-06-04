@@ -6,14 +6,17 @@ import (
 	"testing"
 )
 
-func TestAgentDirPrefersPrimaryEnv(t *testing.T) {
-	primary := filepath.Join(t.TempDir(), "primary-agent")
-	legacy := filepath.Join(t.TempDir(), "legacy-agent")
-	t.Setenv(EnvAgentDir, primary)
-	t.Setenv(EnvLegacyAgentDir, legacy)
+func TestAgentDirPrefersCanonicalEnv(t *testing.T) {
+	// TS config.ts recognizes only PI_CODING_AGENT_DIR (EnvLegacyAgentDir); the
+	// short PI_AGENT_DIR (EnvAgentDir) is a Go-only alias. When both are set the
+	// canonical TS name must win, matching TS behavior.
+	canonical := filepath.Join(t.TempDir(), "canonical-agent")
+	alias := filepath.Join(t.TempDir(), "alias-agent")
+	t.Setenv(EnvAgentDir, alias)
+	t.Setenv(EnvLegacyAgentDir, canonical)
 
-	if got := AgentDir(); got != primary {
-		t.Fatalf("agent dir = %q", got)
+	if got := AgentDir(); got != canonical {
+		t.Fatalf("agent dir = %q, want canonical %q", got, canonical)
 	}
 }
 

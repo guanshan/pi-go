@@ -2,6 +2,7 @@ package core
 
 import (
 	"bytes"
+	"os"
 	"strings"
 	"testing"
 )
@@ -47,5 +48,117 @@ func TestWriteJSONLineNoHTMLEscape(t *testing.T) {
 	}
 	if !strings.HasSuffix(got, "\n") {
 		t.Errorf("output not newline-terminated: %q", got)
+	}
+}
+
+func TestCoreSessionEntryWritesTypeScopedDefaultFields(t *testing.T) {
+	parent := "root"
+	tests := []struct {
+		name  string
+		entry SessionEntry
+		want  string
+	}{
+		{
+			name: "compaction zero tokens and fromHook false",
+			entry: SessionEntry{
+				Type:         "compaction",
+				ID:           "c1",
+				ParentID:     &parent,
+				Timestamp:    "2026-06-02T03:52:13.836Z",
+				Summary:      "use <div> & List<String>",
+				FirstKeptID:  "k1",
+				TokensBefore: 0,
+				Details:      map[string]any{"reason": "auto"},
+				FromHook:     false,
+				FromHookSet:  true,
+			},
+			want: `{"type":"compaction","id":"c1","parentId":"root","timestamp":"2026-06-02T03:52:13.836Z","summary":"use <div> & List<String>","firstKeptEntryId":"k1","tokensBefore":0,"details":{"reason":"auto"},"fromHook":false}` + "\n",
+		},
+		{
+			name: "branch summary fromHook false",
+			entry: SessionEntry{
+				Type:        "branch_summary",
+				ID:          "b1",
+				ParentID:    &parent,
+				Timestamp:   "2026-06-02T03:52:13.836Z",
+				FromID:      "old",
+				Summary:     "a & b < c > d",
+				FromHook:    false,
+				FromHookSet: true,
+			},
+			want: `{"type":"branch_summary","id":"b1","parentId":"root","timestamp":"2026-06-02T03:52:13.836Z","fromId":"old","summary":"a & b < c > d","fromHook":false}` + "\n",
+		},
+		{
+			name: "custom message display false",
+			entry: SessionEntry{
+				Type:       "custom_message",
+				ID:         "m1",
+				ParentID:   &parent,
+				Timestamp:  "2026-06-02T03:52:13.836Z",
+				CustomType: "note",
+				Content:    "hidden <b>&</b>",
+				Display:    false,
+				Details:    map[string]any{"k": "v"},
+			},
+			want: `{"type":"custom_message","id":"m1","parentId":"root","timestamp":"2026-06-02T03:52:13.836Z","customType":"note","content":"hidden <b>&</b>","display":false,"details":{"k":"v"}}` + "\n",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			if err := writeJSONLine(&buf, tc.entry); err != nil {
+				t.Fatal(err)
+			}
+			if got := buf.String(); got != tc.want {
+				t.Fatalf("jsonl mismatch:\n got: %q\nwant: %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestCoreSessionRewritePreservesDefaultFields(t *testing.T) {
+	session := InMemorySession("/tmp/rewrite")
+	parent := "root"
+	session.InMemory = false
+	session.Path = t.TempDir() + "/session.jsonl"
+	session.CurrentID = &parent
+	session.Entries = []SessionEntry{
+		{Type: "compaction", ID: "c1", ParentID: &parent, Timestamp: "2026-06-02T03:52:13.836Z", Summary: "s", FirstKeptID: "root", TokensBefore: 0, FromHook: false, FromHookSet: true},
+		{Type: "custom_message", ID: "m1", ParentID: &parent, Timestamp: "2026-06-02T03:52:14.836Z", CustomType: "note", Content: "hi", Display: false},
+	}
+	if _, err := session.rewrite(); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(session.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(raw)
+	for _, want := range []string{`"tokensBefore":0`, `"fromHook":false`, `"display":false`} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("rewritten session missing %s:\n%s", want, text)
+		}
+	}
+}
+
+func TestCoreSessionRewritePreservesMissingFromHook(t *testing.T) {
+	session := InMemorySession("/tmp/rewrite")
+	parent := "root"
+	session.InMemory = false
+	session.Path = t.TempDir() + "/session.jsonl"
+	session.CurrentID = &parent
+	session.Entries = []SessionEntry{
+		{Type: "compaction", ID: "c1", ParentID: &parent, Timestamp: "2026-06-02T03:52:13.836Z", Summary: "s", FirstKeptID: "root", TokensBefore: 10},
+		{Type: "branch_summary", ID: "b1", ParentID: &parent, Timestamp: "2026-06-02T03:52:14.836Z", FromID: "old", Summary: "branch"},
+	}
+	if _, err := session.rewrite(); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(session.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), `"fromHook"`) {
+		t.Fatalf("rewrite should preserve legacy missing fromHook fields:\n%s", raw)
 	}
 }

@@ -194,12 +194,14 @@ func TestRunRPCForwardsExtensionUIRequest(t *testing.T) {
 	}()
 
 	uiID := waitForRPCUIRequest(t, out, "select")
-	raw, err := json.Marshal(map[string]any{"type": "ui_response", "uiId": uiID, "data": "b"})
+	// Respond with the TS host-facing shape: {type:"extension_ui_response", id,
+	// value} (rpc-types.ts RpcExtensionUIResponse).
+	raw, err := json.Marshal(map[string]any{"type": "extension_ui_response", "id": uiID, "value": "b"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if _, err := pw.Write(append(raw, '\n')); err != nil {
-		t.Fatalf("write ui_response: %v", err)
+		t.Fatalf("write extension_ui_response: %v", err)
 	}
 
 	select {
@@ -213,6 +215,102 @@ func TestRunRPCForwardsExtensionUIRequest(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("RPC UI handler did not receive response")
 	}
+	_ = pw.Close()
+	select {
+	case err := <-rpcDone:
+		if err != nil {
+			t.Fatalf("RunRPC returned error: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("RunRPC did not return")
+	}
+
+	// The emitted request must carry the TS-flattened select shape:
+	// {type:"extension_ui_request", id, method:"select", title, options}.
+	line := findRPCUIRequestLine(t, out, "select")
+	var req struct {
+		Type    string   `json:"type"`
+		ID      string   `json:"id"`
+		Method  string   `json:"method"`
+		Title   string   `json:"title"`
+		Options []string `json:"options"`
+	}
+	if err := json.Unmarshal([]byte(line), &req); err != nil {
+		t.Fatalf("unmarshal request line: %v (%s)", err, line)
+	}
+	if req.Type != "extension_ui_request" || req.Method != "select" {
+		t.Fatalf("unexpected request envelope: %s", line)
+	}
+	if req.Title != "Pick" || len(req.Options) != 2 || req.Options[0] != "a" || req.Options[1] != "b" {
+		t.Fatalf("select request not flattened to TS shape: %s", line)
+	}
+}
+
+// TestRunRPCExtensionUIResponseConfirmRoundTrip verifies the confirm method
+// round-trips: the host replies with {type:"extension_ui_response", id,
+// confirmed:true} and the extension handler resolves to the boolean true,
+// matching the TS createDialogPromise confirm parseResponse.
+func TestRunRPCExtensionUIResponseConfirmRoundTrip(t *testing.T) {
+	runtime := testInteractiveRuntime(t)
+	api := coreext.NewAPI()
+	runtime.Session().extensionRuntime = coreext.NewRunnerWithAPI(api)
+
+	pr, pw := io.Pipe()
+	out := &syncBuffer{}
+	rpcDone := make(chan error, 1)
+	go func() {
+		rpcDone <- RunRPC(context.Background(), runtime, pr, out)
+	}()
+	t.Cleanup(func() {
+		_ = pw.Close()
+		_ = pr.Close()
+	})
+
+	handler := waitForExtensionUIHandler(t, api)
+	type uiResponse struct {
+		result json.RawMessage
+		err    error
+	}
+	uiDone := make(chan uiResponse, 1)
+	go func() {
+		result, err := handler(context.Background(), "confirm", json.RawMessage(`{"message":"Proceed?","detail":"do it"}`))
+		uiDone <- uiResponse{result: result, err: err}
+	}()
+
+	uiID := waitForRPCUIRequest(t, out, "confirm")
+	raw, err := json.Marshal(map[string]any{"type": "extension_ui_response", "id": uiID, "confirmed": true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pw.Write(append(raw, '\n')); err != nil {
+		t.Fatalf("write extension_ui_response: %v", err)
+	}
+
+	select {
+	case got := <-uiDone:
+		if got.err != nil {
+			t.Fatalf("confirm handler error: %v", got.err)
+		}
+		if string(got.result) != "true" {
+			t.Fatalf("confirm result=%s want true", got.result)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("confirm handler did not receive response")
+	}
+
+	// The confirm request flattens detail -> message and message -> title.
+	line := findRPCUIRequestLine(t, out, "confirm")
+	var req struct {
+		Title   string `json:"title"`
+		Message string `json:"message"`
+	}
+	if err := json.Unmarshal([]byte(line), &req); err != nil {
+		t.Fatalf("unmarshal confirm request: %v", err)
+	}
+	if req.Title != "Proceed?" || req.Message != "do it" {
+		t.Fatalf("confirm request not flattened to TS shape: %s", line)
+	}
+
 	_ = pw.Close()
 	select {
 	case err := <-rpcDone:
@@ -276,6 +374,26 @@ func waitForExtensionUIHandler(t *testing.T, api *coreext.API) coreext.UIRequest
 	}
 }
 
+// findRPCUIRequestLine returns the full JSON line for the first emitted
+// extension_ui_request with the given method, for asserting flattened fields.
+func findRPCUIRequestLine(t *testing.T, out *syncBuffer, method string) string {
+	t.Helper()
+	for _, line := range strings.Split(strings.TrimSpace(out.String()), "\n") {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		var record struct {
+			Type   string `json:"type"`
+			Method string `json:"method"`
+		}
+		if json.Unmarshal([]byte(line), &record) == nil && record.Type == "extension_ui_request" && record.Method == method {
+			return line
+		}
+	}
+	t.Fatalf("no extension_ui_request with method %q in output: %s", method, out.String())
+	return ""
+}
+
 func waitForRPCUIRequest(t *testing.T, out *syncBuffer, method string) string {
 	t.Helper()
 	deadline := time.After(time.Second)
@@ -286,19 +404,19 @@ func waitForRPCUIRequest(t *testing.T, out *syncBuffer, method string) string {
 			}
 			var record struct {
 				Type   string `json:"type"`
-				UIID   string `json:"uiId"`
+				ID     string `json:"id"`
 				Method string `json:"method"`
 			}
-			if json.Unmarshal([]byte(line), &record) == nil && record.Type == "ui_request" && record.Method == method {
-				if record.UIID == "" {
-					t.Fatalf("ui_request missing uiId: %s", line)
+			if json.Unmarshal([]byte(line), &record) == nil && record.Type == "extension_ui_request" && record.Method == method {
+				if record.ID == "" {
+					t.Fatalf("extension_ui_request missing id: %s", line)
 				}
-				return record.UIID
+				return record.ID
 			}
 		}
 		select {
 		case <-deadline:
-			t.Fatalf("timed out waiting for %s ui_request; output=%s", method, out.String())
+			t.Fatalf("timed out waiting for %s extension_ui_request; output=%s", method, out.String())
 		default:
 			time.Sleep(10 * time.Millisecond)
 		}

@@ -488,6 +488,16 @@ func applyOpenAIChatThinking(body map[string]any, options OpenAIChatRequestOptio
 		} else if _, exists := options.ThinkingLevelMap["off"]; !exists {
 			body["reasoning"] = map[string]any{"effort": "none"}
 		}
+	case "ant-ling":
+		// ant-ling only emits reasoning when an effort was requested AND the
+		// model's thinkingLevelMap maps it to a string. Mirrors
+		// openai-completions.ts: reasoning = { effort } only when typeof
+		// model.thinkingLevelMap?.[reasoningEffort] === "string".
+		if effort != "" {
+			if mapped, ok := openAIChatThinkingMapValue(options, options.ThinkingLevel); ok {
+				body["reasoning"] = map[string]any{"effort": mapped}
+			}
+		}
 	case "together":
 		body["reasoning"] = map[string]any{"enabled": effort != ""}
 		if effort != "" && options.SupportsReasoningEffort {

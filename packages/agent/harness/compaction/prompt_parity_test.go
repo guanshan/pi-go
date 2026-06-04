@@ -252,6 +252,81 @@ func TestGenerateSummaryAppendsCustomInstructions(t *testing.T) {
 	}
 }
 
+// TestGenerateSummaryPreservesCustomInstructionsWhitespace verifies parity with
+// TS `if (customInstructions) basePrompt += ... ${customInstructions}`: the raw
+// (untrimmed) value is appended byte-for-byte (leading/trailing whitespace kept),
+// not the TrimSpace'd value.
+func TestGenerateSummaryPreservesCustomInstructionsWhitespace(t *testing.T) {
+	provider, model, registry := registerCapture(t)
+	_, err := GenerateSummary(context.Background(), []agent.AgentMessage{ai.NewUserMessage("work", nil)}, model, 16384, "key", nil, "  focus on X  ", "", registry, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	reqs := provider.snapshot()
+	if !strings.Contains(reqs[0].userText, "Additional focus:   focus on X  ") {
+		t.Fatalf("raw whitespace not preserved in custom instructions: %q", reqs[0].userText)
+	}
+}
+
+// TestGenerateSummaryAppendsWhitespaceOnlyCustomInstructions verifies that a
+// whitespace-only custom instruction is still appended (JS truthiness), unlike a
+// TrimSpace gate which would skip it.
+func TestGenerateSummaryAppendsWhitespaceOnlyCustomInstructions(t *testing.T) {
+	provider, model, registry := registerCapture(t)
+	_, err := GenerateSummary(context.Background(), []agent.AgentMessage{ai.NewUserMessage("work", nil)}, model, 16384, "key", nil, "   ", "", registry, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	reqs := provider.snapshot()
+	if !strings.Contains(reqs[0].userText, "Additional focus:    ") {
+		t.Fatalf("whitespace-only custom instructions should still be appended: %q", reqs[0].userText)
+	}
+}
+
+// TestBranchSummaryCustomInstructionsRawAndWhitespace verifies the branch
+// summary path mirrors TS truthiness/raw-value handling
+// (branch-summarization.ts:217-220): whitespace-only instructions still apply and
+// the raw (untrimmed) value is used for both the Additional-focus and the
+// ReplaceInstructions branches.
+func TestBranchSummaryCustomInstructionsRawAndWhitespace(t *testing.T) {
+	entries := []session.Entry{session.MessageEntry{Message: ai.NewUserMessage("branch work", nil)}}
+
+	// Additional-focus branch: raw whitespace preserved.
+	provider, model, registry := registerCapture(t)
+	if _, err := GenerateBranchSummary(context.Background(), entries, BranchSummaryOptions{
+		Model: model, Registry: registry, CustomInstructions: "  keep tests  ",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	reqs := provider.snapshot()
+	if len(reqs) != 1 || !strings.Contains(reqs[0].userText, "Additional focus:   keep tests  ") {
+		t.Fatalf("additional-focus raw whitespace not preserved: %#v", reqs)
+	}
+	if !strings.Contains(reqs[0].userText, branchSummaryPrompt) {
+		t.Fatalf("additional-focus branch must keep the base prompt: %q", reqs[0].userText)
+	}
+
+	// ReplaceInstructions branch: raw value replaces the base prompt verbatim,
+	// and a whitespace-only value still triggers the replacement (truthiness).
+	provider2, model2, registry2 := registerCapture(t)
+	if _, err := GenerateBranchSummary(context.Background(), entries, BranchSummaryOptions{
+		Model: model2, Registry: registry2, CustomInstructions: "   ", ReplaceInstructions: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	reqs2 := provider2.snapshot()
+	if len(reqs2) != 1 {
+		t.Fatalf("expected one request, got %d", len(reqs2))
+	}
+	if strings.Contains(reqs2[0].userText, branchSummaryPrompt) {
+		t.Fatalf("replace branch should not keep the base prompt: %q", reqs2[0].userText)
+	}
+	// The serialized conversation is followed by the raw instructions ("   ").
+	if !strings.HasSuffix(reqs2[0].userText, "</conversation>\n\n   ") {
+		t.Fatalf("replace branch must use the raw whitespace-only instructions: %q", reqs2[0].userText)
+	}
+}
+
 // --- split-turn double request flow (compaction.ts:653-695) ---
 
 func TestCompactSplitTurnIssuesTwoRequestsAndJoins(t *testing.T) {

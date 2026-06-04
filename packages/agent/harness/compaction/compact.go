@@ -247,8 +247,12 @@ func GenerateSummary(ctx context.Context, messages []agent.AgentMessage, model a
 	if previousSummary != "" {
 		basePrompt = updateSummarizationPrompt
 	}
-	if custom := strings.TrimSpace(customInstructions); custom != "" {
-		basePrompt = basePrompt + "\n\nAdditional focus: " + custom
+	// TS: if (customInstructions) basePrompt += `\n\nAdditional focus: ${customInstructions}`
+	// (compaction.ts:472-473). JS truthiness includes whitespace-only strings, and
+	// the raw (untrimmed) value is appended, so gate on != "" and append as-is to
+	// preserve byte-for-byte prompt parity.
+	if customInstructions != "" {
+		basePrompt = basePrompt + "\n\nAdditional focus: " + customInstructions
 	}
 
 	llmMessages, err := messagesToLLM(messages)

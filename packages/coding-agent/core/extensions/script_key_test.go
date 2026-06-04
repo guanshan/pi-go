@@ -116,3 +116,70 @@ export default function (pi) {
 		t.Fatalf("tool registered after unsupported register* calls was lost; tools=%v", runtime.API.SnapshotTools())
 	}
 }
+
+func TestScriptExtensionContextCompatFields(t *testing.T) {
+	if _, err := exec.LookPath("node"); err != nil {
+		t.Skip("node not available")
+	}
+	dir := t.TempDir()
+	ext := filepath.Join(dir, "ctx-ext.mjs")
+	source := `
+export default function (pi) {
+	pi.registerTool({
+		name: "ctxprobe",
+		description: "report context compatibility fields",
+		parameters: { type: "object", properties: {} },
+		execute(_id, _params, _a, _b, ctx) {
+			return { content: [{ type: "text", text: JSON.stringify({
+				cwd: ctx.cwd,
+				hasUI: ctx.hasUI,
+				hasModelRegistry: !!ctx.modelRegistry,
+				isIdle: ctx.isIdle(),
+				abort: ctx.abort(),
+				systemPrompt: ctx.getSystemPrompt(),
+				branch: ctx.sessionManager.getBranch().length,
+			}) }] };
+		},
+	});
+	pi.on("session_before_compact", (payload, ctx) => {
+		payload.branchCount = ctx.sessionManager.getBranch().length;
+		return payload;
+	});
+}
+`
+	if err := os.WriteFile(ext, []byte(source), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runtime := NewRunnerWithAPI(NewAPI())
+	t.Cleanup(func() { _ = runtime.Shutdown(context.Background()) })
+	if errs := LoadScriptExtensions(context.Background(), runtime.API, []string{ext}, nil); len(errs) > 0 {
+		t.Fatalf("load errors: %v", errs)
+	}
+	tool, ok := runtime.ToolDefinition("ctxprobe")
+	if !ok {
+		t.Fatalf("ctxprobe not registered; tools=%v", runtime.RegisteredTools())
+	}
+	result, err := tool.Execute(context.Background(), []byte("{}"))
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	got := ai.MessageText(ai.ToolResultMessage{Content: result.Content})
+	for _, want := range []string{`"cwd":"`, `"hasUI":false`, `"hasModelRegistry":true`, `"isIdle":true`, `"abort":false`, `"systemPrompt":""`, `"branch":0`} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("context probe missing %s in %s", want, got)
+		}
+	}
+
+	payload := &struct {
+		Type          string           `json:"type"`
+		BranchEntries []map[string]any `json:"BranchEntries"`
+		BranchCount   int              `json:"branchCount"`
+	}{
+		Type:          "session_before_compact",
+		BranchEntries: []map[string]any{{"id": "1"}, {"id": "2"}},
+	}
+	runtime.API.Emit("session_before_compact", payload)
+	if payload.BranchCount != 2 {
+		t.Fatalf("branchCount=%d want 2", payload.BranchCount)
+	}
+}

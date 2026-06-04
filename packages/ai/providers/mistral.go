@@ -61,6 +61,7 @@ type MistralRequestOptions struct {
 	MaxOutput        int
 	Temperature      *float64
 	ToolChoice       any
+	Reasoning        bool
 	ThinkingLevel    string
 	ThinkingLevelMap map[string]*string
 	SupportsImages   bool
@@ -97,7 +98,9 @@ func BuildMistralBody(options MistralRequestOptions) map[string]any {
 	if options.Temperature != nil {
 		body["temperature"] = *options.Temperature
 	}
-	if options.ThinkingLevel != "" && options.ThinkingLevel != "off" {
+	// Mirror mistral.ts shouldUseReasoning = model.reasoning && reasoning !== "off":
+	// neither reasoning_effort nor prompt_mode is emitted for non-reasoning models.
+	if options.Reasoning && options.ThinkingLevel != "" && options.ThinkingLevel != "off" {
 		if MistralUsesReasoningEffort(options.ModelID) {
 			body["reasoning_effort"] = MistralReasoningEffort(options.ThinkingLevel, options.ThinkingLevelMap)
 		} else {

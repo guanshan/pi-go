@@ -3,10 +3,12 @@ package ai
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 // fauxAPIProvider is a deterministic test provider. Each instance carries its
@@ -20,6 +22,7 @@ type fauxAPIProvider struct {
 	mu        sync.Mutex
 	responses []FauxResponse
 	callCount int
+	cache     map[string]map[string]bool
 }
 
 // NewFauxProvider returns a fresh faux provider instance with its own scripted
@@ -50,9 +53,30 @@ func (p *fauxAPIProvider) Complete(ctx context.Context, r *ModelRegistry, req Ch
 }
 
 func (p *fauxAPIProvider) Stream(ctx context.Context, _ *ModelRegistry, req ChatRequest) *AssistantMessageEventStream {
-	return streamChatResponse(ctx, func(context.Context) (ChatResponse, error) {
-		return p.complete(ctx, nil, req)
-	})
+	stream := NewAssistantMessageEventStreamWithContext(ctx, 8)
+	go func() {
+		message := NewAssistantMessageForModel(req.Model, nil, Usage{}, "error")
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				message.StopReason = "error"
+				message.ErrorMessage = fmt.Sprint(recovered)
+				pushAssistantError(stream, message)
+			}
+			stream.End(message)
+		}()
+		response, scripted, ok := p.fauxChatWithScript(req)
+		message = response.Message
+		if message.StopReason == "error" || message.StopReason == "aborted" {
+			pushAssistantError(stream, message)
+			return
+		}
+		if ok && scripted.pacingEnabled() {
+			message = pushFauxPacedMessage(ctx, stream, message, scripted)
+			return
+		}
+		pushAssistantMessage(stream, message)
+	}()
+	return stream
 }
 
 func (p *fauxAPIProvider) StreamSimple(ctx context.Context, r *ModelRegistry, req ChatRequest) *AssistantMessageEventStream {
@@ -81,6 +105,7 @@ func (p *fauxAPIProvider) ResetResponses() {
 	defer p.mu.Unlock()
 	p.responses = nil
 	p.callCount = 0
+	p.cache = nil
 }
 
 // PendingResponseCount reports how many scripted responses remain queued on this
@@ -114,11 +139,20 @@ func (p *fauxAPIProvider) next() (FauxResponse, bool) {
 }
 
 func (p *fauxAPIProvider) fauxChat(req ChatRequest) ChatResponse {
+	response, _, _ := p.fauxChatWithScript(req)
+	return response
+}
+
+func (p *fauxAPIProvider) fauxChatWithScript(req ChatRequest) (ChatResponse, FauxResponse, bool) {
 	scripted, ok := p.next()
 	if ok {
-		return fauxScriptedResponse(req, scripted)
+		response := fauxScriptedResponse(req, scripted)
+		p.applySessionCache(req, &response.Message)
+		return response, scripted, true
 	}
-	return fauxEchoResponse(req)
+	response := fauxEchoResponse(req)
+	p.applySessionCache(req, &response.Message)
+	return response, FauxResponse{}, false
 }
 
 // FauxResponse scripts a single faux-provider turn. It can express assistant
@@ -135,6 +169,17 @@ type FauxResponse struct {
 	// ErrorMessage, when set (or when StopReason is "error"/"aborted"), surfaces
 	// as a provider error / terminal error event.
 	ErrorMessage string
+	// TokensPerSecond enables deterministic streaming pacing for this scripted
+	// response. When set, Stream emits text/thinking/tool-call deltas in chunks
+	// and aborts promptly if the stream context is cancelled mid-message.
+	TokensPerSecond float64
+	// TokenSize controls the number of runes emitted per paced delta. It defaults
+	// to 4, matching the faux token estimate.
+	TokenSize int
+}
+
+func (r FauxResponse) pacingEnabled() bool {
+	return r.TokensPerSecond > 0
 }
 
 // FauxText builds a text content block for a FauxResponse.
@@ -301,6 +346,136 @@ func fauxEchoResponse(req ChatRequest) ChatResponse {
 	}
 	msg := NewAssistantMessageForModel(req.Model, TextBlocks(text), Usage{Input: len(req.Messages), Output: len(strings.Fields(text)), TotalTokens: len(req.Messages) + len(strings.Fields(text))}, "stop")
 	return ChatResponse{Message: msg}
+}
+
+func (p *fauxAPIProvider) applySessionCache(req ChatRequest, msg *AssistantMessage) {
+	if msg == nil || req.SessionID == "" || req.CacheRetention == "none" || msg.StopReason == "error" || msg.StopReason == "aborted" {
+		return
+	}
+	prompt := fauxSerializePrompt(req)
+	if strings.TrimSpace(prompt) == "" {
+		return
+	}
+	p.mu.Lock()
+	if p.cache == nil {
+		p.cache = map[string]map[string]bool{}
+	}
+	sessionCache := p.cache[req.SessionID]
+	if sessionCache == nil {
+		sessionCache = map[string]bool{}
+		p.cache[req.SessionID] = sessionCache
+	}
+	hit := sessionCache[prompt]
+	sessionCache[prompt] = true
+	p.mu.Unlock()
+	if !hit {
+		return
+	}
+	cached := msg.Usage.Input
+	if cached <= 0 {
+		cached = estimateFauxTokens(prompt)
+	}
+	msg.Usage.Input = max(0, msg.Usage.Input-cached)
+	msg.Usage.CacheRead += cached
+	msg.Usage.TotalTokens = msg.Usage.Input + msg.Usage.Output + msg.Usage.CacheRead + msg.Usage.CacheWrite
+}
+
+func pushFauxPacedMessage(ctx context.Context, stream *AssistantMessageEventStream, message AssistantMessage, scripted FauxResponse) AssistantMessage {
+	if err := ctx.Err(); err != nil {
+		return pushFauxAbort(stream, message, err)
+	}
+	partial := messageWithBlocks(message, nil)
+	stream.Push(AssistantMessageEvent{Type: "start", Partial: partial})
+	blocks := MessageBlocks(message)
+	running := make([]ContentBlock, 0, len(blocks))
+	for index, block := range blocks {
+		running = append(running, emptyContentBlock(block))
+		if block.Type == "toolCall" {
+			running[index].Arguments = nil
+		}
+		partial = messageWithBlocks(message, running)
+		stream.Push(contentStartEvent(block.Type, index, partial))
+		delta := contentBlockDelta(block)
+		for _, chunk := range fauxChunks(delta, scripted.tokenSize()) {
+			if err := waitFauxPace(ctx, scripted); err != nil {
+				return pushFauxAbort(stream, partial, err)
+			}
+			appendFauxChunk(&running[index], block.Type, chunk)
+			partial = messageWithBlocks(message, running)
+			stream.Push(contentDeltaEvent(block.Type, index, chunk, partial))
+		}
+		running[index] = block
+		partial = messageWithBlocks(message, running)
+		stream.Push(contentEndEvent(block, index, partial))
+	}
+	stream.Push(AssistantMessageEvent{Type: "done", Reason: doneReason(message.StopReason), Partial: message, Message: message})
+	return message
+}
+
+func pushFauxAbort(stream *AssistantMessageEventStream, partial AssistantMessage, err error) AssistantMessage {
+	if err == nil {
+		err = context.Canceled
+	}
+	partial.StopReason = "aborted"
+	partial.ErrorMessage = err.Error()
+	pushAssistantError(stream, partial)
+	return partial
+}
+
+func waitFauxPace(ctx context.Context, scripted FauxResponse) error {
+	if scripted.TokensPerSecond <= 0 {
+		return ctx.Err()
+	}
+	delay := time.Duration(float64(time.Second) / scripted.TokensPerSecond)
+	if delay <= 0 {
+		return ctx.Err()
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return ctx.Err()
+	}
+}
+
+func fauxChunks(text string, size int) []string {
+	if text == "" {
+		return nil
+	}
+	if size <= 0 {
+		size = 4
+	}
+	runes := []rune(text)
+	var chunks []string
+	for len(runes) > 0 {
+		if len(runes) <= size {
+			chunks = append(chunks, string(runes))
+			break
+		}
+		chunks = append(chunks, string(runes[:size]))
+		runes = runes[size:]
+	}
+	return chunks
+}
+
+func (r FauxResponse) tokenSize() int {
+	if r.TokenSize > 0 {
+		return r.TokenSize
+	}
+	return 4
+}
+
+func appendFauxChunk(block *ContentBlock, blockType, chunk string) {
+	switch blockType {
+	case "thinking":
+		block.Thinking += chunk
+	case "toolCall":
+		block.Arguments = append(json.RawMessage(block.Arguments), []byte(chunk)...)
+	default:
+		block.Text += chunk
+	}
 }
 
 // fauxEstimateUsage produces a deterministic, non-zero usage estimate so

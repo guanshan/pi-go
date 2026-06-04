@@ -126,14 +126,14 @@ func wantsVersion(argv []string) bool {
 }
 
 // skipsMigrations reports whether startup migrations should be skipped for the
-// given argv. Only paths that never build the agent runtime skip migrations:
-// --help / --version, session export, and pure package-management/config
-// commands. The default interactive run (no args) MUST run migrations, matching
-// src/main.ts where runMigrations executes before the interactive path and only
-// the early process.exit branches (version/export) and package/config command
-// handlers bypass it.
+// given argv. Only paths that exit before runMigrations in src/main.ts skip it:
+// --version (handled separately at MainWithOptions), session export, and pure
+// package-management/config commands. --help does NOT skip migrations — TS runs
+// runMigrations (main.ts:542) before printHelp (main.ts:690), so deprecation
+// migrations apply even when only printing help. The default interactive run
+// (no args) also runs migrations.
 func skipsMigrations(argv []string) bool {
-	if wantsHelp(argv) || wantsExport(argv) {
+	if wantsExport(argv) {
 		return true
 	}
 	if len(argv) == 0 {
@@ -153,15 +153,6 @@ func skipsMigrations(argv []string) bool {
 func wantsExport(argv []string) bool {
 	for i, arg := range argv {
 		if arg == "--export" && i+1 < len(argv) {
-			return true
-		}
-	}
-	return false
-}
-
-func wantsHelp(argv []string) bool {
-	for _, arg := range argv {
-		if arg == "--help" || arg == "-h" {
 			return true
 		}
 	}

@@ -9,10 +9,13 @@ import (
 )
 
 func TestModelCatalogIncludesGeneratedModels(t *testing.T) {
-	if len(GeneratedModels()) != 923 {
-		t.Fatalf("generated model count=%d", len(GeneratedModels()))
-	}
+	// No magic count: AllKnownModels must be a superset of the generated catalog
+	// and contain every generated (provider, id). Drift in the generated count is
+	// caught by TestGeneratedTextModelCatalogMatchesTS.
 	models := AllKnownModels()
+	if len(models) < len(GeneratedModels()) {
+		t.Fatalf("AllKnownModels=%d < GeneratedModels=%d", len(models), len(GeneratedModels()))
+	}
 	seen := map[string]bool{}
 	for _, model := range models {
 		key := model.Provider + "\x00" + model.ID
@@ -20,6 +23,11 @@ func TestModelCatalogIncludesGeneratedModels(t *testing.T) {
 			t.Fatalf("duplicate model in catalog: %s/%s", model.Provider, model.ID)
 		}
 		seen[key] = true
+	}
+	for _, gm := range GeneratedModels() {
+		if !seen[gm.Provider+"\x00"+gm.ID] {
+			t.Fatalf("AllKnownModels missing generated model %s/%s", gm.Provider, gm.ID)
+		}
 	}
 	bedrock, ok := Find(models, "amazon-bedrock", "amazon.nova-2-lite-v1:0")
 	if !ok {

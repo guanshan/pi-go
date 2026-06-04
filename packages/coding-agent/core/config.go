@@ -407,13 +407,22 @@ func normalizePathInput(path string, stripAtPrefix bool) string {
 }
 
 func AgentDir() string {
-	if v := os.Getenv(EnvAgentDir); v != "" {
-		return filepath.Clean(ExpandTilde(v))
-	}
+	// TS only recognizes PI_CODING_AGENT_DIR (config.ts ENV_AGENT_DIR). PI_AGENT_DIR
+	// is a Go-only short alias, so the canonical name must win when both are set to
+	// match TS behavior.
 	if v := os.Getenv(EnvLegacyAgentDir); v != "" {
 		return filepath.Clean(ExpandTilde(v))
 	}
+	if v := os.Getenv(EnvAgentDir); v != "" {
+		return filepath.Clean(ExpandTilde(v))
+	}
 	return filepath.Join(HomeDir(), ConfigDirName, DefaultAgentSubDir)
+}
+
+// DebugLogPath returns the path the /debug command writes diagnostics to,
+// mirroring TS config.ts getDebugLogPath (`<agentDir>/<app>-debug.log`).
+func DebugLogPath() string {
+	return filepath.Join(AgentDir(), AppName+"-debug.log")
 }
 
 // BinDir returns the agent bin directory (<agentDir>/bin), where migrated and
@@ -554,10 +563,12 @@ func (s *SettingsManager) SessionDir() string {
 	if s.Global.SessionDir != "" {
 		return ExpandTilde(s.Global.SessionDir)
 	}
-	if v := os.Getenv(EnvSessionDir); v != "" {
+	// Canonical PI_CODING_AGENT_SESSION_DIR (TS ENV_SESSION_DIR) takes precedence
+	// over the Go-only PI_SESSION_DIR short alias.
+	if v := os.Getenv(EnvLegacySessionDir); v != "" {
 		return ExpandTilde(v)
 	}
-	if v := os.Getenv(EnvLegacySessionDir); v != "" {
+	if v := os.Getenv(EnvSessionDir); v != "" {
 		return ExpandTilde(v)
 	}
 	return filepath.Join(s.AgentDir, "sessions")

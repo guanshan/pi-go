@@ -36,6 +36,31 @@ func TestPiBinaryProcessSnapshots(t *testing.T) {
 		t.Fatalf("help created %d session files under %s", got, agentDir)
 	}
 
+	// --help combined with non-interactive selectors (-p, --mode json) must still
+	// print help and nothing else: help short-circuits before mode handling, so no
+	// startup chatter or JSON protocol lines leak. NOTE: Go writes --help to stdout
+	// (verified against the built binary), unlike TS which routes it to stderr —
+	// the assertion follows Go's real stream split, not TS's.
+	for _, helpArgs := range [][]string{
+		{"-p", "--help"},
+		{"--mode", "json", "--help"},
+	} {
+		result = runPiProcess(t, binary, cwd, agentDir, home, helpArgs...)
+		if result.exitCode != 0 {
+			t.Fatalf("%v exitCode=%d, want 0 (result=%#v)", helpArgs, result.exitCode, result)
+		}
+		if !strings.Contains(result.stdout, "pi - AI coding assistant") {
+			t.Fatalf("%v stdout missing help banner: %q", helpArgs, result.stdout)
+		}
+		if result.stderr != "" {
+			t.Fatalf("%v leaked to stderr: %q", helpArgs, result.stderr)
+		}
+		// stdout must be the plain help text, never JSON protocol lines.
+		if strings.HasPrefix(strings.TrimSpace(result.stdout), "{") {
+			t.Fatalf("%v stdout looks like JSON, not help: %q", helpArgs, result.stdout)
+		}
+	}
+
 	common := []string{
 		"--model", "faux/faux",
 		"--no-session",
@@ -81,6 +106,13 @@ func TestPiBinaryProcessSnapshots(t *testing.T) {
 	}
 	if !sawMessageEnd {
 		t.Fatalf("json events missing message_end: %s", result.stdout)
+	}
+	// stdout cleanliness: in JSON mode every non-empty stdout line must be a JSON
+	// object (begin with '{'), with no startup chatter / non-protocol prefix lines.
+	for _, line := range lines {
+		if !strings.HasPrefix(strings.TrimSpace(line), "{") {
+			t.Fatalf("json mode emitted a non-protocol stdout line: %q", line)
+		}
 	}
 }
 

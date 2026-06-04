@@ -59,7 +59,7 @@ func TestSessionJSONLWriteGoldenNoHTMLEscape(t *testing.T) {
 				FirstKeptEntryID: "k1",
 				TokensBefore:     42,
 			},
-			want: `{"type":"compaction","id":"c1","parentId":null,"timestamp":"2026-06-02T03:52:13.836Z","summary":"use <div> & List<String>","firstKeptEntryId":"k1","tokensBefore":42}`,
+			want: `{"type":"compaction","id":"c1","parentId":null,"timestamp":"2026-06-02T03:52:13.836Z","summary":"use <div> & List<String>","firstKeptEntryId":"k1","tokensBefore":42,"fromHook":false}`,
 		},
 		{
 			name: "branch summary with html",
@@ -68,7 +68,7 @@ func TestSessionJSONLWriteGoldenNoHTMLEscape(t *testing.T) {
 				FromID:    "root",
 				Summary:   "a & b < c > d",
 			},
-			want: `{"type":"branch_summary","id":"b1","parentId":null,"timestamp":"2026-06-02T03:52:13.836Z","fromId":"root","summary":"a & b < c > d"}`,
+			want: `{"type":"branch_summary","id":"b1","parentId":null,"timestamp":"2026-06-02T03:52:13.836Z","fromId":"root","summary":"a & b < c > d","fromHook":false}`,
 		},
 		{
 			name: "custom_message with string content containing html",
@@ -79,6 +79,61 @@ func TestSessionJSONLWriteGoldenNoHTMLEscape(t *testing.T) {
 				Display:    true,
 			},
 			want: `{"type":"custom_message","id":"cm1","parentId":null,"timestamp":"2026-06-02T03:52:13.836Z","customType":"note","content":"<b>bold</b> & co","display":true}`,
+		},
+		{
+			// TS appendCompaction always writes tokensBefore and fromHook, even at
+			// zero/false (session.ts:173-191). Go's omitempty would drop both; the
+			// MarshalJSON re-adds them at the TS positions {…,tokensBefore,fromHook}.
+			name: "compaction zero tokensBefore and fromHook",
+			entry: CompactionEntry{
+				BaseEntry:        BaseEntry{ID: "c2", Timestamp: "2026-06-02T03:52:13.836Z"},
+				Summary:          "s",
+				FirstKeptEntryID: "k2",
+				TokensBefore:     0,
+				FromHook:         false,
+			},
+			want: `{"type":"compaction","id":"c2","parentId":null,"timestamp":"2026-06-02T03:52:13.836Z","summary":"s","firstKeptEntryId":"k2","tokensBefore":0,"fromHook":false}`,
+		},
+		{
+			// details (when present) must sit between tokensBefore and fromHook,
+			// matching the TS object-literal order {summary, firstKeptEntryId,
+			// tokensBefore, details, fromHook}. Verifies tokensBefore is inserted
+			// before details (not appended at the end) when tokensBefore is zero.
+			name: "compaction zero tokensBefore with details preserves order",
+			entry: CompactionEntry{
+				BaseEntry:        BaseEntry{ID: "c3", Timestamp: "2026-06-02T03:52:13.836Z"},
+				Summary:          "s",
+				FirstKeptEntryID: "k3",
+				TokensBefore:     0,
+				Details:          map[string]any{"reason": "auto"},
+				FromHook:         true,
+			},
+			want: `{"type":"compaction","id":"c3","parentId":null,"timestamp":"2026-06-02T03:52:13.836Z","summary":"s","firstKeptEntryId":"k3","tokensBefore":0,"details":{"reason":"auto"},"fromHook":true}`,
+		},
+		{
+			// TS moveTo always writes fromHook on branch_summary (session.ts:255-264).
+			name: "branch_summary fromHook false",
+			entry: BranchSummaryEntry{
+				BaseEntry: BaseEntry{ID: "b2", Timestamp: "2026-06-02T03:52:13.836Z"},
+				FromID:    "root",
+				Summary:   "s",
+				FromHook:  false,
+			},
+			want: `{"type":"branch_summary","id":"b2","parentId":null,"timestamp":"2026-06-02T03:52:13.836Z","fromId":"root","summary":"s","fromHook":false}`,
+		},
+		{
+			// TS appendCustomMessageEntry always writes display (session.ts:204-219);
+			// display:false must survive. With details present, display sits between
+			// content and details: {customType, content, display, details}.
+			name: "custom_message display false with details",
+			entry: CustomMessageEntry{
+				BaseEntry:  BaseEntry{ID: "cm2", Timestamp: "2026-06-02T03:52:13.836Z"},
+				CustomType: "note",
+				Content:    "hi",
+				Display:    false,
+				Details:    map[string]any{"k": "v"},
+			},
+			want: `{"type":"custom_message","id":"cm2","parentId":null,"timestamp":"2026-06-02T03:52:13.836Z","customType":"note","content":"hi","display":false,"details":{"k":"v"}}`,
 		},
 	}
 

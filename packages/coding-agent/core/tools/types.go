@@ -36,6 +36,11 @@ type ReadTool struct {
 	// AutoResize mirrors the imageAutoResize setting: when true, image reads are
 	// shrunk to fit the inline image size limit (and omitted if impossible).
 	AutoResize bool
+	// ModelSupportsImages reports whether the active model accepts "image" input.
+	// When false the read tool appends a note that the image will be omitted from
+	// the request, mirroring read.ts getNonVisionImageNote (ctx.model). Kept in
+	// sync with the live model on /model switch by the agent session.
+	ModelSupportsImages bool
 }
 type WriteTool struct{ CWD string }
 type EditTool struct{ CWD string }
@@ -66,6 +71,9 @@ type BuiltinToolOptions struct {
 	ShellPath     string
 	CommandPrefix string
 	AutoResize    bool
+	// ModelSupportsImages reports whether the active model accepts image input.
+	// Defaults to true (vision-capable) so omitting it preserves prior behavior.
+	ModelSupportsImages bool
 	// BinDir is the agent bin directory the bash tool prepends to PATH.
 	BinDir string
 }

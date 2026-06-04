@@ -258,3 +258,73 @@ func TestFormatSkillInvocationMatchesTypeScript(t *testing.T) {
 		t.Fatalf("invocation=%q", got)
 	}
 }
+
+// TestValidateSkillDescriptionUsesUTF16Length verifies the description length
+// limit and reported count use UTF-16 code units (TS description.length), not Go
+// byte length. A CJK string of 1024 runes is 1024 UTF-16 units (BMP) but 3072
+// UTF-8 bytes, so a byte-length check would wrongly reject it.
+func TestValidateSkillDescriptionUsesUTF16Length(t *testing.T) {
+	// 1024 CJK runes == 1024 UTF-16 units == exactly the limit: must be valid.
+	atLimit := strings.Repeat("中", maxSkillDescriptionLength)
+	if got := utf16Len(atLimit); got != maxSkillDescriptionLength {
+		t.Fatalf("precondition utf16Len=%d want %d", got, maxSkillDescriptionLength)
+	}
+	if errs := validateSkillDescription(atLimit); len(errs) != 0 {
+		t.Fatalf("description at the UTF-16 limit must be valid, got %v (byte len=%d)", errs, len(atLimit))
+	}
+
+	// 1025 CJK runes == 1025 UTF-16 units: must be rejected, and the reported
+	// count must be the UTF-16 count (1025), not the byte count.
+	over := strings.Repeat("中", maxSkillDescriptionLength+1)
+	errs := validateSkillDescription(over)
+	if len(errs) != 1 {
+		t.Fatalf("expected one error, got %v", errs)
+	}
+	wantCount := maxSkillDescriptionLength + 1
+	if !strings.Contains(errs[0], "1025") || !strings.Contains(errs[0], "exceeds") {
+		t.Fatalf("error %q should report UTF-16 count %d, not byte count %d", errs[0], wantCount, len(over))
+	}
+}
+
+// TestSliceUTF16AndLen covers the UTF-16 helpers used by description truncation,
+// including astral runes (surrogate pairs count as two units and must not be
+// split mid-pair).
+func TestSliceUTF16AndLen(t *testing.T) {
+	if got := utf16Len("ab"); got != 2 {
+		t.Fatalf("utf16Len(ascii)=%d want 2", got)
+	}
+	if got := utf16Len("中"); got != 1 {
+		t.Fatalf("utf16Len(BMP)=%d want 1", got)
+	}
+	if got := utf16Len("😀"); got != 2 {
+		t.Fatalf("utf16Len(astral)=%d want 2", got)
+	}
+	// Slicing must never split a surrogate pair: a budget of 1 cannot fit the
+	// 2-unit emoji, so the result is empty (a whole rune or nothing).
+	if got := sliceUTF16("😀x", 1); got != "" {
+		t.Fatalf("sliceUTF16 split a surrogate pair: %q", got)
+	}
+	if got := sliceUTF16("😀x", 2); got != "😀" {
+		t.Fatalf("sliceUTF16(emoji,2)=%q want the emoji", got)
+	}
+	if got := sliceUTF16("中文字", 2); got != "中文" {
+		t.Fatalf("sliceUTF16(cjk,2)=%q want 中文", got)
+	}
+}
+
+// TestLocaleCompareOrdersCaseInsensitivelyLikeLocaleCompare locks the ICU root
+// collation used to mirror JS localeCompare for directory ordering: it is not
+// raw byte order (which would place all uppercase before lowercase).
+func TestLocaleCompareOrdersCaseInsensitivelyLikeLocaleCompare(t *testing.T) {
+	// Byte order sorts "Z" (0x5A) before "a" (0x61); localeCompare/ICU root sorts
+	// "a" before "Z" (case-insensitive primary weight, lowercase tie-break).
+	if localeCompare("a", "Z") >= 0 {
+		t.Fatalf("localeCompare(a, Z) = %d, want < 0 (localeCompare orders a before Z, unlike byte order)", localeCompare("a", "Z"))
+	}
+	if localeCompare("apple", "apple") != 0 {
+		t.Fatal("localeCompare of equal strings must be 0")
+	}
+	if localeCompare("banana", "apple") <= 0 {
+		t.Fatal("localeCompare(banana, apple) must be > 0")
+	}
+}

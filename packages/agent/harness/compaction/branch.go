@@ -3,7 +3,6 @@ package compaction
 import (
 	"context"
 	"encoding/json"
-	"strings"
 	"time"
 
 	"github.com/guanshan/pi-go/packages/agent"
@@ -127,12 +126,17 @@ func GenerateBranchSummary(ctx context.Context, entries []session.Entry, options
 	if err != nil {
 		return BranchSummary{}, err
 	}
+	// TS: if (replaceInstructions && customInstructions) instructions = customInstructions;
+	// else if (customInstructions) instructions += `\n\nAdditional focus: ${customInstructions}`
+	// (branch-summarization.ts:217-220). JS truthiness includes whitespace-only
+	// strings, and the raw (untrimmed) value is used, so gate on != "" and use the
+	// raw string for byte-for-byte prompt parity.
 	instructions := branchSummaryPrompt
-	if custom := strings.TrimSpace(options.CustomInstructions); custom != "" {
+	if options.CustomInstructions != "" {
 		if options.ReplaceInstructions {
-			instructions = custom
+			instructions = options.CustomInstructions
 		} else {
-			instructions += "\n\nAdditional focus: " + custom
+			instructions += "\n\nAdditional focus: " + options.CustomInstructions
 		}
 	}
 	prompt := "<conversation>\n" + SerializeConversation(llmMessages) + "\n</conversation>\n\n" + instructions

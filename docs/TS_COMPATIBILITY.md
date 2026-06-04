@@ -422,7 +422,24 @@ Intentional behavioral divergences (safer or platform-specific; documented rathe
   original inode's xattrs/ACLs, and (running as root) the replacement file's owner
   may differ. Symlinks are preserved (the target is resolved before rename). This
   is a deliberate robustness trade-off, not an oversight (parity review topic 8
-  P2-4).
+  P2-4). Two further consequences of writing via a temp file in the target
+  directory rather than in place. Both consequences below are now aligned with TS
+  (parity review topic on `atomicWriteFile` EACCES semantics):
+  - **Writable file inside a read-only directory**: TS's in-place `fsWriteFile`
+    succeeds (the directory's mode does not block rewriting an existing writable
+    file). `os.CreateTemp(dir)` cannot create a temp sibling in a read-only dir,
+    so `atomicWriteFile` now falls back to an in-place `os.WriteFile(target, …)`
+    when `CreateTemp` fails with a permission/read-only error
+    (`EACCES`/`EROFS`/`ENOTDIR`/`EPERM`), restoring TS's success path
+    (`file_mutation_queue.go`, `isWriteFallbackError`). This trades the
+    atomic-rename crash-safety for that read-only-dir corner case only.
+  - **Read-only target file (`0o444`)**: TS `edit` surfaces a friendly
+    `Could not edit file: <path>. Error code: EACCES.` for an unwritable target.
+    `edit.go` now runs a `W_OK` preflight (`checkWritable`, an `O_WRONLY` probe)
+    after reading the file, so a read-only-but-readable target reports the same
+    `EACCES` message instead of being silently overwritten via the temp-file
+    replace. This matches TS's access-then-write (with the same accepted TOCTOU
+    race); tests skip where `chmod` is not enforced (root).
 - **`write` byte count**: "Successfully wrote N bytes" reports the raw UTF-8 byte
   length in Go vs the JS UTF-16 code-unit length in TS, so N differs for non-ASCII
   content (parity review topic 4 P2-5).
@@ -556,6 +573,53 @@ bugs and should not be "fixed" toward TS without a corresponding decision.
   Messages appended in order), `TestHarnessToolResultHooksChainPatches` (patch
   chaining), and `TestHarnessToolCallHookShortCircuitsOnBlock` (block
   short-circuits remaining handlers).
+
+- **Generated model catalog is regenerated from the TS source of truth**: the Go
+  text and image catalogs (`packages/ai/models_generated.go`,
+  `packages/ai/image_models_generated.go`) are generated, never hand-edited, by
+  `node packages/ai/scripts/generate-go-models.ts`. The script imports the
+  committed TS runtime objects (`MODELS` / `IMAGE_MODELS`) from
+  `$PI_TS_AI_SRC` (default `/root/guanshan/pi/packages/ai/src`) so the baked
+  compat / `thinkingLevelMap` and derived `ThinkingLevels` stay byte-identical to
+  TS. **Regeneration flow whenever the upstream TS catalog is bumped:**
+
+  ```bash
+  cd packages/ai && PI_TS_AI_SRC=/root/guanshan/pi/packages/ai/src \
+    node scripts/generate-go-models.ts
+  gofmt -w models_generated.go image_models_generated.go
+  go test ./packages/ai/ -run TestGeneratedTextModelCatalog
+  ```
+
+  Catalog version: **964 text models / 29 image models** (the bump from 923 added
+  the `nvidia`, `ant-ling`, and `zai-coding-cn` providers plus their baked
+  compat). `TestGeneratedTextModelCatalogMatchesTS` is a drift check: it parses
+  the TS `models.generated.ts` `(provider, id)` set and asserts equality with the
+  Go catalog (skipping gracefully when the TS checkout is unreachable, e.g. CI
+  without the sibling repo). It replaces the old `len(...) == 923` magic-number
+  assertion that silently masked the missing 41 models / 3 providers. When the
+  catalog is regenerated, also confirm `providers/env.go` `ProviderEnvKeys`,
+  `cmd`/`coding-agent` help text, and `detectOpenAICompletionsCompat` (`types.go`)
+  cover any newly-introduced provider.
+
+- **Provider env-key lookup mirrors TS `env-api-keys.ts` 1:1, with one
+  resolution-only superset**: `ProviderEnvKeys` (`packages/ai/providers/env.go`)
+  is a 1:1 port of `getApiKeyEnvVars` in TS `env-api-keys.ts`. Notable
+  consequences of the parity correction:
+  - `google` reads only `GEMINI_API_KEY` (the prior Go-only `GOOGLE_API_KEY`
+    fallback was removed).
+  - `kimi-coding` reads only `KIMI_API_KEY` (the prior `MOONSHOT_API_KEY`
+    fallback and the plain `kimi` alias, neither of which exists in TS, were
+    removed).
+  - `amazon-bedrock` is **not** enumerated here — its bearer token and ambient
+    AWS credentials are resolved via `BedrockEnvCredentials` / `ambientAuthLabel`
+    (matching TS `getEnvApiKey`'s ambient branch), and `azure-openai` (only the
+    `-responses` variant is mapped in TS) and `openai-codex` (OAuth-only) are
+    likewise absent.
+  - Unknown/custom providers return an **empty** slice and do not implicitly
+    resolve a synthesized `<PROVIDER>_API_KEY`, matching TS `findEnvKeys`
+    returning `undefined`. Custom providers can still opt into a key by declaring
+    an explicit model `EnvKey`. Locked by `env_api_keys_per_provider_test.go` and
+    `auth_storage_test.go` `TestProviderEnvKeysDefaultFallback`.
 
 ## Verification Commands
 

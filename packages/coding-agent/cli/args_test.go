@@ -122,6 +122,140 @@ func TestParseArgsUnknownFlagCapturesFollowingValue(t *testing.T) {
 	}
 }
 
+// TestParseArgsInvalidModeSilentlyIgnored mirrors TS args.ts:77-81: an
+// unrecognized --mode value is silently ignored (Mode stays default text) and
+// produces NO error diagnostic, unlike Go's earlier fatal-exit behavior.
+func TestParseArgsInvalidModeSilentlyIgnored(t *testing.T) {
+	args := ParseArgs([]string{"--mode", "bogus", "hi"})
+	if args.Mode != ModeText {
+		t.Fatalf("invalid --mode should leave Mode at default text, got %q", args.Mode)
+	}
+	for _, d := range args.Diagnostics {
+		if d.Type == "error" {
+			t.Fatalf("invalid --mode must not produce an error diagnostic, got %q", d.Message)
+		}
+	}
+	if len(args.Messages) != 1 || args.Messages[0] != "hi" {
+		t.Fatalf("trailing message should still parse, got %#v", args.Messages)
+	}
+	for _, mode := range []string{"text", "json", "rpc"} {
+		got := ParseArgs([]string{"--mode", mode})
+		if string(got.Mode) != mode {
+			t.Fatalf("--mode %s should set Mode, got %q", mode, got.Mode)
+		}
+	}
+}
+
+// TestParseArgsNoStarBooleanFlags asserts each --no-* flag (and its short alias
+// where one exists) flips the matching boolean, matching TS args.ts.
+func TestParseArgsNoStarBooleanFlags(t *testing.T) {
+	cases := []struct {
+		argv  []string
+		check func(Args) bool
+		name  string
+	}{
+		{[]string{"--no-session"}, func(a Args) bool { return a.NoSession }, "no-session"},
+		{[]string{"--no-tools"}, func(a Args) bool { return a.NoTools }, "no-tools"},
+		{[]string{"-nt"}, func(a Args) bool { return a.NoTools }, "-nt"},
+		{[]string{"--no-builtin-tools"}, func(a Args) bool { return a.NoBuiltinTools }, "no-builtin-tools"},
+		{[]string{"-nbt"}, func(a Args) bool { return a.NoBuiltinTools }, "-nbt"},
+		{[]string{"--no-extensions"}, func(a Args) bool { return a.NoExtensions }, "no-extensions"},
+		{[]string{"-ne"}, func(a Args) bool { return a.NoExtensions }, "-ne"},
+		{[]string{"--no-skills"}, func(a Args) bool { return a.NoSkills }, "no-skills"},
+		{[]string{"-ns"}, func(a Args) bool { return a.NoSkills }, "-ns"},
+		{[]string{"--no-prompt-templates"}, func(a Args) bool { return a.NoPromptTemplates }, "no-prompt-templates"},
+		{[]string{"-np"}, func(a Args) bool { return a.NoPromptTemplates }, "-np"},
+		{[]string{"--no-themes"}, func(a Args) bool { return a.NoThemes }, "no-themes"},
+		{[]string{"--no-context-files"}, func(a Args) bool { return a.NoContextFiles }, "no-context-files"},
+		{[]string{"-nc"}, func(a Args) bool { return a.NoContextFiles }, "-nc"},
+	}
+	for _, tc := range cases {
+		args := ParseArgs(tc.argv)
+		if !tc.check(args) {
+			t.Errorf("%s did not flip its boolean: %#v", tc.name, args)
+		}
+		for _, d := range args.Diagnostics {
+			if d.Type == "error" {
+				t.Errorf("%s produced unexpected error diagnostic: %q", tc.name, d.Message)
+			}
+		}
+	}
+}
+
+// TestParseArgsValueFlagsAndAliases covers value-bearing flags, their short
+// aliases, repeatable flags, --print message capture, and --list-models'
+// optional argument.
+func TestParseArgsValueFlagsAndAliases(t *testing.T) {
+	t.Run("repeatable flags accumulate", func(t *testing.T) {
+		args := ParseArgs([]string{
+			"--extension", "a", "-e", "b",
+			"--skill", "s1", "--skill", "s2",
+			"--prompt-template", "p1",
+			"--theme", "t1",
+			"--append-system-prompt", "x", "--append-system-prompt", "y",
+		})
+		if len(args.Extensions) != 2 || args.Extensions[0] != "a" || args.Extensions[1] != "b" {
+			t.Fatalf("extensions=%#v", args.Extensions)
+		}
+		if len(args.Skills) != 2 || args.Skills[1] != "s2" {
+			t.Fatalf("skills=%#v", args.Skills)
+		}
+		if len(args.PromptTemplates) != 1 || len(args.Themes) != 1 {
+			t.Fatalf("promptTemplates=%#v themes=%#v", args.PromptTemplates, args.Themes)
+		}
+		if len(args.AppendSystemPrompt) != 2 || args.AppendSystemPrompt[1] != "y" {
+			t.Fatalf("appendSystemPrompt=%#v", args.AppendSystemPrompt)
+		}
+	})
+	t.Run("print captures following message", func(t *testing.T) {
+		args := ParseArgs([]string{"-p", "do the thing"})
+		if !args.Print || len(args.Messages) != 1 || args.Messages[0] != "do the thing" {
+			t.Fatalf("print=%v messages=%#v", args.Print, args.Messages)
+		}
+	})
+	t.Run("print without message stays empty", func(t *testing.T) {
+		args := ParseArgs([]string{"--print"})
+		if !args.Print || len(args.Messages) != 0 {
+			t.Fatalf("print=%v messages=%#v", args.Print, args.Messages)
+		}
+	})
+	t.Run("list-models without search", func(t *testing.T) {
+		args := ParseArgs([]string{"--list-models"})
+		if args.ListModels == nil || *args.ListModels != "" {
+			t.Fatalf("list-models=%v", args.ListModels)
+		}
+	})
+	t.Run("list-models with search", func(t *testing.T) {
+		args := ParseArgs([]string{"--list-models", "sonnet"})
+		if args.ListModels == nil || *args.ListModels != "sonnet" {
+			t.Fatalf("list-models=%v", args.ListModels)
+		}
+	})
+	t.Run("continue and resume aliases", func(t *testing.T) {
+		if !ParseArgs([]string{"-c"}).Continue || !ParseArgs([]string{"--continue"}).Continue {
+			t.Fatal("continue alias failed")
+		}
+		if !ParseArgs([]string{"-r"}).Resume || !ParseArgs([]string{"--resume"}).Resume {
+			t.Fatal("resume alias failed")
+		}
+	})
+	t.Run("fork and session-dir", func(t *testing.T) {
+		args := ParseArgs([]string{"--fork", "abc", "--session-dir", "/tmp/sd"})
+		if args.Fork != "abc" || args.SessionDir != "/tmp/sd" {
+			t.Fatalf("fork=%q sessionDir=%q", args.Fork, args.SessionDir)
+		}
+	})
+	t.Run("export with output message", func(t *testing.T) {
+		args := ParseArgs([]string{"--export", "session.jsonl", "out.html"})
+		if args.Export != "session.jsonl" {
+			t.Fatalf("export=%q", args.Export)
+		}
+		if len(args.Messages) != 1 || args.Messages[0] != "out.html" {
+			t.Fatalf("export output message=%#v", args.Messages)
+		}
+	})
+}
+
 // TestPrintHelpIncludesExamplesAndEnvDescriptions verifies the help output is on
 // par with TS args.ts: it includes the Examples block, descriptioned environment
 // variables, and the Built-in Tool Names section.

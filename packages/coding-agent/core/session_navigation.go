@@ -110,11 +110,11 @@ func (a *AgentSession) NavigateTree(ctx context.Context, targetID string, opts N
 			a.emitExtensionSessionTree(result.NewLeafID, oldLeaf, nil, fromExtension)
 			return result, nil
 		}
-		entry := SessionEntry{Type: "branch_summary", FromID: oldLeaf, Summary: summary, Details: details}
+		entry := SessionEntry{Type: "branch_summary", FromID: oldLeaf, Summary: summary, Details: details, FromHook: fromExtension}
 		if err := a.Session.Append(entry); err != nil {
 			return NavigateTreeResult{}, err
 		}
-		result.SummaryEntry = &BranchSummaryEntry{Type: "branch_summary", FromID: oldLeaf, Summary: summary, Details: details}
+		result.SummaryEntry = &BranchSummaryEntry{Type: "branch_summary", FromID: oldLeaf, Summary: summary, Details: details, FromHook: fromExtension}
 	}
 	a.emitExtensionSessionTree(result.NewLeafID, oldLeaf, result.SummaryEntry, fromExtension)
 	return result, nil

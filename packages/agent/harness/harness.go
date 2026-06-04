@@ -179,6 +179,17 @@ func (h *AgentHarness) Prompt(ctx context.Context, text string, opts PromptOptio
 // for flushing pending writes and releasing the run. gen identifies the run so
 // the abort handle is only published while this run is the active one.
 func (h *AgentHarness) runTurn(ctx context.Context, gen uint64, state turnState, text string, opts PromptOptions) (final ai.AssistantMessage, err error) {
+	// TS drains the nextTurn queue and emits queue_update BEFORE before_agent_start
+	// (agent-harness.ts:560-569), so the hook observes an already-drained queue and
+	// queue_update precedes before_agent_start. If queue_update fails, TS re-inserts
+	// the drained messages (unshift) so they are not lost; mirror that here.
+	queued := h.nextTurnQueue.DrainAll()
+	if len(queued) > 0 {
+		if err := h.emitHarness(ctx, h.queueUpdateEvent()); err != nil {
+			h.nextTurnQueue.Prepend(queued)
+			return ai.AssistantMessage{}, err
+		}
+	}
 	startResult, err := h.emitBeforeAgentStart(ctx, BeforeAgentStartEvent{
 		Prompt:       text,
 		Images:       append([]ai.ContentBlock(nil), opts.Images...),
@@ -188,17 +199,13 @@ func (h *AgentHarness) runTurn(ctx context.Context, gen uint64, state turnState,
 	if err != nil {
 		return ai.AssistantMessage{}, err
 	}
-	if startResult != nil {
-		if startResult.SystemPrompt != "" {
-			state.systemPrompt = startResult.SystemPrompt
-		}
+	// A non-nil SystemPrompt pointer is an override even when it points to ""
+	// (TS createContext uses `beforeResult?.systemPrompt ?? turnState.systemPrompt`,
+	// so "" clears the prompt). nil = preserve the turn's systemPrompt.
+	if startResult != nil && startResult.SystemPrompt != nil {
+		state.systemPrompt = *startResult.SystemPrompt
 	}
-	promptMessages := h.nextTurnQueue.DrainAll()
-	if len(promptMessages) > 0 {
-		if err := h.emitHarness(ctx, h.queueUpdateEvent()); err != nil {
-			return ai.AssistantMessage{}, err
-		}
-	}
+	promptMessages := append([]agent.AgentMessage(nil), queued...)
 	promptMessages = append(promptMessages, ai.NewUserMessage(text, opts.Images))
 	if startResult != nil && startResult.Messages != nil {
 		promptMessages = append(promptMessages, startResult.Messages...)
@@ -701,22 +708,17 @@ func (h *AgentHarness) createTurnState(ctx context.Context) (turnState, error) {
 	if err != nil {
 		return turnState{}, err
 	}
-	var tools []agent.AgentTool
+	// TS_COMPATIBILITY: createTurnState consumes only context.messages and uses
+	// the in-memory harness fields (this.model / this.thinkingLevel /
+	// this.activeToolNames) for the turn's model, thinking level, and active
+	// tools (agent-harness.ts:331-363). The session BuildContext result also
+	// carries thinkingLevel / model / activeToolNames, but TS deliberately
+	// ignores them here, so we must NOT write them back into the harness or use
+	// them for this turn — doing so polluted model metadata (only Provider/ID
+	// were overwritten, leaving stale API/contextWindow) and silently mutated
+	// the live model/thinking/tools state.
 	h.mu.Lock()
-	if built.ActiveToolNames != nil {
-		h.activeToolNames = append([]string(nil), (*built.ActiveToolNames)...)
-		h.activeToolNamesSet = true
-	}
-	if built.ThinkingLevel != "" {
-		thinking = ai.ThinkingLevel(built.ThinkingLevel)
-		h.thinkingLevel = thinking
-	}
-	if built.Model != nil {
-		model.Provider = built.Model.Provider
-		model.ID = built.Model.ModelID
-		h.model = model
-	}
-	tools = h.activeToolsLocked()
+	tools := h.activeToolsLocked()
 	h.mu.Unlock()
 	if thinking == "" {
 		thinking = ai.ThinkingOff

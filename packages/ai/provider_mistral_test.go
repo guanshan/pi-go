@@ -201,6 +201,45 @@ func TestMistralChatPromptModeImageOmissionAndAffinityOverride(t *testing.T) {
 	}
 }
 
+// TestMistralChatNonReasoningModelOmitsReasoning locks the parity fix: a
+// non-reasoning Mistral model must NOT receive prompt_mode or reasoning_effort
+// even when a thinking level is requested. Mirrors mistral.ts shouldUseReasoning
+// = model.reasoning && reasoning !== "off".
+func TestMistralChatNonReasoningModelOmitsReasoning(t *testing.T) {
+	var captured map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&captured); err != nil {
+			t.Fatal(err)
+		}
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"ok"},"finish_reason":"stop"}]}`))
+	}))
+	defer server.Close()
+
+	registry := NewModelRegistry(t.TempDir(), NewAuthStorage(t.TempDir()))
+	registry.Auth.SetRuntime("mistral", "test-key")
+	_, err := registry.StreamlessChat(context.Background(), ChatRequest{
+		Model: Model{
+			Provider:  "mistral",
+			ID:        "mistral-small-latest",
+			API:       "mistral-conversations",
+			BaseURL:   server.URL + "/v1/chat/completions",
+			Input:     []string{"text"},
+			Reasoning: false,
+		},
+		Messages:      []Message{NewUserMessage("hi", nil)},
+		ThinkingLevel: ThinkingHigh,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := captured["prompt_mode"]; ok {
+		t.Fatalf("prompt_mode should be omitted for non-reasoning model: %#v", captured)
+	}
+	if _, ok := captured["reasoning_effort"]; ok {
+		t.Fatalf("reasoning_effort should be omitted for non-reasoning model: %#v", captured)
+	}
+}
+
 func TestMistralChatStreamingDeltas(t *testing.T) {
 	var captured map[string]any
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

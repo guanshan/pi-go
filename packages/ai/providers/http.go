@@ -395,6 +395,11 @@ func isRetryableStatus(status int) bool {
 	return status == http.StatusTooManyRequests || status >= 500
 }
 
+// IsRetryableStatus reports whether an HTTP status is transient enough to retry.
+func IsRetryableStatus(status int) bool {
+	return isRetryableStatus(status)
+}
+
 func responseRetryDelay(resp *http.Response, attempt int, options RequestOptions) (time.Duration, error) {
 	if resp == nil {
 		return retryDelay(nil, attempt, options), nil
@@ -415,6 +420,12 @@ func responseRetryDelay(resp *http.Response, attempt int, options RequestOptions
 	return retryDelay(nil, attempt, options), nil
 }
 
+// ResponseRetryDelay returns the delay for a retry attempt, honoring
+// Retry-After-Ms / Retry-After headers and maxRetryDelayMs.
+func ResponseRetryDelay(resp *http.Response, attempt int, options RequestOptions) (time.Duration, error) {
+	return responseRetryDelay(resp, attempt, options)
+}
+
 func retryDelay(_ *http.Response, attempt int, options RequestOptions) time.Duration {
 	delay := time.Duration(100*(1<<min(attempt, 5))) * time.Millisecond
 	capped, err := capRetryDelay(delay, options)
@@ -422,6 +433,11 @@ func retryDelay(_ *http.Response, attempt int, options RequestOptions) time.Dura
 		return delay
 	}
 	return capped
+}
+
+// RetryDelay returns the exponential fallback delay for an attempt.
+func RetryDelay(attempt int, options RequestOptions) time.Duration {
+	return retryDelay(nil, attempt, options)
 }
 
 func capRetryDelay(delay time.Duration, options RequestOptions) (time.Duration, error) {
@@ -450,4 +466,9 @@ func waitForRetry(ctx context.Context, delay time.Duration) error {
 	case <-timer.C:
 		return nil
 	}
+}
+
+// WaitForRetry waits for delay or context cancellation, whichever comes first.
+func WaitForRetry(ctx context.Context, delay time.Duration) error {
+	return waitForRetry(ctx, delay)
 }

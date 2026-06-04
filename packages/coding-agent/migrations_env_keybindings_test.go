@@ -11,8 +11,9 @@ import (
 )
 
 // TestSkipsMigrations verifies the migration gate: default interactive (no
-// args) must run migrations, while paths that never build the runtime
-// (--help/--version-equivalent help, export, package/config commands) skip.
+// args) and --help both run migrations (TS main.ts runs runMigrations before
+// printHelp), while only paths that exit before runMigrations — export and pure
+// package/config commands — skip.
 func TestSkipsMigrations(t *testing.T) {
 	tests := []struct {
 		name string
@@ -23,9 +24,9 @@ func TestSkipsMigrations(t *testing.T) {
 		{"empty slice", []string{}, false},
 		{"interactive print", []string{"--print", "hi"}, false},
 		{"interactive model", []string{"--model", "faux/faux"}, false},
-		{"help long", []string{"--help"}, true},
-		{"help short", []string{"-h"}, true},
-		{"help with subcommand", []string{"install", "--help"}, true},
+		{"help long runs migrations", []string{"--help"}, false},
+		{"help short runs migrations", []string{"-h"}, false},
+		{"help with subcommand skips via package command", []string{"install", "--help"}, true},
 		{"export with value", []string{"--export", "session.jsonl"}, true},
 		{"export without value runs migrations", []string{"--export"}, false},
 		{"install", []string{"install", "pkg"}, true},

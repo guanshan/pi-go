@@ -76,6 +76,15 @@ type modelCycleDoneMsg struct {
 	busy   bool
 }
 
+// thinkingCycleDoneMsg reports the outcome of an off-goroutine CycleThinkingLevel
+// so the "no other thinking levels" / "while streaming" feedback is surfaced on
+// the Update goroutine. A successful change rides the emitted
+// ThinkingLevelChangedEvent status, so ok==true needs no extra status.
+type thinkingCycleDoneMsg struct {
+	ok   bool
+	busy bool
+}
+
 type modelSelectDoneMsg struct {
 	Err error
 }
@@ -119,6 +128,7 @@ type interactiveModel struct {
 	busy               bool
 	busyKind           interactiveBusyKind
 	cyclingModel       bool
+	cyclingThinking    bool
 	width              int
 	height             int
 	assistantSlot      int
@@ -181,6 +191,7 @@ var interactiveSlashCommands = []string{
 	"login",
 	"logout",
 	"model",
+	"thinking",
 	"scoped-models",
 	"settings",
 	"resume",
@@ -197,6 +208,7 @@ var interactiveSlashCommands = []string{
 	"clone",
 	"changelog",
 	"reload",
+	"debug",
 	"help",
 	"hotkeys",
 	"quit",
@@ -372,6 +384,10 @@ func (m *interactiveModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			cmd = m.cycleModel(true)
 			m.refreshViewport()
 			return m, cmd
+		case "shift+tab":
+			cmd = m.cycleThinking()
+			m.refreshViewport()
+			return m, cmd
 		case "up":
 			if m.navigateAutocomplete(-1) {
 				m.refreshViewport()
@@ -501,6 +517,17 @@ func (m *interactiveModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.refreshViewport()
 		return m, nil
+	case thinkingCycleDoneMsg:
+		m.cyclingThinking = false
+		if !msg.ok {
+			if msg.busy {
+				m.setStatus("Can't switch thinking level while a response is streaming")
+			} else {
+				m.setStatus("No other thinking levels available")
+			}
+		}
+		m.refreshViewport()
+		return m, nil
 	case modelSelectDoneMsg:
 		// Success feedback rides the ModelChangedEvent emitted by SetModel; only
 		// surface the failure path here.
@@ -568,6 +595,65 @@ func (m *interactiveModel) extensionUIHandler(ctx context.Context, method string
 	case <-m.ctx.Done():
 		m.post(interactiveExtensionUICancelMsg{Request: req})
 		return nil, m.ctx.Err()
+	}
+}
+
+// oauthSlashPrompter returns a slashPrompter that drives /login OAuth prompts
+// through the existing extension-UI input overlay. It is invoked only from the
+// runSlashCommand tea.Cmd goroutine, so blocking on the overlay's result channel
+// is safe (it never runs on the Update goroutine). The overlay request is posted
+// via m.post (goroutine-safe) and the model field is never mutated directly from
+// here. esc/ctrl+c resolves the channel with a JSON null, which aborts the login
+// with an error so a cancelled prompt cannot hang the command goroutine.
+func (m *interactiveModel) oauthSlashPrompter(ctx context.Context) slashPrompter {
+	return func(prompt ai.OAuthPrompt) (string, error) {
+		if m == nil || m.post == nil {
+			return "", fmt.Errorf("interactive prompt is not available")
+		}
+		if ctx == nil {
+			ctx = context.Background()
+		}
+		req := &interactiveExtensionUIRequest{
+			Method: "input",
+			Prompt: extensionUIPrompt{
+				Message:     firstNonEmpty(prompt.Message, "Enter value"),
+				Placeholder: prompt.Placeholder,
+			},
+			Response: make(chan extensionUIResult, 1),
+		}
+		m.post(interactiveExtensionUIRequestMsg{Request: req})
+		var raw json.RawMessage
+		select {
+		case result := <-req.Response:
+			if result.Err != nil {
+				return "", result.Err
+			}
+			raw = result.Result
+		case <-ctx.Done():
+			m.post(interactiveExtensionUICancelMsg{Request: req})
+			return "", ctx.Err()
+		case <-m.ctx.Done():
+			m.post(interactiveExtensionUICancelMsg{Request: req})
+			return "", m.ctx.Err()
+		}
+		// The input overlay resolves esc/ctrl+c to a JSON null; treat that as a
+		// cancellation that aborts the OAuth flow (unless the prompt explicitly
+		// allows an empty answer, in which case an empty string flows through).
+		if len(raw) == 0 || string(raw) == "null" {
+			if prompt.AllowEmpty {
+				return "", nil
+			}
+			return "", fmt.Errorf("login cancelled")
+		}
+		var value string
+		if err := json.Unmarshal(raw, &value); err != nil {
+			return "", err
+		}
+		value = strings.TrimSpace(value)
+		if value == "" && !prompt.AllowEmpty {
+			return "", fmt.Errorf("login cancelled")
+		}
+		return value, nil
 	}
 }
 
@@ -928,10 +1014,20 @@ func (m *interactiveModel) runAbort() tea.Cmd {
 }
 
 func (m *interactiveModel) runSlashCommand(ctx context.Context, line string) tea.Cmd {
+	// Provide a real interactive prompter for /login so OAuth flows
+	// (anthropic / github-copilot / openai-codex) can complete inside the TUI:
+	// modes.go calls prompter for each OAuthPrompt and the prompter blocks on the
+	// input overlay. Other commands keep a nil prompter so they stay
+	// non-blocking. The prompter is only ever invoked from this tea.Cmd
+	// goroutine, so blocking on the overlay channel never stalls the Update loop.
+	var prompter slashPrompter
+	if isLoginCommand(line) {
+		prompter = m.oauthSlashPrompter(ctx)
+	}
 	return func() tea.Msg {
 		var stdout bytes.Buffer
 		var stderr bytes.Buffer
-		done, err := handleSlashWithPrompt(ctx, m.runtime, line, nil, &stdout, &stderr)
+		done, err := handleSlashWithPrompt(ctx, m.runtime, line, prompter, &stdout, &stderr)
 		return interactiveCommandDoneMsg{
 			Stdout: stdout.String(),
 			Stderr: stderr.String(),
@@ -939,6 +1035,16 @@ func (m *interactiveModel) runSlashCommand(ctx context.Context, line string) tea
 			Quit:   done,
 		}
 	}
+}
+
+// isLoginCommand reports whether the submitted slash line is a /login invocation
+// (the only command that may need the blocking OAuth prompter).
+func isLoginCommand(line string) bool {
+	fields := strings.Fields(strings.TrimSpace(line))
+	if len(fields) == 0 {
+		return false
+	}
+	return strings.TrimPrefix(fields[0], "/") == "login"
 }
 
 func (m *interactiveModel) runBashCommand(ctx context.Context, line string) tea.Cmd {
@@ -1778,6 +1884,35 @@ func (m *interactiveModel) cycleModel(backward bool) tea.Cmd {
 			scoped = agent.hasScopedModels()
 		}
 		return modelCycleDoneMsg{ok: ok, scoped: scoped, busy: busy}
+	}
+}
+
+// cycleThinking advances to the next thinking level in response to Shift+Tab,
+// mirroring TS app.thinking.cycle. Like cycleModel, the switch must run in the
+// returned tea.Cmd goroutine: CycleThinkingLevel -> SetThinkingLevel ->
+// emitSessionEvent -> m.post -> program.Send blocks on Bubble Tea's unbuffered
+// channel, so invoking it on the Update goroutine would deadlock. m.cyclingThinking
+// (toggled only on the Update goroutine) serializes rapid presses; cycling is
+// suppressed mid-turn (m.busy). Success feedback rides the emitted
+// ThinkingLevelChangedEvent status; only the "no other levels" case reports via
+// thinkingCycleDoneMsg.
+func (m *interactiveModel) cycleThinking() tea.Cmd {
+	if m.busy {
+		m.setStatus("Can't switch thinking level while a response is streaming")
+		return nil
+	}
+	if m.cyclingThinking {
+		return nil
+	}
+	agent, err := runtimeAgent(m.runtime)
+	if err != nil {
+		m.setStatus(err.Error())
+		return nil
+	}
+	m.cyclingThinking = true
+	return func() tea.Msg {
+		_, ok := agent.CycleThinkingLevel()
+		return thinkingCycleDoneMsg{ok: ok}
 	}
 }
 

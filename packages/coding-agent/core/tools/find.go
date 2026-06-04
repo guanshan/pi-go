@@ -17,31 +17,40 @@ import (
 
 func (FindTool) Name() string { return "find" }
 func (FindTool) Description() string {
-	return "Find files by glob pattern. Respects .gitignore. Output is truncated to 1000 results or 50KB."
+	// Byte-exact with find.ts:117 (DEFAULT_LIMIT=1000, DEFAULT_MAX_BYTES/1024=50).
+	return "Search for files by glob pattern. Returns matching file paths relative to the search directory. Respects .gitignore. Output is truncated to 1000 results or 50KB (whichever is hit first)."
 }
 func (FindTool) Schema() map[string]any {
 	return objectSchema(map[string]any{
-		"pattern": stringSchema("Glob pattern, e.g. *.ts or src/**/*.go"),
-		"path":    stringSchema("Directory to search"),
-		"limit":   numberSchema("Maximum results"),
+		"pattern": stringSchema("Glob pattern to match files, e.g. '*.ts', '**/*.json', or 'src/**/*.spec.ts'"),
+		"path":    stringSchema("Directory to search in (default: current directory)"),
+		"limit":   numberSchema("Maximum number of results (default: 1000)"),
 	}, []string{"pattern"})
 }
 func (t FindTool) Execute(ctx context.Context, raw json.RawMessage, _ ToolUpdate) ai.ToolResult {
 	var args struct {
 		Pattern string `json:"pattern"`
 		Path    string `json:"path"`
-		Limit   int    `json:"limit"`
+		// Limit is a pointer so an explicit limit:0 (zero results) is distinguished
+		// from an absent limit (DEFAULT_LIMIT), matching find.ts:151 `limit ??
+		// DEFAULT_LIMIT`.
+		Limit *int `json:"limit"`
 	}
 	if err := json.Unmarshal(raw, &args); err != nil || args.Pattern == "" {
 		return toolError("Invalid find input: pattern is required")
 	}
-	limit := args.Limit
-	if limit <= 0 {
-		limit = DefaultFindLimit
+	limit := DefaultFindLimit
+	if args.Limit != nil {
+		limit = *args.Limit
 	}
 	root := ResolveToolPath(t.CWD, firstNonEmpty(args.Path, "."))
 	if _, err := os.Stat(root); err != nil {
 		return toolError(fmt.Sprintf("Path not found: %s", root))
+	}
+	if limit <= 0 {
+		// An explicit limit:0 yields zero results, matching fd --max-results 0 /
+		// the `results.length >= 0` guard in find.ts (effectiveLimit 0).
+		return formatFindResults(nil, false, limit)
 	}
 	var results []string
 	limitReached := false

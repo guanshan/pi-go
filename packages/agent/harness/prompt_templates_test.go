@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	harnessenv "github.com/guanshan/pi-go/packages/agent/harness/env"
@@ -41,6 +42,55 @@ func TestLoadPromptTemplatesNonRecursiveExplicitAndDiagnostics(t *testing.T) {
 	}
 	if len(loaded.Diagnostics) != 1 || loaded.Diagnostics[0].Code != "parse_failed" {
 		t.Fatalf("diagnostics=%#v", loaded.Diagnostics)
+	}
+}
+
+// TestPromptTemplateDescriptionTruncatesByUTF16 verifies the first-line
+// description fallback slices to 60 UTF-16 code units and appends "..." based on
+// the ORIGINAL first line's UTF-16 length, matching TS firstLine.slice(0, 60) +
+// (firstLine.length > 60 ? "..." : "").
+func TestPromptTemplateDescriptionTruncatesByUTF16(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	env, err := harnessenv.NewLocalExecutionEnv(root, "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 61 CJK runes == 61 UTF-16 units > 60: slice to 60 runes and append "...".
+	longCJK := strings.Repeat("中", 61)
+	writeHarnessTestFile(t, filepath.Join(root, "cjk.md"), longCJK+"\nbody")
+	tmpl, diags := loadPromptTemplateFromFile(ctx, env, filepath.Join(root, "cjk.md"))
+	if tmpl == nil {
+		t.Fatalf("load failed: %#v", diags)
+	}
+	wantCJK := strings.Repeat("中", 60) + "..."
+	if tmpl.Description != wantCJK {
+		t.Fatalf("CJK description=%q want %q", tmpl.Description, wantCJK)
+	}
+
+	// Exactly 60 UTF-16 units: no "..." appended (length is not > 60).
+	exact := strings.Repeat("中", 60)
+	writeHarnessTestFile(t, filepath.Join(root, "exact.md"), exact+"\nbody")
+	tmpl, diags = loadPromptTemplateFromFile(ctx, env, filepath.Join(root, "exact.md"))
+	if tmpl == nil {
+		t.Fatalf("load failed: %#v", diags)
+	}
+	if tmpl.Description != exact {
+		t.Fatalf("exact description=%q want %q (no ellipsis at exactly 60)", tmpl.Description, exact)
+	}
+
+	// Emoji (astral, 2 UTF-16 units each): 31 emoji == 62 UTF-16 units > 60.
+	// The 60-unit slice fits 30 whole emoji (a surrogate pair must not be split).
+	emojiLine := strings.Repeat("😀", 31)
+	writeHarnessTestFile(t, filepath.Join(root, "emoji.md"), emojiLine+"\nbody")
+	tmpl, diags = loadPromptTemplateFromFile(ctx, env, filepath.Join(root, "emoji.md"))
+	if tmpl == nil {
+		t.Fatalf("load failed: %#v", diags)
+	}
+	wantEmoji := strings.Repeat("😀", 30) + "..."
+	if tmpl.Description != wantEmoji {
+		t.Fatalf("emoji description=%q want %q", tmpl.Description, wantEmoji)
 	}
 }
 

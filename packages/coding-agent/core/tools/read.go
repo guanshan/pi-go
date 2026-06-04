@@ -14,7 +14,8 @@ import (
 
 func (ReadTool) Name() string { return "read" }
 func (ReadTool) Description() string {
-	return "Read text files and images. Text output is truncated to 2000 lines or 50KB; use offset/limit to continue."
+	// Byte-exact with read.ts:212 (DEFAULT_MAX_LINES=2000, DEFAULT_MAX_BYTES/1024=50).
+	return "Read the contents of a file. Supports text files and images (jpg, png, gif, webp). Images are sent as attachments. For text files, output is truncated to 2000 lines or 50KB (whichever is hit first). Use offset/limit for large files. When you need the full file, continue with offset until complete."
 }
 func (ReadTool) Schema() map[string]any {
 	return objectSchema(map[string]any{
@@ -27,7 +28,10 @@ func (t ReadTool) Execute(ctx context.Context, raw json.RawMessage, _ ToolUpdate
 	var args struct {
 		Path   string `json:"path"`
 		Offset int    `json:"offset"`
-		Limit  int    `json:"limit"`
+		// Limit is a pointer so an explicit limit:0 (empty selection) is
+		// distinguished from an absent limit (TruncateHead default), matching
+		// read.ts:291 `if (limit !== undefined)`.
+		Limit *int `json:"limit"`
 	}
 	if err := json.Unmarshal(raw, &args); err != nil || args.Path == "" {
 		return toolError("Invalid read input: path is required")
@@ -37,77 +41,104 @@ func (t ReadTool) Execute(ctx context.Context, raw json.RawMessage, _ ToolUpdate
 	if err != nil {
 		return toolError(err.Error())
 	}
+	// Mirror read.ts getNonVisionImageNote: when the active model lacks "image"
+	// input, append a note that the image will be omitted from the request.
+	nonVisionImageNote := ""
+	if !t.ModelSupportsImages {
+		nonVisionImageNote = "[Current model does not support images. The image will be omitted from this request.]"
+	}
 	if isImagePath(abs, data) {
 		mimeType := detectMime(abs, data)
 		if !t.AutoResize {
+			textNote := fmt.Sprintf("Read image file [%s]", mimeType)
+			if nonVisionImageNote != "" {
+				textNote += "\n" + nonVisionImageNote
+			}
 			return ai.ToolResult{Content: []ai.ContentBlock{
-				{Type: "text", Text: fmt.Sprintf("Read image file [%s]", mimeType)},
+				{Type: "text", Text: textNote},
 				{Type: "image", Data: base64.StdEncoding.EncodeToString(data), MimeType: mimeType},
 			}}
 		}
 		resized := imageresize.Resize(data, mimeType, imageresize.Options{})
 		if resized == nil {
-			return ai.ToolResult{Content: ai.TextBlocks(fmt.Sprintf("Read image file [%s]\n[Image omitted: could not be resized below the inline image size limit.]", mimeType))}
+			textNote := fmt.Sprintf("Read image file [%s]\n[Image omitted: could not be resized below the inline image size limit.]", mimeType)
+			if nonVisionImageNote != "" {
+				textNote += "\n" + nonVisionImageNote
+			}
+			return ai.ToolResult{Content: ai.TextBlocks(textNote)}
 		}
 		text := fmt.Sprintf("Read image file [%s]", resized.MimeType)
 		if note := imageresize.DimensionNote(resized); note != "" {
 			text += "\n" + note
+		}
+		if nonVisionImageNote != "" {
+			text += "\n" + nonVisionImageNote
 		}
 		return ai.ToolResult{Content: []ai.ContentBlock{
 			{Type: "text", Text: text},
 			{Type: "image", Data: resized.Data, MimeType: resized.MimeType},
 		}}
 	}
-	text := string(data)
-	lines := strings.Split(text, "\n")
-	totalFileLines := len(lines)
+	textContent := string(data)
+	allLines := strings.Split(textContent, "\n")
+	totalFileLines := len(allLines)
+	startLine := 0
 	if args.Offset > 0 {
-		start := args.Offset - 1
-		if start >= len(lines) {
-			return toolError(fmt.Sprintf("Offset %d is beyond end of file (%d lines total)", args.Offset, len(lines)))
-		}
-		lines = lines[start:]
+		startLine = args.Offset - 1
 	}
-	if args.Limit > 0 && args.Limit < len(lines) {
-		lines = lines[:args.Limit]
-		text = strings.Join(lines, "\n")
-		next := args.Offset
-		if next <= 0 {
-			next = 1
+	startLineDisplay := startLine + 1
+	if startLine >= len(allLines) {
+		return toolError(fmt.Sprintf("Offset %d is beyond end of file (%d lines total)", args.Offset, len(allLines)))
+	}
+	// Mirror read.ts:288-297: honor an explicit limit first (limit:0 -> empty
+	// selection), then let TruncateHead decide. Distinguish absent from 0 via the
+	// decoded *int pointer.
+	var selectedContent string
+	userLimited := false
+	userLimitedLines := 0
+	if args.Limit != nil {
+		end := startLine + *args.Limit
+		if end > len(allLines) {
+			end = len(allLines)
 		}
-		next += args.Limit
-		text += fmt.Sprintf("\n\n[%d more lines in file. Use offset=%d to continue.]", len(strings.Split(string(data), "\n"))-next+1, next)
+		if end < startLine {
+			end = startLine
+		}
+		selectedContent = strings.Join(allLines[startLine:end], "\n")
+		userLimited = true
+		userLimitedLines = end - startLine
 	} else {
-		text = strings.Join(lines, "\n")
+		selectedContent = strings.Join(allLines[startLine:], "\n")
 	}
-	trunc := TruncateHead(text, DefaultMaxLines, DefaultMaxBytes)
-	if trunc.FirstLineExceedsLimit {
-		offset := args.Offset
-		if offset <= 0 {
-			offset = 1
-		}
+	trunc := TruncateHead(selectedContent, DefaultMaxLines, DefaultMaxBytes)
+	var text string
+	var details any
+	switch {
+	case trunc.FirstLineExceedsLimit:
 		// Mirror TS read.ts:303-304: report the offending line's byte size.
-		firstLineSize := FormatSize(len(lines[0]))
-		text = fmt.Sprintf("[Line %d is %s, exceeds %s limit. Use bash: sed -n '%dp' %s | head -c %d]", offset, firstLineSize, FormatSize(DefaultMaxBytes), offset, args.Path, DefaultMaxBytes)
-	} else if trunc.Truncated {
-		start := args.Offset
-		if start <= 0 {
-			start = 1
-		}
-		end := start + trunc.OutputLines - 1
+		firstLineSize := FormatSize(len(allLines[startLine]))
+		text = fmt.Sprintf("[Line %d is %s, exceeds %s limit. Use bash: sed -n '%dp' %s | head -c %d]", startLineDisplay, firstLineSize, FormatSize(DefaultMaxBytes), startLineDisplay, args.Path, DefaultMaxBytes)
+		details = map[string]any{"truncation": trunc}
+	case trunc.Truncated:
+		end := startLineDisplay + trunc.OutputLines - 1
+		nextOffset := end + 1
 		// Mirror TS read.ts:311-315: include "of TOTAL" and, for byte
 		// truncation, the byte-limit suffix.
 		if trunc.TruncatedBy == "bytes" {
-			text = trunc.Content + fmt.Sprintf("\n\n[Showing lines %d-%d of %d (%s limit). Use offset=%d to continue.]", start, end, totalFileLines, FormatSize(DefaultMaxBytes), end+1)
+			text = trunc.Content + fmt.Sprintf("\n\n[Showing lines %d-%d of %d (%s limit). Use offset=%d to continue.]", startLineDisplay, end, totalFileLines, FormatSize(DefaultMaxBytes), nextOffset)
 		} else {
-			text = trunc.Content + fmt.Sprintf("\n\n[Showing lines %d-%d of %d. Use offset=%d to continue.]", start, end, totalFileLines, end+1)
+			text = trunc.Content + fmt.Sprintf("\n\n[Showing lines %d-%d of %d. Use offset=%d to continue.]", startLineDisplay, end, totalFileLines, nextOffset)
 		}
-	} else {
-		text = trunc.Content
-	}
-	var details any
-	if trunc.Truncated {
 		details = map[string]any{"truncation": trunc}
+	case userLimited && startLine+userLimitedLines < len(allLines):
+		// Mirror TS read.ts:317-321: a user-specified limit stopped early but the
+		// file still has more content. This note never mixes with the truncation
+		// notes above (else-if chain).
+		remaining := len(allLines) - (startLine + userLimitedLines)
+		nextOffset := startLine + userLimitedLines + 1
+		text = fmt.Sprintf("%s\n\n[%d more lines in file. Use offset=%d to continue.]", trunc.Content, remaining, nextOffset)
+	default:
+		text = trunc.Content
 	}
 	return ai.ToolResult{Content: ai.TextBlocks(text), Details: details}
 }

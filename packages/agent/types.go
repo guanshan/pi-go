@@ -176,8 +176,12 @@ type AgentLoopConfig struct {
 	ConvertToLLM     ConvertToLLMFunc
 	TransformContext TransformContextFunc
 	GetAPIKey        GetAPIKeyFunc
-	BeforeToolCall   BeforeToolCallFunc
-	AfterToolCall    AfterToolCallFunc
+	// APIKey is the fallback used when GetAPIKey is unset or returns an empty
+	// string, mirroring TS `(config.getApiKey ? ... : undefined) || config.apiKey`
+	// (agent-loop.ts:302): GetAPIKey wins when it yields a non-empty value.
+	APIKey         string
+	BeforeToolCall BeforeToolCallFunc
+	AfterToolCall  AfterToolCallFunc
 
 	ShouldStopAfterTurn ShouldStopAfterTurnFunc
 	PrepareNextTurn     PrepareNextTurnFunc

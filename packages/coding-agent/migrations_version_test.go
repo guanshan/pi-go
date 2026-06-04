@@ -95,6 +95,48 @@ func TestMigrateAuthToAuthJSON(t *testing.T) {
 	if containsBytes(settings, []byte("apiKeys")) {
 		t.Fatalf("apiKeys not removed: %s", settings)
 	}
+	// auth.json keeps the 0600 credential boundary (TS migrations.ts:71).
+	if info, err := os.Stat(filepath.Join(agentDir, "auth.json")); err == nil {
+		if perm := info.Mode().Perm(); perm&0o077 != 0 && os.Geteuid() != 0 {
+			t.Fatalf("auth.json should be 0600, got %o", perm)
+		}
+	}
+}
+
+// TestWriteIndentedJSONModeControlsDirBoundary pins the behavioral contract the
+// settings-vs-auth perm split relies on: a 0600 (credential) file tightens its
+// parent dir to 0700, while a 0644 (settings) file leaves the dir world/group
+// traversable (0755). The settings.json migration now passes 0o644 so it no
+// longer tightens the agent dir, matching TS migrations.ts:62 which writes
+// settings with default perms; auth.json keeps the 0600/0700 boundary.
+func TestWriteIndentedJSONModeControlsDirBoundary(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("chmod bits are not enforced when running as root; cannot assert dir perms")
+	}
+	authDir := filepath.Join(t.TempDir(), "auth")
+	if err := writeIndentedJSON(filepath.Join(authDir, "auth.json"), map[string]string{"k": "v"}, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if perm := mustStatPerm(t, authDir); perm != 0o700 {
+		t.Fatalf("0600 file should yield a 0700 dir boundary, got %o", perm)
+	}
+
+	settingsDir := filepath.Join(t.TempDir(), "settings")
+	if err := writeIndentedJSON(filepath.Join(settingsDir, "settings.json"), map[string]string{"k": "v"}, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if perm := mustStatPerm(t, settingsDir); perm == 0o700 {
+		t.Fatalf("0644 settings file must not tighten the dir to 0700, got %o", perm)
+	}
+}
+
+func mustStatPerm(t *testing.T, path string) os.FileMode {
+	t.Helper()
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return info.Mode().Perm()
 }
 
 func TestRunMigrationsSessionAndExtensions(t *testing.T) {

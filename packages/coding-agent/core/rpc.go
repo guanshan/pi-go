@@ -82,17 +82,32 @@ type rpcCommand struct {
 	Success            *bool             `json:"success,omitempty"`
 	Data               json.RawMessage   `json:"data,omitempty"`
 	Error              string            `json:"error,omitempty"`
+	// Extension UI response fields (rpc-types.ts RpcExtensionUIResponse). The
+	// host echoes the request id and exactly one of value/confirmed/cancelled.
+	Value     string `json:"value,omitempty"`
+	Confirmed *bool  `json:"confirmed,omitempty"`
+	Cancelled bool   `json:"cancelled,omitempty"`
+}
+
+// rpcPendingUI tracks one in-flight extension UI request. The method is retained
+// so an incoming extension_ui_response (which carries only value/confirmed/
+// cancelled, per rpc-types.ts) can be mapped back to the result shape the
+// extension (node bridge) expects: a string for select/input, a bool for
+// confirm.
+type rpcPendingUI struct {
+	method string
+	ch     chan extensionUIResult
 }
 
 type rpcUIBroker struct {
 	mu      sync.Mutex
 	nextID  uint64
-	pending map[string]chan extensionUIResult
+	pending map[string]rpcPendingUI
 	writer  *rpcWriter
 }
 
 func newRPCUIBroker(writer *rpcWriter) *rpcUIBroker {
-	return &rpcUIBroker{pending: map[string]chan extensionUIResult{}, writer: writer}
+	return &rpcUIBroker{pending: map[string]rpcPendingUI{}, writer: writer}
 }
 
 func (b *rpcUIBroker) handle(ctx context.Context, method string, params json.RawMessage) (json.RawMessage, error) {
@@ -108,19 +123,16 @@ func (b *rpcUIBroker) handle(ctx context.Context, method string, params json.Raw
 	var ch chan extensionUIResult
 	if method != "notify" {
 		ch = make(chan extensionUIResult, 1)
-		b.pending[uiID] = ch
+		b.pending[uiID] = rpcPendingUI{method: method, ch: ch}
 	}
 	b.mu.Unlock()
 
-	payload := map[string]any{
-		"type":   "ui_request",
-		"uiId":   uiID,
-		"method": method,
-		"params": params,
-	}
-	if len(params) == 0 {
-		payload["params"] = map[string]any{}
-	}
+	// Emit the TS host-facing shape (rpc-types.ts RpcExtensionUIRequest):
+	// {type:"extension_ui_request", id, method, ...flattened method-specific
+	// fields}. The internal node-bridge field names (message/choices/detail/
+	// options/level) are remapped to the wire fields (title/options/placeholder/
+	// notifyType) so the host sees the same protocol as TS.
+	payload := flattenExtensionUIRequest(uiID, method, params)
 	b.writer.writeLine(payload)
 	if method == "notify" {
 		return json.RawMessage("null"), nil
@@ -137,12 +149,36 @@ func (b *rpcUIBroker) handle(ctx context.Context, method string, params json.Raw
 	}
 }
 
+// resolveExtensionUIResponse maps a host-sent extension_ui_response (value /
+// confirmed / cancelled, per rpc-types.ts) to the result the extension bridge
+// expects for the originating method, then resolves the pending request. It
+// returns false when the id is unknown.
+func (b *rpcUIBroker) resolveExtensionUIResponse(id string, cmd rpcCommand) bool {
+	if b == nil {
+		return false
+	}
+	b.mu.Lock()
+	pending, ok := b.pending[id]
+	if ok {
+		delete(b.pending, id)
+	}
+	b.mu.Unlock()
+	if !ok {
+		return false
+	}
+	result, err := mapExtensionUIResult(pending.method, cmd)
+	pending.ch <- extensionUIResult{Result: result, Err: err}
+	return true
+}
+
+// respond resolves a legacy ui_response carrying the raw result directly (the
+// Go-only transition shape). The TS-faithful path is resolveExtensionUIResponse.
 func (b *rpcUIBroker) respond(uiID string, result json.RawMessage, err error) bool {
 	if b == nil {
 		return false
 	}
 	b.mu.Lock()
-	ch, ok := b.pending[uiID]
+	pending, ok := b.pending[uiID]
 	if ok {
 		delete(b.pending, uiID)
 	}
@@ -150,8 +186,105 @@ func (b *rpcUIBroker) respond(uiID string, result json.RawMessage, err error) bo
 	if !ok {
 		return false
 	}
-	ch <- extensionUIResult{Result: result, Err: err}
+	pending.ch <- extensionUIResult{Result: result, Err: err}
 	return true
+}
+
+// flattenExtensionUIRequest builds the host-facing extension_ui_request, mapping
+// the internal node-bridge params (message/choices/detail/options/level) onto
+// the TS wire fields (rpc-types.ts RpcExtensionUIRequest).
+func flattenExtensionUIRequest(id, method string, params json.RawMessage) map[string]any {
+	var p struct {
+		Message string          `json:"message"`
+		Choices []string        `json:"choices"`
+		Detail  string          `json:"detail"`
+		Level   string          `json:"level"`
+		Options json.RawMessage `json:"options"`
+		Timeout *int            `json:"timeout"`
+	}
+	if len(params) > 0 {
+		_ = json.Unmarshal(params, &p)
+	}
+	out := map[string]any{"type": "extension_ui_request", "id": id, "method": method}
+	switch method {
+	case "select":
+		out["title"] = p.Message
+		out["options"] = p.Choices
+		if p.Timeout != nil {
+			out["timeout"] = *p.Timeout
+		}
+	case "confirm":
+		out["title"] = p.Message
+		out["message"] = p.Detail
+		if p.Timeout != nil {
+			out["timeout"] = *p.Timeout
+		}
+	case "input":
+		out["title"] = p.Message
+		if placeholder := extractInputPlaceholder(p.Options); placeholder != "" {
+			out["placeholder"] = placeholder
+		}
+		if p.Timeout != nil {
+			out["timeout"] = *p.Timeout
+		}
+	case "notify":
+		out["message"] = p.Message
+		if p.Level != "" {
+			out["notifyType"] = p.Level
+		}
+	default:
+		// Unknown methods forward their params verbatim so future host-facing
+		// methods are not silently dropped.
+		if len(params) > 0 {
+			var extra map[string]any
+			if json.Unmarshal(params, &extra) == nil {
+				for k, v := range extra {
+					out[k] = v
+				}
+			}
+		}
+	}
+	return out
+}
+
+func extractInputPlaceholder(options json.RawMessage) string {
+	if len(options) == 0 {
+		return ""
+	}
+	var o struct {
+		Placeholder string `json:"placeholder"`
+	}
+	_ = json.Unmarshal(options, &o)
+	return o.Placeholder
+}
+
+// mapExtensionUIResult converts a host extension_ui_response into the result the
+// extension bridge expects, mirroring the TS createDialogPromise parseResponse
+// callbacks: select/input -> value (undefined when cancelled), confirm ->
+// confirmed (false when cancelled).
+func mapExtensionUIResult(method string, cmd rpcCommand) (json.RawMessage, error) {
+	if cmd.Cancelled {
+		switch method {
+		case "confirm":
+			return json.RawMessage("false"), nil
+		default:
+			return json.RawMessage("null"), nil
+		}
+	}
+	switch method {
+	case "confirm":
+		if cmd.Confirmed != nil && *cmd.Confirmed {
+			return json.RawMessage("true"), nil
+		}
+		return json.RawMessage("false"), nil
+	default:
+		// select / input resolve to the typed value string.
+		raw, err := json.Marshal(cmd.Value)
+		if err != nil {
+			return json.RawMessage("null"), nil
+		}
+		return raw, nil
+	}
 }
 
 func RunRPC(ctx context.Context, runtime *AgentSessionRuntime, in io.Reader, out io.Writer) error {
@@ -213,6 +346,19 @@ func handleRPCCommand(ctx context.Context, runtime *AgentSessionRuntime, cmd rpc
 	}
 	sink := func(event ai.Event) { w.writeLine(event) }
 	switch cmd.Type {
+	case "extension_ui_response":
+		// TS host-facing response (rpc-types.ts RpcExtensionUIResponse):
+		// {type:"extension_ui_response", id, value|confirmed|cancelled}. The id is
+		// the request id echoed back; map it to the internal pending request and
+		// translate value/confirmed/cancelled into the extension's result shape.
+		id, _ := cmd.ID.(string)
+		if strings.TrimSpace(id) == "" {
+			return fmt.Errorf("id is required")
+		}
+		if !uiBroker.resolveExtensionUIResponse(id, cmd) {
+			return fmt.Errorf("unknown extension UI id: %s", id)
+		}
+		return nil
 	case "ui_response":
 		if strings.TrimSpace(cmd.UIID) == "" {
 			return fmt.Errorf("uiId is required")

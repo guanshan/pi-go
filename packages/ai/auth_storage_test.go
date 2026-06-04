@@ -113,8 +113,11 @@ func TestAuthStorageReadsObjectCredentialsAndEnvFallback(t *testing.T) {
 	}
 
 	t.Setenv("CUSTOM_API_KEY", "env-key")
-	if got := auth.APIKey(Model{Provider: "custom"}); got != "env-key" {
-		t.Fatalf("env key=%q", got)
+	if got := auth.APIKey(Model{Provider: "custom"}); got != "" {
+		t.Fatalf("implicit custom env key=%q, want empty", got)
+	}
+	if got := auth.APIKey(Model{Provider: "custom", EnvKey: "CUSTOM_API_KEY"}); got != "env-key" {
+		t.Fatalf("explicit model env key=%q", got)
 	}
 }
 
@@ -209,8 +212,11 @@ func TestProviderEnvKeysDefaultFallback(t *testing.T) {
 			t.Fatalf("%s env keys=%#v", provider, got)
 		}
 	}
-	if got := ProviderEnvKeys("my-provider"); len(got) != 1 || got[0] != "MY_PROVIDER_API_KEY" {
-		t.Fatalf("env keys=%#v", got)
+	// Unknown providers enumerate NO env keys, mirroring TS findEnvKeys returning
+	// undefined. They also do not implicitly resolve a synthesized env var; custom
+	// providers must declare an explicit model EnvKey to opt into one.
+	if got := ProviderEnvKeys("my-provider"); len(got) != 0 {
+		t.Fatalf("unknown provider env keys=%#v, want empty", got)
 	}
 	if got := ProviderEnvKeys(""); len(got) != 0 {
 		t.Fatalf("empty provider env keys=%#v", got)

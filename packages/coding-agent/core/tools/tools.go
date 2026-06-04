@@ -9,7 +9,7 @@ import (
 
 func BuiltinTools(cwd string, options BuiltinToolOptions) ToolSet {
 	return ToolSet{
-		"read":  ReadTool{CWD: cwd, AutoResize: options.AutoResize},
+		"read":  ReadTool{CWD: cwd, AutoResize: options.AutoResize, ModelSupportsImages: options.ModelSupportsImages},
 		"bash":  BashTool{CWD: cwd, ShellPath: options.ShellPath, CommandPrefix: options.CommandPrefix, BinDir: options.BinDir},
 		"edit":  EditTool{CWD: cwd},
 		"write": WriteTool{CWD: cwd},

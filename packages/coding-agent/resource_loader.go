@@ -1,6 +1,7 @@
 package codingagent
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -48,11 +49,12 @@ type PromptsResult struct {
 }
 
 type Theme struct {
-	Name       string     `json:"name"`
-	Path       string     `json:"path"`
-	SourcePath string     `json:"sourcePath,omitempty"`
-	Raw        string     `json:"raw,omitempty"`
-	SourceInfo SourceInfo `json:"sourceInfo,omitempty"`
+	Name       string         `json:"name"`
+	Path       string         `json:"path"`
+	SourcePath string         `json:"sourcePath,omitempty"`
+	Raw        string         `json:"raw,omitempty"`
+	Config     map[string]any `json:"config,omitempty"`
+	SourceInfo SourceInfo     `json:"sourceInfo,omitempty"`
 }
 
 type ThemesResult struct {
@@ -633,6 +635,13 @@ func loadThemes(paths []string) []Theme {
 		theme := Theme{Name: strings.TrimSuffix(filepath.Base(path), filepath.Ext(path)), Path: path, SourcePath: path}
 		if raw, err := os.ReadFile(path); err == nil {
 			theme.Raw = string(raw)
+			var config map[string]any
+			if json.Unmarshal(raw, &config) == nil {
+				theme.Config = config
+				if name, ok := config["name"].(string); ok && strings.TrimSpace(name) != "" {
+					theme.Name = strings.TrimSpace(name)
+				}
+			}
 		}
 		out = append(out, theme)
 	}

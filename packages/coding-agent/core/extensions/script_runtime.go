@@ -774,7 +774,19 @@ const api = {
 	},
 	events: {
 		on(event, handler) { return api.on(event, handler); },
-		emit() {},
+		emit(event, payload = {}) {
+			const key = String(event ?? "").trim();
+			if (!key) return payload;
+			for (const handler of eventHandlers.get(key) ?? []) {
+				try {
+					const result = handler(payload, extensionContext(payload));
+					if (result && typeof result === "object") Object.assign(payload, result);
+				} catch (error) {
+					console.warn("pi.events.emit handler failed: " + (error?.message ?? String(error)));
+				}
+			}
+			return payload;
+		},
 	},
 	// ctx.ui requests are routed to the host over the bridge (ui_request ->
 	// ui_response). When the host bound no handler (truly headless) the host
@@ -794,11 +806,27 @@ const api = {
 	},
 };
 
-function extensionContext() {
+function extensionContext(payload = {}) {
+	const branch = payload.branchEntries ?? payload.BranchEntries ?? payload.entries ?? payload.Entries ?? [];
+	const systemPrompt = payload.systemPrompt ?? payload.SystemPrompt ?? "";
 	return {
+		cwd: process.cwd(),
 		hasUI: hasUIState,
 		ui: api.ui,
-		sessionManager: { getBranch() { return []; } },
+		model: payload.model ?? payload.Model ?? null,
+		modelRegistry: {
+			list() { return []; },
+			get() { return undefined; },
+			find() { return undefined; },
+		},
+		isIdle() { return true; },
+		signal: payload.signal ?? payload.Signal,
+		abort() { return false; },
+		compact() { return Promise.resolve(null); },
+		getSystemPrompt() { return String(systemPrompt ?? ""); },
+		sessionManager: {
+			getBranch() { return Array.isArray(branch) ? branch : []; },
+		},
 	};
 }
 
@@ -861,7 +889,7 @@ rl.on("line", async (line) => {
 			if (request.type === "emit") {
 				const payload = request.payload ?? {};
 				for (const handler of eventHandlers.get(request.event) ?? []) {
-					const result = await handler(payload, extensionContext());
+					const result = await handler(payload, extensionContext(payload));
 					if (result && typeof result === "object") Object.assign(payload, result);
 				}
 				delete payload.signal;

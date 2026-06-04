@@ -20,17 +20,19 @@ import (
 
 func (GrepTool) Name() string { return "grep" }
 func (GrepTool) Description() string {
-	return "Search file contents for a regex or literal pattern. Respects .gitignore."
+	// Byte-exact with grep.ts:131 (DEFAULT_LIMIT=100, DEFAULT_MAX_BYTES/1024=50,
+	// GREP_MAX_LINE_LENGTH=500).
+	return "Search file contents for a pattern. Returns matching lines with file paths and line numbers. Respects .gitignore. Output is truncated to 100 matches or 50KB (whichever is hit first). Long lines are truncated to 500 chars."
 }
 func (GrepTool) Schema() map[string]any {
 	return objectSchema(map[string]any{
-		"pattern":    stringSchema("Search pattern"),
-		"path":       stringSchema("Directory or file to search"),
-		"glob":       stringSchema("Glob filter, e.g. *.ts or **/*.spec.ts"),
-		"ignoreCase": boolSchema("Case-insensitive search"),
-		"literal":    boolSchema("Treat pattern as a literal string"),
-		"context":    numberSchema("Context lines before and after"),
-		"limit":      numberSchema("Maximum matches"),
+		"pattern":    stringSchema("Search pattern (regex or literal string)"),
+		"path":       stringSchema("Directory or file to search (default: current directory)"),
+		"glob":       stringSchema("Filter files by glob pattern, e.g. '*.ts' or '**/*.spec.ts'"),
+		"ignoreCase": boolSchema("Case-insensitive search (default: false)"),
+		"literal":    boolSchema("Treat pattern as literal string instead of regex (default: false)"),
+		"context":    numberSchema("Number of lines to show before and after each match (default: 0)"),
+		"limit":      numberSchema("Maximum number of matches to return (default: 100)"),
 	}, []string{"pattern"})
 }
 func (t GrepTool) Execute(ctx context.Context, raw json.RawMessage, _ ToolUpdate) ai.ToolResult {

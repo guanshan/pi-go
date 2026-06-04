@@ -447,6 +447,9 @@ func (e *LocalExecutionEnv) Exec(ctx context.Context, command string, opts ExecO
 	cmd.Dir = cwd
 	cmd.Env = e.shellEnvironment(opts.Env)
 	configureProcessGroup(cmd)
+	// Suppress the console window Windows would otherwise flash for each spawned
+	// shell child (no-op on non-Windows), mirroring TS's windowsHide: true.
+	hideWindow(cmd)
 	cmd.Cancel = func() error {
 		if cmd.Process != nil {
 			killProcessTree(cmd.Process.Pid)
@@ -529,14 +532,21 @@ func (e *LocalExecutionEnv) shellConfig() (string, []string, error) {
 		return "", nil, &ExecutionError{Code: ExecErrShellUnavailable, Err: fmt.Errorf("custom shell path not found: %s", e.shellPath)}
 	}
 	if runtime.GOOS == "windows" {
-		for _, candidate := range []string{
-			filepath.Join(os.Getenv("ProgramFiles"), "Git", "bin", "bash.exe"),
-			filepath.Join(os.Getenv("ProgramFiles(x86)"), "Git", "bin", "bash.exe"),
-		} {
-			if candidate != "" {
-				if _, err := os.Stat(candidate); err == nil {
-					return candidate, []string{"-c"}, nil
-				}
+		// Only build a candidate when the program-files env var is non-empty.
+		// filepath.Join("", "Git", "bin", "bash.exe") yields the RELATIVE path
+		// "Git/bin/bash.exe", so the old `candidate != ""` guard never tripped and
+		// os.Stat would resolve it against the process CWD. Mirror TS's existence
+		// guard (and shell_config.go:windowsGitBashPaths) by skipping the var
+		// entirely when unset, keeping only absolute candidates.
+		var candidates []string
+		for _, envVar := range []string{"ProgramFiles", "ProgramFiles(x86)"} {
+			if base := os.Getenv(envVar); base != "" {
+				candidates = append(candidates, filepath.Join(base, "Git", "bin", "bash.exe"))
+			}
+		}
+		for _, candidate := range candidates {
+			if _, err := os.Stat(candidate); err == nil {
+				return candidate, []string{"-c"}, nil
 			}
 		}
 		if bash, err := exec.LookPath("bash.exe"); err == nil {

@@ -88,6 +88,19 @@ process and communicates over stdin/stdout with newline-delimited JSON-RPC
   `session_before_compact`, …) and requests (`execute_tool`, `before_agent_start`).
 - The extension replies with registrations (tools/commands), transforms, and
   hook results. UI requests reuse the existing `extension_ui_request` shape.
+
+> **RPC-mode extension UI wire shape.** When pi runs in `--mode rpc`, an
+> extension's `ctx.ui.*` call is surfaced to the controlling host as a single
+> flattened line `{"type":"extension_ui_request","id":<id>,"method":<m>,…}` with
+> the method-specific fields inlined (`select` → `title`/`options`, `confirm` →
+> `title`/`message`, `input` → `title`/`placeholder`, `notify` →
+> `message`/`notifyType`). The host answers with
+> `{"type":"extension_ui_response","id":<id>, …}` carrying exactly one of
+> `value` (select/input), `confirmed` (confirm), or `cancelled:true`. This
+> matches the TS `RpcExtensionUIRequest`/`RpcExtensionUIResponse` types in
+> `rpc-types.ts`. (The internal host↔node-subprocess bridge keeps its own
+> `ui_request`/`ui_response` framing with `uiId`/`ok`/`result`; that seam is
+> distinct from the host-facing RPC protocol.)
 - **Pros:** language-agnostic — users can write extensions in **TypeScript/Node,
   Python, or anything** that speaks the protocol, so existing TS extensions can
   run under their own Node/Bun with the real `@earendil-works/*` packages

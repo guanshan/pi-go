@@ -23,7 +23,7 @@ func killProcessGroup(cmd *exec.Cmd) {
 	if pid <= 0 {
 		return
 	}
-	_ = exec.Command("taskkill", "/F", "/T", "/PID", fmt.Sprint(pid)).Run()
+	runTaskkillTree(pid)
 	// Fall back to killing the direct child in case taskkill is unavailable.
 	_ = cmd.Process.Kill()
 }
@@ -34,7 +34,17 @@ func killProcessTreeByPID(pid int) {
 	if pid <= 0 {
 		return
 	}
-	_ = exec.Command("taskkill", "/F", "/T", "/PID", fmt.Sprint(pid)).Run()
+	runTaskkillTree(pid)
+}
+
+// runTaskkillTree force-kills the whole process tree rooted at pid via taskkill,
+// suppressing the console window each invocation would otherwise flash
+// (hideWindow mirrors TS's windowsHide on its taskkill spawn). stdio is left at
+// taskkill's defaults; only the window-suppression flag is added.
+func runTaskkillTree(pid int) {
+	cmd := exec.Command("taskkill", "/F", "/T", "/PID", fmt.Sprint(pid))
+	hideWindow(cmd)
+	_ = cmd.Run()
 }
 
 func processGroupStillAlive(int) bool {

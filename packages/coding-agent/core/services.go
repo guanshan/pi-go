@@ -151,7 +151,7 @@ func CreateAgentSessionFromServices(ctx context.Context, options CreateAgentSess
 			thinking = services.SettingsManager.DefaultThinkingLevel()
 		}
 	}
-	tools := toolSetFromServiceOptions(services.Cwd, services.SettingsManager, options.NoTools, options.Tools, options.ExcludeTools, services.ExtensionRuntime, options.CustomTools)
+	tools := toolSetFromServiceOptions(services.Cwd, services.SettingsManager, options.NoTools, options.Tools, options.ExcludeTools, services.ExtensionRuntime, options.CustomTools, model)
 	systemPrompt := services.ResourceLoader.BuildSystemPrompt(cli.Args{}, ToolPromptInfoFor(tools))
 	agentSession := NewAgentSession(session, services.SettingsManager, services.ModelRegistry, services.ResourceLoader, model, thinking, tools, systemPrompt)
 	agentSession.extensionRuntime = services.ExtensionRuntime
@@ -258,11 +258,11 @@ func diagnosticType(value string) DiagnosticType {
 	}
 }
 
-func toolSetFromServiceOptions(cwd string, settings *SettingsManager, noTools NoToolsMode, names, excludeNames []string, runtime *coreext.Runner, custom ToolSet) ToolSet {
+func toolSetFromServiceOptions(cwd string, settings *SettingsManager, noTools NoToolsMode, names, excludeNames []string, runtime *coreext.Runner, custom ToolSet, model ai.Model) ToolSet {
 	if noTools == NoToolsAll {
 		return ToolSet{}
 	}
-	builtins := BuiltinTools(cwd, settings)
+	builtins := BuiltinToolsForModel(cwd, settings, ai.SupportsInput(model, "image"))
 	extensions := extensionToolSet(runtime)
 	excluded := make(map[string]bool, len(excludeNames))
 	for _, name := range excludeNames {

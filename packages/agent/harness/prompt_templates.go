@@ -77,7 +77,9 @@ func loadPromptTemplatesFromDir(ctx context.Context, env harnessenv.ExecutionEnv
 	if err != nil {
 		return PromptTemplateLoadResult{Diagnostics: []PromptTemplateDiagnostic{promptTemplateDiagnostic("list_failed", err, dir)}}
 	}
-	sort.Slice(entries, func(i, j int) bool { return entries[i].Name < entries[j].Name })
+	// TS orders entries with entries.sort((a, b) => a.name.localeCompare(b.name))
+	// (prompt-templates.ts:113); use the ICU root collator instead of byte order.
+	sort.SliceStable(entries, func(i, j int) bool { return localeCompare(entries[i].Name, entries[j].Name) < 0 })
 	var result PromptTemplateLoadResult
 	for _, entry := range entries {
 		kind, ok := resolvePromptTemplateKind(ctx, env, entry, &result.Diagnostics)
@@ -105,9 +107,13 @@ func loadPromptTemplateFromFile(ctx context.Context, env harnessenv.ExecutionEnv
 	description, _ := frontmatter["description"].(string)
 	if strings.TrimSpace(description) == "" {
 		if firstLine := firstNonEmptyLine(body); firstLine != "" {
-			description = firstLine
-			if len(description) > 60 {
-				description = description[:60] + "..."
+			// TS: description = firstLine.slice(0, 60); if (firstLine.length > 60)
+			// description += "..." (prompt-templates.ts:154-155). The slice and the
+			// length test both use UTF-16 code units, and the "..." test is against
+			// the ORIGINAL firstLine length (not the sliced value).
+			description = sliceUTF16(firstLine, 60)
+			if utf16Len(firstLine) > 60 {
+				description += "..."
 			}
 		}
 	}

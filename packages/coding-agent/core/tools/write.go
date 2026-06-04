@@ -12,11 +12,12 @@ import (
 
 func (WriteTool) Name() string { return "write" }
 func (WriteTool) Description() string {
-	return "Create or overwrite a file, creating parent directories automatically."
+	// Byte-exact with write.ts:189.
+	return "Write content to a file. Creates the file if it doesn't exist, overwrites if it does. Automatically creates parent directories."
 }
 func (WriteTool) Schema() map[string]any {
 	return objectSchema(map[string]any{
-		"path":    stringSchema("Path to the file to write"),
+		"path":    stringSchema("Path to the file to write (relative or absolute)"),
 		"content": stringSchema("Content to write to the file"),
 	}, []string{"path", "content"})
 }

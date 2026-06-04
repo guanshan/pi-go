@@ -45,7 +45,11 @@ func ResolveShellConfig(customShellPath string) (ShellConfig, error) {
 }
 
 func ShellCommand(config ShellConfig, command string) *exec.Cmd {
-	return exec.Command(config.Shell, shellCommandArgs(config, command)...)
+	cmd := exec.Command(config.Shell, shellCommandArgs(config, command)...)
+	// Suppress the Windows console window for every shell command, mirroring TS's
+	// windowsHide: true. Centralized here so bash.go and session_api.go inherit it.
+	hideWindow(cmd)
+	return cmd
 }
 
 // ShellEnv returns the process environment with the agent bin directory
@@ -101,7 +105,9 @@ func ShellEnv(binDir string) []string {
 }
 
 func ShellCommandContext(ctx context.Context, config ShellConfig, command string) *exec.Cmd {
-	return exec.CommandContext(ctx, config.Shell, shellCommandArgs(config, command)...)
+	cmd := exec.CommandContext(ctx, config.Shell, shellCommandArgs(config, command)...)
+	hideWindow(cmd)
+	return cmd
 }
 
 // ConfigureTreeKill makes cmd run in its own process group (where the platform
