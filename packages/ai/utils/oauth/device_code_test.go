@@ -9,9 +9,8 @@ import (
 // fakeClock drives PollDeviceCodeFlow deterministically: Now() advances by the
 // requested sleep duration so the deadline logic is exercised without real time.
 type fakeClock struct {
-	now    time.Time
-	slept  []time.Duration
-	cancel context.CancelFunc
+	now   time.Time
+	slept []time.Duration
 }
 
 func (f *fakeClock) Now() time.Time { return f.now }

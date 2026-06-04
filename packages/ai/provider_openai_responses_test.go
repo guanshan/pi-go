@@ -809,7 +809,7 @@ func TestOpenAICodexResponsesSSEHeaderTimeout(t *testing.T) {
 	for range stream.Events() {
 	}
 	message := stream.Result()
-	if message.StopReason != "error" || !strings.Contains(message.ErrorMessage, "Codex SSE response headers timed out after 10ms") {
+	if message.StopReason != "error" || !strings.Contains(message.ErrorMessage, "codex SSE response headers timed out after 10ms") {
 		t.Fatalf("message=%#v", message)
 	}
 }

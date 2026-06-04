@@ -114,7 +114,7 @@ func TestLsLocaleSort(t *testing.T) {
 	apple := strings.Index(out, "apple")
 	banana := strings.Index(out, "Banana")
 	cherry := strings.Index(out, "Cherry")
-	if !(apple < banana && banana < cherry) {
+	if apple >= banana || banana >= cherry {
 		t.Fatalf("expected case-insensitive order apple<Banana<Cherry, got %q", out)
 	}
 }

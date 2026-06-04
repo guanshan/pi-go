@@ -472,7 +472,7 @@ func appendFauxChunk(block *ContentBlock, blockType, chunk string) {
 	case "thinking":
 		block.Thinking += chunk
 	case "toolCall":
-		block.Arguments = append(json.RawMessage(block.Arguments), []byte(chunk)...)
+		block.Arguments = append(block.Arguments, []byte(chunk)...)
 	default:
 		block.Text += chunk
 	}

@@ -128,7 +128,7 @@ func doOpenAICodexResponsesHTTPRequest(ctx context.Context, req ChatRequest, url
 	if err != nil {
 		cancel()
 		if timedOut.Load() && ctx.Err() == nil {
-			return nil, nil, fmt.Errorf("Codex SSE response headers timed out after %dms", headerTimeout.Milliseconds())
+			return nil, nil, fmt.Errorf("codex SSE response headers timed out after %dms", headerTimeout.Milliseconds())
 		}
 		return nil, nil, err
 	}
