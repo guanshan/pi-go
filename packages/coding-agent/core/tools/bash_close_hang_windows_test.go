@@ -4,6 +4,7 @@ package tools
 
 import (
 	"context"
+	"os"
 	"os/exec"
 	"testing"
 	"time"
@@ -25,7 +26,7 @@ func TestBashCloseHangDetachedChildReturnsPromptly(t *testing.T) {
 	if _, err := exec.LookPath("cmd"); err != nil {
 		t.Skip("cmd.exe not available")
 	}
-	tool := BashTool{CWD: t.TempDir()}
+	tool := BashTool{CWD: os.TempDir()}
 
 	// `start /b` launches a detached child (a long ping used as a portable sleep)
 	// that inherits the shell's stdio handles, then the shell exits immediately.

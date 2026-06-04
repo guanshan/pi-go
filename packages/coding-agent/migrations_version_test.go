@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 
 	cautils "github.com/guanshan/pi-go/packages/coding-agent/utils"
@@ -96,7 +97,7 @@ func TestMigrateAuthToAuthJSON(t *testing.T) {
 		t.Fatalf("apiKeys not removed: %s", settings)
 	}
 	// auth.json keeps the 0600 credential boundary (TS migrations.ts:71).
-	if info, err := os.Stat(filepath.Join(agentDir, "auth.json")); err == nil {
+	if info, err := os.Stat(filepath.Join(agentDir, "auth.json")); err == nil && runtime.GOOS != "windows" {
 		if perm := info.Mode().Perm(); perm&0o077 != 0 && os.Geteuid() != 0 {
 			t.Fatalf("auth.json should be 0600, got %o", perm)
 		}
@@ -110,6 +111,9 @@ func TestMigrateAuthToAuthJSON(t *testing.T) {
 // longer tightens the agent dir, matching TS migrations.ts:62 which writes
 // settings with default perms; auth.json keeps the 0600/0700 boundary.
 func TestWriteIndentedJSONModeControlsDirBoundary(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX file modes not meaningful on Windows")
+	}
 	if os.Geteuid() == 0 {
 		t.Skip("chmod bits are not enforced when running as root; cannot assert dir perms")
 	}
