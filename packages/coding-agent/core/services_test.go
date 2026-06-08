@@ -211,13 +211,32 @@ func TestCreateAgentSessionFromServicesBindsScriptExtensionContext(t *testing.T)
 	}
 	result := tool.Execute(context.Background(), json.RawMessage(`{}`), nil)
 	got := ai.MessageText(ai.ToolResultMessage{Content: result.Content})
-	for _, want := range []string{`"cwd":"` + cwd + `"`, `"mode":"print"`, `"model":"faux/faux"`, `"systemPrompt":"custom system prompt`, `"branch":1`, `"models":1`, `"idle":true`} {
-		if !strings.Contains(got, want) {
-			t.Fatalf("context output missing %s in %s", want, got)
-		}
+	var probe struct {
+		CWD          string `json:"cwd"`
+		Mode         string `json:"mode"`
+		Model        string `json:"model"`
+		SystemPrompt string `json:"systemPrompt"`
+		Branch       int    `json:"branch"`
+		Leaf         string `json:"leaf"`
+		Models       int    `json:"models"`
+		Idle         bool   `json:"idle"`
 	}
-	if strings.Contains(got, `"leaf":""`) {
-		t.Fatalf("expected non-empty leaf id in %s", got)
+	if err := json.Unmarshal([]byte(got), &probe); err != nil {
+		t.Fatalf("context output is not JSON: %v (%s)", err, got)
+	}
+	if probe.CWD != cwd ||
+		probe.Mode != "print" ||
+		probe.Model != "faux/faux" ||
+		probe.Branch != 1 ||
+		probe.Models != 1 ||
+		!probe.Idle {
+		t.Fatalf("context output = %#v, raw %s", probe, got)
+	}
+	if !strings.Contains(probe.SystemPrompt, "custom system prompt") {
+		t.Fatalf("context output missing custom system prompt: %#v, raw %s", probe, got)
+	}
+	if probe.Leaf == "" {
+		t.Fatalf("expected non-empty leaf id: %#v, raw %s", probe, got)
 	}
 }
 

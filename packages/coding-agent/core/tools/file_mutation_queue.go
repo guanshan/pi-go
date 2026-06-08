@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/guanshan/pi-go/packages/ai"
 )
@@ -134,11 +135,27 @@ func atomicWriteFile(path string, data []byte, perm os.FileMode) error {
 	if err := tmp.Close(); err != nil {
 		return err
 	}
-	if err := replaceFile(tmpName, target); err != nil {
+	if err := replaceFileWithRetry(tmpName, target); err != nil {
 		return err
 	}
 	committed = true
 	return nil
+}
+
+func replaceFileWithRetry(oldpath, newpath string) error {
+	const attempts = 8
+	var err error
+	for attempt := 0; attempt < attempts; attempt++ {
+		err = replaceFile(oldpath, newpath)
+		if err == nil {
+			return nil
+		}
+		if runtime.GOOS != "windows" || !isWriteFallbackError(err) {
+			return err
+		}
+		time.Sleep(time.Duration(attempt+1) * 10 * time.Millisecond)
+	}
+	return err
 }
 
 func fileWriteMode(path string, fallback os.FileMode) os.FileMode {

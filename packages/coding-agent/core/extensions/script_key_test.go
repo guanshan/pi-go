@@ -507,10 +507,54 @@ export default function (pi) {
 		t.Fatalf("execute: %v", err)
 	}
 	got := ai.MessageText(ai.ToolResultMessage{Content: result.Content})
-	for _, want := range []string{`"cwd":"` + dir + `"`, `"mode":"tui"`, `"hasUI":false`, `"hasModelRegistry":true`, `"model":"faux/faux"`, `"allModels":2`, `"availableModels":1`, `"list":1`, `"found":true`, `"hasAuth":true`, `"authOK":true`, `"isIdle":false`, `"hasPending":true`, `"abortType":"function"`, `"compactSummary":"compacted"`, `"systemPrompt":"system prompt"`, `"branch":1`, `"entries":2`, `"leaf":"leaf"`} {
-		if !strings.Contains(got, want) {
-			t.Fatalf("context probe missing %s in %s", want, got)
-		}
+	type contextProbe struct {
+		CWD              string `json:"cwd"`
+		Mode             string `json:"mode"`
+		HasUI            bool   `json:"hasUI"`
+		HasModelRegistry bool   `json:"hasModelRegistry"`
+		Model            string `json:"model"`
+		AllModels        int    `json:"allModels"`
+		AvailableModels  int    `json:"availableModels"`
+		List             int    `json:"list"`
+		Found            bool   `json:"found"`
+		HasAuth          bool   `json:"hasAuth"`
+		AuthOK           bool   `json:"authOK"`
+		IsIdle           bool   `json:"isIdle"`
+		HasPending       bool   `json:"hasPending"`
+		AbortType        string `json:"abortType"`
+		CompactSummary   string `json:"compactSummary"`
+		SystemPrompt     string `json:"systemPrompt"`
+		Branch           int    `json:"branch"`
+		Entries          int    `json:"entries"`
+		Leaf             string `json:"leaf"`
+	}
+	var probe contextProbe
+	if err := json.Unmarshal([]byte(got), &probe); err != nil {
+		t.Fatalf("context probe is not JSON: %v (%s)", err, got)
+	}
+	want := contextProbe{
+		CWD:              dir,
+		Mode:             "tui",
+		HasUI:            false,
+		HasModelRegistry: true,
+		Model:            "faux/faux",
+		AllModels:        2,
+		AvailableModels:  1,
+		List:             1,
+		Found:            true,
+		HasAuth:          true,
+		AuthOK:           true,
+		IsIdle:           false,
+		HasPending:       true,
+		AbortType:        "function",
+		CompactSummary:   "compacted",
+		SystemPrompt:     "system prompt",
+		Branch:           1,
+		Entries:          2,
+		Leaf:             "leaf",
+	}
+	if probe != want {
+		t.Fatalf("context probe = %#v, want %#v (raw %s)", probe, want, got)
 	}
 	deadline := time.After(2 * time.Second)
 	for {
