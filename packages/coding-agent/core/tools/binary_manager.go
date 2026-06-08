@@ -247,9 +247,6 @@ func installManagedToolWithLock(ctx context.Context, config managedToolConfig, b
 	return managedToolDownloader(ctx, config, binDir)
 }
 
-// managedToolLock is a held download lock. token uniquely identifies the
-// lock file this process created, so release can avoid deleting a lock that a
-// different process reclaimed after the stale timeout.
 type managedToolLock struct {
 	file  *os.File
 	path  string
@@ -264,7 +261,7 @@ func acquireManagedToolLock(ctx context.Context, lockPath string) (*managedToolL
 			_, _ = fmt.Fprintf(file, "pid=%d\ncreated=%s\ntoken=%s\n", os.Getpid(), time.Now().UTC().Format(time.RFC3339), token)
 			return &managedToolLock{file: file, path: lockPath, token: token}, nil
 		}
-		if !os.IsExist(err) {
+		if !isManagedToolLockContention(err, lockPath) {
 			return nil, err
 		}
 		if info, statErr := os.Stat(lockPath); statErr == nil && time.Since(info.ModTime()) > managedToolLockStaleAfter {
@@ -279,6 +276,17 @@ func acquireManagedToolLock(ctx context.Context, lockPath string) (*managedToolL
 	}
 }
 
+func isManagedToolLockContention(err error, lockPath string) bool {
+	if os.IsExist(err) {
+		return true
+	}
+	if runtime.GOOS != "windows" || !os.IsPermission(err) {
+		return false
+	}
+	info, statErr := os.Stat(lockPath)
+	return statErr == nil && !info.IsDir()
+}
+
 func releaseManagedToolLock(lock *managedToolLock) {
 	if lock == nil {
 		return
@@ -289,25 +297,17 @@ func releaseManagedToolLock(lock *managedToolLock) {
 	if lock.path == "" {
 		return
 	}
-	// Only delete the lock if we still own it. A download that overran the
-	// stale timeout may have had its lock reclaimed and replaced by another
-	// installer; deleting that lock would let a third installer run
-	// concurrently. Leave a foreign lock for its rightful owner to clean up.
 	if data, err := os.ReadFile(lock.path); err == nil && !strings.Contains(string(data), "token="+lock.token) {
 		return
 	}
 	_ = os.Remove(lock.path)
 }
 
-// managedToolLockToken returns a process-unique token written into the lock
-// file so ownership can be verified on release.
 func managedToolLockToken() string {
 	var buf [16]byte
 	if _, err := rand.Read(buf[:]); err == nil {
 		return hex.EncodeToString(buf[:])
 	}
-	// crypto/rand should never fail; fall back to pid+nanos, which is still
-	// unique enough across concurrent installers to scope ownership.
 	return fmt.Sprintf("%d-%d", os.Getpid(), time.Now().UnixNano())
 }
 

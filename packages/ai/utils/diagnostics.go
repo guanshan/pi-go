@@ -47,7 +47,7 @@ func ExtractDiagnosticError(value any) DiagnosticErrorInfo {
 // type carries no useful name (e.g. anonymous types).
 func diagnosticErrorName(err error) string {
 	t := reflect.TypeOf(err)
-	for t != nil && t.Kind() == reflect.Ptr {
+	for t != nil && t.Kind() == reflect.Pointer {
 		t = t.Elem()
 	}
 	if t != nil {
