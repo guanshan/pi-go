@@ -17,6 +17,11 @@ import (
 // the terminal error and wakes every pending request (and future ones) so none
 // block forever on a dead process.
 func (r *scriptRuntime) readLoop(scanner *bufio.Scanner) {
+	defer func() {
+		if r.bridgeCleanup != nil {
+			r.bridgeCleanup()
+		}
+	}()
 	for scanner.Scan() {
 		line := scanner.Bytes()
 		// A server-initiated UI request from the extension (ctx.ui.*) carries

@@ -139,4 +139,3 @@ func asBashExecutionMessage(message ai.Message) (BashExecutionMessage, bool) {
 		}, true
 	}
 }
-

@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	tea "charm.land/bubbletea/v2"
+	"github.com/guanshan/pi-go/packages/ai"
 	coreext "github.com/guanshan/pi-go/packages/coding-agent/core/extensions"
 )
 
@@ -125,6 +126,14 @@ func TestInteractiveExtensionShortcutExecutes(t *testing.T) {
 
 func TestInteractiveExtensionShortcutDoesNotOverrideBuiltInKey(t *testing.T) {
 	runtime := testInteractiveRuntime(t)
+	baseModel := runtime.Session().CurrentModel()
+	altModel := baseModel
+	altModel.ID = baseModel.ID + "-alt"
+	altModel.Name = baseModel.Name + " Alt"
+	runtime.Session().SetScopedModels([]ScopedModel{
+		{Model: baseModel, ThinkingLevel: ai.ThinkingOff},
+		{Model: altModel, ThinkingLevel: ai.ThinkingOff},
+	})
 	api := coreext.NewAPI()
 	called := false
 	api.RegisterShortcut(coreext.ShortcutDefinition{

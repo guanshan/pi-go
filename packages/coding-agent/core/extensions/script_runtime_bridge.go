@@ -6,7 +6,7 @@ import { createInterface } from "node:readline";
 import { pathToFileURL } from "node:url";
 import { inspect } from "node:util";
 
-const extensionPath = process.argv[1];
+const extensionPath = process.argv[process.argv.length - 1];
 const tools = new Map();
 const commands = new Map();
 const shortcuts = new Map();

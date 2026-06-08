@@ -80,11 +80,12 @@ type scriptResponseMessage struct {
 }
 
 type scriptRuntime struct {
-	path   string
-	cmd    *exec.Cmd
-	stdin  io.WriteCloser
-	stderr *syncBuffer
-	nextID int64
+	path          string
+	cmd           *exec.Cmd
+	stdin         io.WriteCloser
+	stderr        *syncBuffer
+	bridgeCleanup func()
+	nextID        int64
 
 	// writeMu serializes concurrent stdin writes (each request emits one JSON
 	// line). It is held only for the duration of the write, never across the
@@ -354,6 +355,27 @@ func unregisterScriptMessageRenderer(api *API, path, customType string) {
 	api.UnregisterMessageRendererSource(customType, path)
 }
 
+func writeScriptRuntimeBridge() (string, func(), error) {
+	file, err := os.CreateTemp("", "pi-script-runtime-*.mjs")
+	if err != nil {
+		return "", nil, err
+	}
+	path := file.Name()
+	cleanup := func() {
+		_ = os.Remove(path)
+	}
+	if _, err := file.WriteString(scriptRuntimeBridge); err != nil {
+		_ = file.Close()
+		cleanup()
+		return "", nil, err
+	}
+	if err := file.Close(); err != nil {
+		cleanup()
+		return "", nil, err
+	}
+	return path, cleanup, nil
+}
+
 func startScriptRuntime(
 	ctx context.Context,
 	path string,
@@ -373,7 +395,11 @@ func startScriptRuntime(
 	if err != nil {
 		return nil, scriptReadyMessage{}, fmt.Errorf("%s: node executable is required to load script extensions", path)
 	}
-	cmd := exec.CommandContext(ctx, node, "--input-type=module", "--eval", scriptRuntimeBridge, "--", path)
+	bridgePath, bridgeCleanup, err := writeScriptRuntimeBridge()
+	if err != nil {
+		return nil, scriptReadyMessage{}, fmt.Errorf("%s: create script bridge: %w", path, err)
+	}
+	cmd := exec.CommandContext(ctx, node, bridgePath, path)
 	cmd.Dir = filepath.Dir(path)
 	env := os.Environ()
 	// Seed extension CLI flag values before the factory runs so getFlag resolves
@@ -392,32 +418,38 @@ func startScriptRuntime(
 	cmd.Env = env
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
+		bridgeCleanup()
 		return nil, scriptReadyMessage{}, fmt.Errorf("%s: %w", path, err)
 	}
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
+		bridgeCleanup()
 		return nil, scriptReadyMessage{}, fmt.Errorf("%s: %w", path, err)
 	}
 	stderr := &syncBuffer{}
 	cmd.Stderr = stderr
 	if err := cmd.Start(); err != nil {
+		bridgeCleanup()
 		return nil, scriptReadyMessage{}, fmt.Errorf("%s: %w", path, err)
 	}
 	scanner := bufio.NewScanner(stdout)
 	scanner.Buffer(make([]byte, 0, 64*1024), 10*1024*1024)
 	if !scanner.Scan() {
 		_ = cmd.Wait()
+		bridgeCleanup()
 		return nil, scriptReadyMessage{}, fmt.Errorf("%s: extension loader exited before ready%s", path, scriptStderrSuffix(stderr))
 	}
 	var ready scriptReadyMessage
 	if err := json.Unmarshal(scanner.Bytes(), &ready); err != nil {
 		_ = cmd.Process.Kill()
 		_ = cmd.Wait()
+		bridgeCleanup()
 		return nil, scriptReadyMessage{}, fmt.Errorf("%s: invalid extension loader response: %w", path, err)
 	}
 	if ready.Type == "error" || ready.Error != "" {
 		_ = cmd.Process.Kill()
 		_ = cmd.Wait()
+		bridgeCleanup()
 		return nil, scriptReadyMessage{}, fmt.Errorf("%s: %s%s", path, firstNonEmpty(ready.Error, "extension failed to load"), scriptStderrSuffix(stderr))
 	}
 	// Derive a session-scoped context so cancelling the parent (or Shutdown)
@@ -428,6 +460,7 @@ func startScriptRuntime(
 		cmd:             cmd,
 		stdin:           stdin,
 		stderr:          stderr,
+		bridgeCleanup:   bridgeCleanup,
 		pending:         make(map[int64]chan scriptResponseMessage),
 		providerChunks:  make(map[int64]chan scriptProviderChunkEvent),
 		readDone:        make(chan struct{}),
