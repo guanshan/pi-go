@@ -3,6 +3,7 @@ package core
 import (
 	"context"
 	"fmt"
+	"os"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -214,70 +215,244 @@ func unclosedAtQuoteStart(value string) int {
 	return -1
 }
 
-// fileReferenceSuggestions lists files/directories under cwd that complete the
-// given "@<partial>" token, returning full replacement values like "@src/" or
-// "@main.go" (mirrors the TS @-attachment provider: directories get a trailing
-// slash, values with spaces are quoted as @"...", hidden entries are shown only
-// when explicitly typed).
+// fileReferenceSuggestions returns the completion values for the given
+// "@<partial>" token (see fileReferenceCompletions for the full algorithm). It
+// keeps the []string shape used by callers that only need replacement values.
 func fileReferenceSuggestions(token, cwd string) []string {
+	completions := fileReferenceCompletions(token, cwd)
+	values := make([]string, 0, len(completions))
+	for _, completion := range completions {
+		values = append(values, completion.Value)
+	}
+	return values
+}
+
+// fileReferenceMaxResults caps @-attachment suggestions at the top 20 scored
+// entries, mirroring TS getFuzzyFileSuggestions (autocomplete.ts:742).
+const fileReferenceMaxResults = 20
+
+// fileReferenceWalkLimit bounds how many filesystem entries the recursive walk
+// considers before scoring, mirroring TS walkDirectoryWithFd's
+// `fd --max-results 100` (autocomplete.ts:729).
+const fileReferenceWalkLimit = 100
+
+// fileReferenceCompletions performs a RECURSIVE FUZZY file search for the given
+// "@<partial>" token, mirroring TS getFuzzyFileSuggestions (autocomplete.ts
+// :717-769). It walks the whole subtree under the (optionally scoped) base
+// directory, scores every entry (exact filename=100, prefix=80,
+// substring-in-name=50, substring-in-path=30, +10 for directories), sorts by
+// score descending, and returns the top 20 with a description carrying the
+// display path. Directories get a trailing slash so the user can keep
+// descending; values with spaces (or originally quoted tokens) are wrapped as
+// @"...". Unlike a flat single-directory listing, a query like "@compon"
+// surfaces "src/ui/components/" deep in the tree.
+func fileReferenceCompletions(token, cwd string) []interactiveCompletion {
 	rawPrefix := strings.TrimPrefix(token, "@")
 	quoted := false
 	if strings.HasPrefix(rawPrefix, "\"") {
 		quoted = true
 		rawPrefix = rawPrefix[1:]
 	}
-	displayPrefix := filepath.ToSlash(rawPrefix)
-	absolute := filepath.IsAbs(rawPrefix) || strings.HasPrefix(displayPrefix, "/")
-	var dir, base string
-	if slash := strings.LastIndex(displayPrefix, "/"); slash >= 0 {
-		dir, base = displayPrefix[:slash], displayPrefix[slash+1:]
-		if dir == "" {
-			dir = "/" // "@/abc" -> list the filesystem root, not cwd
-		} else if len(dir) == 2 && dir[1] == ':' {
-			dir += "/" // "@C:/abc" -> list C:/, not C:'s cwd
+	normalizedQuery := filepath.ToSlash(rawPrefix)
+
+	// Resolve a scoped query: if the typed text contains a "/", everything up to
+	// and including the last "/" selects the base directory to walk, and only the
+	// trailing segment is the fuzzy query (TS resolveScopedFuzzyQuery,
+	// autocomplete.ts:518-546).
+	scoped := false
+	displayBase := ""
+	query := normalizedQuery
+	baseDir := cwd
+	if slash := strings.LastIndex(normalizedQuery, "/"); slash >= 0 {
+		displayBase = normalizedQuery[:slash+1]
+		query = normalizedQuery[slash+1:]
+		resolved := fileReferenceBaseDir(displayBase, cwd)
+		if info, err := os.Stat(resolved); err == nil && info.IsDir() {
+			scoped = true
+			baseDir = resolved
+		} else {
+			// Not a real directory: fall back to walking cwd with the whole query,
+			// matching TS (scopedQuery null -> fdBaseDir = basePath, fdQuery = query).
+			scoped = false
+			displayBase = ""
+			query = normalizedQuery
+			baseDir = cwd
 		}
-	} else {
-		dir, base = ".", displayPrefix
 	}
-	readDir := filepath.FromSlash(dir)
-	if !absolute {
-		readDir = filepath.Join(cwd, readDir)
-	}
-	entries, err := interactiveReadDir(readDir)
-	if err != nil {
+
+	entries := fileReferenceWalk(baseDir, query, scoped)
+	if len(entries) == 0 {
 		return nil
 	}
-	matches := make([]string, 0, 8)
+
+	type scoredEntry struct {
+		relPath     string
+		isDirectory bool
+		score       int
+	}
+	scored := make([]scoredEntry, 0, len(entries))
 	for _, entry := range entries {
-		name := entry.Name()
-		// Hide dotfiles only at the bare top level (a plain "@" with no path and no
-		// dot typed) to avoid .git/node_modules noise; once the user descends into a
-		// directory or types a leading dot, surface hidden entries like TS fd --hidden.
-		if strings.HasPrefix(name, ".") && dir == "." && !strings.HasPrefix(base, ".") {
+		// Empty query scores every entry as 1 (TS getFuzzyFileSuggestions:737
+		// `fdQuery ? scoreEntry(...) : 1`); a non-empty query uses the fuzzy score.
+		score := 1
+		if query != "" {
+			score = scoreFileReferenceEntry(entry.relPath, query, entry.isDirectory)
+		}
+		if score <= 0 {
 			continue
 		}
-		if base != "" && !strings.HasPrefix(name, base) {
-			continue
-		}
-		var rel string
-		switch {
-		case dir == "/":
-			rel = "/" + name
-		case dir != ".":
-			rel = strings.TrimSuffix(dir, "/") + "/" + name
-		default:
-			rel = name
-		}
-		if entry.IsDir() {
-			rel += "/"
-		}
-		matches = append(matches, buildFileRefCompletion(rel, quoted))
+		scored = append(scored, scoredEntry{relPath: entry.relPath, isDirectory: entry.isDirectory, score: score})
 	}
-	sort.Strings(matches)
-	if len(matches) > 8 {
-		matches = matches[:8]
+	// Stable sort by score descending so equal-score entries keep walk order
+	// (TS Array.prototype.sort with (a,b)=>b.score-a.score is not stable in spec
+	// but V8 is; stable Go sort matches the observable ordering).
+	sort.SliceStable(scored, func(i, j int) bool { return scored[i].score > scored[j].score })
+	if len(scored) > fileReferenceMaxResults {
+		scored = scored[:fileReferenceMaxResults]
 	}
-	return matches
+
+	completions := make([]interactiveCompletion, 0, len(scored))
+	for _, entry := range scored {
+		displayPath := entry.relPath
+		if scoped {
+			displayPath = scopedFileReferenceDisplayPath(displayBase, entry.relPath)
+		}
+		completionPath := displayPath
+		if entry.isDirectory {
+			completionPath += "/"
+		}
+		value := buildFileRefCompletion(completionPath, quoted)
+		label := filepathBase(entry.relPath)
+		if entry.isDirectory {
+			label += "/"
+		}
+		completions = append(completions, interactiveCompletion{
+			Value:       value,
+			Label:       label,
+			Description: displayPath,
+		})
+	}
+	return completions
+}
+
+// fileReferenceEntry is one path discovered by the recursive walk, relative to
+// the base directory and with forward slashes.
+type fileReferenceEntry struct {
+	relPath     string
+	isDirectory bool
+}
+
+// fileReferenceBaseDir resolves a scoped display base ("src/", "~/x/", "/abs/")
+// to an absolute filesystem path (TS resolveScopedFuzzyQuery base resolution).
+func fileReferenceBaseDir(displayBase, cwd string) string {
+	switch {
+	case strings.HasPrefix(displayBase, "~/"):
+		home := HomeDir()
+		if home == "" {
+			return filepath.FromSlash(displayBase)
+		}
+		return filepath.Join(home, filepath.FromSlash(strings.TrimPrefix(displayBase, "~/")))
+	case strings.HasPrefix(displayBase, "/"):
+		return filepath.FromSlash(displayBase)
+	case len(displayBase) >= 2 && displayBase[1] == ':':
+		return filepath.FromSlash(displayBase)
+	default:
+		return filepath.Join(cwd, filepath.FromSlash(displayBase))
+	}
+}
+
+// scopedFileReferenceDisplayPath re-prefixes a walk-relative path with the typed
+// display base (TS scopedPathForDisplay, autocomplete.ts:548-554).
+func scopedFileReferenceDisplayPath(displayBase, relPath string) string {
+	relPath = filepath.ToSlash(relPath)
+	if displayBase == "/" {
+		return "/" + relPath
+	}
+	return filepath.ToSlash(displayBase) + relPath
+}
+
+// filepathBase returns the final path segment of a forward-slash relative path.
+func filepathBase(relPath string) string {
+	relPath = strings.TrimSuffix(filepath.ToSlash(relPath), "/")
+	if i := strings.LastIndex(relPath, "/"); i >= 0 {
+		return relPath[i+1:]
+	}
+	return relPath
+}
+
+// fileReferenceWalk recursively walks baseDir and returns up to
+// fileReferenceWalkLimit entries (files and directories) relative to baseDir,
+// mirroring TS walkDirectoryWithFd (fd --type f --type d --follow --hidden,
+// .git excluded). Enumeration goes through interactiveReadDir so callers can
+// observe/cache directory reads. Top-level dotfiles are hidden only for a bare,
+// unscoped query that does not itself start with a dot (the Go #12 heuristic to
+// avoid .git/node_modules noise); .git is always pruned, matching fd's
+// --exclude .git.
+func fileReferenceWalk(baseDir, query string, scoped bool) []fileReferenceEntry {
+	showHidden := scoped || strings.HasPrefix(query, ".")
+	results := make([]fileReferenceEntry, 0, 16)
+	var walk func(absDir, relDir string)
+	walk = func(absDir, relDir string) {
+		if len(results) >= fileReferenceWalkLimit {
+			return
+		}
+		entries, err := interactiveReadDir(absDir)
+		if err != nil {
+			return
+		}
+		// Deterministic traversal order (interactiveReadDir/os.ReadDir already
+		// sorts by name, but be explicit so a swapped hook stays stable).
+		sort.Slice(entries, func(i, j int) bool { return entries[i].Name() < entries[j].Name() })
+		for _, entry := range entries {
+			if len(results) >= fileReferenceWalkLimit {
+				return
+			}
+			name := entry.Name()
+			if name == ".git" {
+				continue
+			}
+			isDir := entry.IsDir()
+			rel := name
+			if relDir != "" {
+				rel = relDir + "/" + name
+			}
+			hidden := strings.HasPrefix(name, ".")
+			if hidden && !showHidden && relDir == "" {
+				continue
+			}
+			results = append(results, fileReferenceEntry{relPath: rel, isDirectory: isDir})
+			if isDir {
+				walk(filepath.Join(absDir, name), rel)
+			}
+		}
+	}
+	walk(baseDir, "")
+	return results
+}
+
+// scoreFileReferenceEntry scores a walk entry against the fuzzy query, mirroring
+// TS scoreEntry (autocomplete.ts:692-714): exact filename match=100, filename
+// prefix=80, substring in filename=50, substring in full path=30; directories
+// with a positive score get a +10 bonus to sort first. 0 means no match.
+func scoreFileReferenceEntry(relPath, query string, isDirectory bool) int {
+	fileName := filepathBase(relPath)
+	lowerName := strings.ToLower(fileName)
+	lowerQuery := strings.ToLower(query)
+	score := 0
+	switch {
+	case lowerName == lowerQuery:
+		score = 100
+	case strings.HasPrefix(lowerName, lowerQuery):
+		score = 80
+	case strings.Contains(lowerName, lowerQuery):
+		score = 50
+	case strings.Contains(strings.ToLower(filepath.ToSlash(relPath)), lowerQuery):
+		score = 30
+	}
+	if isDirectory && score > 0 {
+		score += 10
+	}
+	return score
 }
 
 // buildFileRefCompletion wraps a path as an "@"-prefixed completion value,
@@ -525,7 +700,7 @@ func interactiveBuiltinCompletions(input string, agent *AgentSession) []interact
 	if token, _, ok := trailingFileRefToken(input); ok {
 		if agent != nil {
 			if cwd := agent.Session.CWD(); cwd != "" {
-				return completionsFromStrings(fileReferenceSuggestions(token, cwd))
+				return fileReferenceCompletions(token, cwd)
 			}
 		}
 		return nil
@@ -549,33 +724,69 @@ func interactiveBuiltinCompletions(input string, agent *AgentSession) []interact
 		return nil
 	}
 	prefix := strings.TrimPrefix(text, "/")
-	matches := make([]interactiveCompletion, 0, 6)
-	for _, command := range interactiveSlashCommands {
-		if strings.HasPrefix(command, prefix) {
-			matches = append(matches, interactiveCompletion{Value: "/" + command, Description: interactiveSlashCommandDescriptions[command]})
+	// Mirror TS CombinedAutocompleteProvider: build the full command list, then
+	// fuzzy-filter by command NAME ranked by match score (autocomplete.ts:322 via
+	// fuzzyFilter). Subsequence matching makes "/mdl"->"/model" and
+	// "/tngs"->"/settings" work, and orders results best-match first instead of
+	// alphabetically. Candidates are deduped by value, preserving first-seen order
+	// (built-ins, then templates, then skills, then extension commands) so equal
+	// fuzzy scores fall back to that stable insertion order.
+	candidates := make([]slashCommandCandidate, 0, 8)
+	seen := map[string]bool{}
+	add := func(name, value, description string) {
+		if value == "" || seen[value] {
+			return
 		}
+		seen[value] = true
+		candidates = append(candidates, slashCommandCandidate{name: name, completion: interactiveCompletion{Value: value, Description: description}})
+	}
+	for _, command := range interactiveSlashCommands {
+		add(command, "/"+command, interactiveSlashCommandDescriptions[command])
 	}
 	if agent != nil {
+		// Iterate the template/skill maps in a stable (sorted) order so equal
+		// fuzzy scores fall back to a deterministic ordering rather than Go's
+		// randomized map iteration.
+		templateNames := make([]string, 0, len(agent.Resources.PromptTemplates))
 		for name := range agent.Resources.PromptTemplates {
-			if strings.HasPrefix(name, prefix) {
-				template := agent.Resources.PromptTemplates[name]
-				matches = append(matches, interactiveCompletion{Value: "/" + name, Description: prefixAutocompleteDescription(promptTemplateCompletionDescription(template), template.SourceInfo)})
-			}
+			templateNames = append(templateNames, name)
 		}
+		sort.Strings(templateNames)
+		for _, name := range templateNames {
+			template := agent.Resources.PromptTemplates[name]
+			add(name, "/"+name, prefixAutocompleteDescription(promptTemplateCompletionDescription(template), template.SourceInfo))
+		}
+		skillNames := make([]string, 0, len(agent.Resources.Skills))
 		for name := range agent.Resources.Skills {
-			command := "skill:" + name
-			if strings.HasPrefix(command, prefix) {
-				skill := agent.Resources.Skills[name]
-				matches = append(matches, interactiveCompletion{Value: "/" + command, Description: prefixAutocompleteDescription(skill.Description, skill.SourceInfo)})
-			}
+			skillNames = append(skillNames, name)
 		}
-		matches = append(matches, extensionCommandCompletions(agent, prefix)...)
+		sort.Strings(skillNames)
+		for _, name := range skillNames {
+			command := "skill:" + name
+			skill := agent.Resources.Skills[name]
+			add(command, "/"+command, prefixAutocompleteDescription(skill.Description, skill.SourceInfo))
+		}
+		for _, extension := range extensionCommandCompletions(agent, "") {
+			add(strings.TrimPrefix(extension.Value, "/"), extension.Value, extension.Description)
+		}
 	}
-	sort.Slice(matches, func(i, j int) bool { return matches[i].Value < matches[j].Value })
+	filtered := tui.FuzzyFilter(candidates, prefix, func(c slashCommandCandidate) string { return c.name })
+	matches := make([]interactiveCompletion, 0, len(filtered))
+	for _, candidate := range filtered {
+		matches = append(matches, candidate.completion)
+	}
 	if len(matches) > 6 {
 		matches = matches[:6]
 	}
 	return matches
+}
+
+// slashCommandCandidate pairs a slash command's match key (its name without the
+// leading "/") with its completion, so tui.FuzzyFilter can rank by name while
+// the completion's Value/Description ride along.
+type slashCommandCandidate struct {
+	name       string
+	completion interactiveCompletion
 }
 
 func extensionAutocompleteCompletions(input string, agent *AgentSession) []interactiveCompletion {

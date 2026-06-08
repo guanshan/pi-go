@@ -1,6 +1,7 @@
 package compaction
 
 import (
+	"encoding/json"
 	"testing"
 
 	"github.com/guanshan/pi-go/packages/agent"
@@ -88,6 +89,28 @@ func TestEstimateTokensUsesUTF16Length(t *testing.T) {
 	}, ai.Usage{}, "toolUse")
 	if got := EstimateTokens(tool); got != 1 { // ceil(3/4) == 1
 		t.Fatalf("toolCall EstimateTokens=%d want 1", got)
+	}
+}
+
+// TestSafeJSONDoesNotHTMLEscape locks the token-estimation serializer to TS
+// JSON.stringify behavior (compaction.ts:28-34,238): <, >, and & must NOT be
+// HTML-escaped, so their character count matches upstream (1 char each, not the
+// 6-char \u00xx sequences that encoding/json.Marshal would emit). serializing
+// {"q":"a<b>c&d"} yields a 15-char value, not 30.
+func TestSafeJSONDoesNotHTMLEscape(t *testing.T) {
+	args := json.RawMessage(`{"q":"a<b>c&d"}`)
+	got := safeJSON(args)
+	if got != `{"q":"a<b>c&d"}` {
+		t.Fatalf("safeJSON HTML-escaped output: %q", got)
+	}
+
+	// And the token estimate reflects the un-escaped length: name "" (0) +
+	// args (15 UTF-16 units) = 15, ceil(15/4) == 4.
+	tool := ai.NewAssistantMessageForModel(ai.Model{}, []ai.ContentBlock{
+		{Type: "toolCall", ID: "c", Name: "", Arguments: args},
+	}, ai.Usage{}, "toolUse")
+	if got := EstimateTokens(tool); got != 4 {
+		t.Fatalf("toolCall EstimateTokens with HTML chars=%d want 4", got)
 	}
 }
 

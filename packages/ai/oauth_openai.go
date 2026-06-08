@@ -147,8 +147,10 @@ func RefreshOpenAICodexToken(ctx context.Context, refreshToken string, options .
 	if err != nil {
 		return OAuthCredentials{}, err
 	}
-	if accountID, err := aiproviders.ExtractCodexAccountID(credentials.Access); err == nil {
-		credentials.Extra = map[string]any{"accountId": accountID}
+	accountID, err := aiproviders.ExtractCodexAccountID(credentials.Access)
+	if err != nil {
+		return OAuthCredentials{}, err
 	}
+	credentials.Extra = map[string]any{"accountId": accountID}
 	return credentials, nil
 }

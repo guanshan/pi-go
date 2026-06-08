@@ -137,11 +137,14 @@ func TestAgentSessionExtensionCanCancelTreeNavigationBeforeLeafChange(t *testing
 	appendSessionMessage(t, session, ai.NewAssistantMessageForModel(model, ai.TextBlocks("reply"), ai.Usage{}, "stop"))
 	leafID := appendSessionMessage(t, session, ai.NewUserMessage("branch work", nil))
 	appendSessionMessage(t, session, ai.NewAssistantMessageForModel(model, ai.TextBlocks("branch reply"), ai.Usage{}, "stop"))
+	resources := ResourceLoader{CWD: cwd, AgentDir: settings.AgentDir, PromptTemplates: map[string]PromptTemplate{}, Skills: map[string]Skill{}}
+	agent := NewAgentSession(session, settings, registry, resources, model, ai.ThinkingOff, ToolSet{}, "system")
+	// NewAgentSession seeds an initial thinking_level_change entry (TS sdk.ts:361-373)
+	// for a session without one, which moves the leaf; position the test's target
+	// leaf afterward so the cancellation assertion is meaningful.
 	if err := session.SetLeaf(leafID); err != nil {
 		t.Fatal(err)
 	}
-	resources := ResourceLoader{CWD: cwd, AgentDir: settings.AgentDir, PromptTemplates: map[string]PromptTemplate{}, Skills: map[string]Skill{}}
-	agent := NewAgentSession(session, settings, registry, resources, model, ai.ThinkingOff, ToolSet{}, "system")
 	runtime, err := coreext.NewRunner(func(api *coreext.API) error {
 		api.On("session_before_tree", func(payload any) {
 			payload.(*coreext.SessionBeforeTreeEvent).Cancel = true
@@ -198,17 +201,94 @@ func TestAgentSessionReloadEmitsExtensionLifecycle(t *testing.T) {
 		t.Fatal(err)
 	}
 	agent.extensionRuntime = runtime
+	originalSettings := agent.Settings
 
 	if err := agent.Reload(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	want := []string{"shutdown:reload", "runtime_shutdown", "start:reload"}
+	// The outgoing runtime receives shutdown:reload and then has its runtime
+	// shutdown invoked. session_start(reload) is emitted onto the REBUILT runtime,
+	// which has no test handlers, so it does not appear in this listener's log.
+	// This is the post-fix behavior: the runtime is respawned, not left dead.
+	want := []string{"shutdown:reload", "runtime_shutdown"}
 	if len(events) != len(want) {
-		t.Fatalf("events=%#v", events)
+		t.Fatalf("events=%#v want=%#v", events, want)
 	}
 	for i, value := range want {
 		if events[i] != value {
 			t.Fatalf("events=%#v want=%#v", events, want)
 		}
+	}
+	// P1-15: Reload must REBUILD the extension runtime (not leave a.extensionRuntime
+	// pointing at the dead/shut-down runner).
+	if agent.extensionRuntime == nil {
+		t.Fatal("extension runtime was not rebuilt after reload (nil)")
+	}
+	if agent.extensionRuntime == runtime {
+		t.Fatal("extension runtime was not respawned after reload (still the old, shut-down runner)")
+	}
+	// P2-30: Reload must re-read settings from disk (fresh SettingsManager).
+	if agent.Settings == originalSettings {
+		t.Fatal("Reload did not re-read settings from disk (SettingsManager not replaced)")
+	}
+}
+
+// TestAgentSessionReloadRebuildsFunctionalRuntime verifies the P1-15 fix end to
+// end: after reload, the rebuilt extension runtime exposes the extension's tools
+// again (extensions are not dead) and preserves the previous flag values.
+func TestAgentSessionReloadRebuildsFunctionalRuntime(t *testing.T) {
+	cwd := t.TempDir()
+	settings := NewSettingsManager(cwd, t.TempDir())
+	registry := ai.NewModelRegistry(settings.AgentDir, ai.NewAuthStorage(settings.AgentDir))
+	model, ok, _ := registry.Match("faux", "faux")
+	if !ok {
+		t.Fatal("missing faux model")
+	}
+	session := InMemorySession(cwd)
+	resources := ResourceLoader{CWD: cwd, AgentDir: settings.AgentDir, PromptTemplates: map[string]PromptTemplate{}, Skills: map[string]Skill{}}
+
+	factory := func(api *coreext.API) error {
+		api.RegisterFlag(coreext.FlagDefinition{Name: "myflag", Type: "string", Default: "default"})
+		api.RegisterTool(coreext.ToolDefinition{
+			Name:        "ext_tool",
+			Description: "extension tool",
+			Parameters:  map[string]any{"type": "object"},
+			Execute: func(context.Context, []byte) (ai.ToolResult, error) {
+				return ai.ToolResult{Content: ai.TextBlocks("ok")}, nil
+			},
+		})
+		return nil
+	}
+
+	// Build the initial runtime with the flag overridden, mirroring how the host
+	// seeds CLI/extension flag values at construction.
+	runtime, _ := loadExtensionRuntime(context.Background(), nil, []coreext.Factory{factory}, map[string]any{"myflag": "overridden"})
+	agent := NewAgentSession(session, settings, registry, resources, model, ai.ThinkingOff, ToolSet{}, "system")
+	agent.extensionRuntime = runtime
+	// Wire the factory so Reload's _buildRuntime equivalent rebuilds from it.
+	agent.ResourceLoaderOptions.ExtensionFactories = []coreext.Factory{factory}
+
+	if _, ok := runtime.ToolDefinition("ext_tool"); !ok {
+		t.Fatal("setup: extension tool missing before reload")
+	}
+	if got := runtime.FlagValue("myflag"); got != "overridden" {
+		t.Fatalf("setup: flag value before reload = %#v", got)
+	}
+
+	if err := agent.Reload(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	rebuilt := agent.extensionRuntime
+	if rebuilt == nil || rebuilt == runtime {
+		t.Fatalf("runtime not respawned: rebuilt=%p old=%p", rebuilt, runtime)
+	}
+	// Extensions are alive again: the tool is registered on the new runtime.
+	if _, ok := rebuilt.ToolDefinition("ext_tool"); !ok {
+		t.Fatal("extension tool missing after reload (extensions died)")
+	}
+	// Flag values are preserved across the rebuild.
+	if got := rebuilt.FlagValue("myflag"); got != "overridden" {
+		t.Fatalf("flag value not preserved after reload = %#v", got)
 	}
 }

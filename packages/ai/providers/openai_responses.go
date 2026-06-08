@@ -393,14 +393,25 @@ func ResponsesAssistantItems(options OpenAIResponsesRequestOptions, msg OpenAIRe
 				}},
 			})
 		case "toolCall":
-			callID, itemID := ResponsesToolCallIDParts(block.ID)
+			// Mirror openai-responses-shared.ts assistant function_call path: split
+			// the stored "callId|itemId" on the FIRST "|" and use the RAW parts
+			// (no NormalizeIDPart / forced "fc_" prefix — that normalization is only
+			// for the toolResult call_id path). The id is omitted only when this is
+			// a different-model message AND the raw item id starts with "fc_" (to
+			// dodge OpenAI's rs_/fc_ pairing validation); a non-fc_ item id is kept.
+			callID := block.ID
+			itemID := ""
+			if parts := strings.SplitN(block.ID, "|", 2); len(parts) == 2 {
+				callID = parts[0]
+				itemID = parts[1]
+			}
 			item := map[string]any{
 				"type":      "function_call",
 				"call_id":   callID,
 				"name":      block.Name,
 				"arguments": MistralRequestArguments(block.Arguments),
 			}
-			if itemID != "" && !isDifferentModel {
+			if itemID != "" && (!isDifferentModel || !strings.HasPrefix(itemID, "fc_")) {
 				item["id"] = itemID
 			}
 			out = append(out, item)

@@ -2,6 +2,7 @@ package ai
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"os"
@@ -25,6 +26,67 @@ type ImagesModel struct {
 	Output   []string          `json:"output,omitempty"`
 	Cost     Cost              `json:"cost,omitempty"`
 	Headers  map[string]string `json:"headers,omitempty"`
+}
+
+// imagesModelJSON mirrors the upstream TS ImagesModel wire shape, where the
+// catalog cost carries only the 4 rate fields (input/output/cacheRead/
+// cacheWrite) and never the runtime-only `total` field.
+type imagesModelJSON struct {
+	Provider string            `json:"provider"`
+	ID       string            `json:"id"`
+	Name     string            `json:"name,omitempty"`
+	API      string            `json:"api"`
+	BaseURL  string            `json:"baseUrl,omitempty"`
+	EnvKey   string            `json:"envKey,omitempty"`
+	Input    []string          `json:"input,omitempty"`
+	Output   []string          `json:"output,omitempty"`
+	Cost     ModelCost         `json:"cost,omitempty"`
+	Headers  map[string]string `json:"headers,omitempty"`
+}
+
+func (m ImagesModel) MarshalJSON() ([]byte, error) {
+	return json.Marshal(imagesModelJSON{
+		Provider: m.Provider,
+		ID:       m.ID,
+		Name:     m.Name,
+		API:      m.API,
+		BaseURL:  m.BaseURL,
+		EnvKey:   m.EnvKey,
+		Input:    m.Input,
+		Output:   m.Output,
+		Cost: ModelCost{
+			Input:      m.Cost.Input,
+			Output:     m.Cost.Output,
+			CacheRead:  m.Cost.CacheRead,
+			CacheWrite: m.Cost.CacheWrite,
+		},
+		Headers: m.Headers,
+	})
+}
+
+func (m *ImagesModel) UnmarshalJSON(data []byte) error {
+	var raw imagesModelJSON
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	*m = ImagesModel{
+		Provider: raw.Provider,
+		ID:       raw.ID,
+		Name:     raw.Name,
+		API:      raw.API,
+		BaseURL:  raw.BaseURL,
+		EnvKey:   raw.EnvKey,
+		Input:    raw.Input,
+		Output:   raw.Output,
+		Cost: Cost{
+			Input:      raw.Cost.Input,
+			Output:     raw.Cost.Output,
+			CacheRead:  raw.Cost.CacheRead,
+			CacheWrite: raw.Cost.CacheWrite,
+		},
+		Headers: raw.Headers,
+	}
+	return nil
 }
 
 type ImagesContext struct {
@@ -244,7 +306,7 @@ func GenerateImages(ctx context.Context, model ImagesModel, imageContext ImagesC
 	defer cancel()
 	provider := GetImagesProvider(model.API)
 	if provider == nil {
-		return AssistantImages{}, fmt.Errorf("no images provider registered for api %q", model.API)
+		return AssistantImages{}, fmt.Errorf("No API provider registered for api: %s", model.API) //nolint:staticcheck // ST1005: TS-faithful message (images.ts:9)
 	}
 	return provider.Generate(ctx, model, imageContext, options)
 }

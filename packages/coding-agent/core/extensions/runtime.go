@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"strings"
 	"sync"
 )
@@ -64,9 +65,33 @@ func (b *EventBus) Emit(event string, payload any) {
 	b.mu.RUnlock()
 	for _, entry := range entries {
 		if entry.fn != nil {
-			entry.fn(payload)
+			emitListener(normalized, entry.fn, payload)
 		}
 	}
+}
+
+// emitListener invokes a single listener, recovering from a panic so one
+// misbehaving listener cannot abort the emit loop (mirrors TS event-bus.ts
+// safeHandler's try/catch -> console.error). The panic is logged and the loop
+// continues with the next listener.
+func emitListener(event string, fn func(any), payload any) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			log.Printf("event handler error (%s): %v", event, recovered)
+		}
+	}()
+	fn(payload)
+}
+
+// Clear removes all listeners for every event (mirrors TS event-bus.ts clear()
+// -> emitter.removeAllListeners()).
+func (b *EventBus) Clear() {
+	if b == nil {
+		return
+	}
+	b.mu.Lock()
+	b.listeners = map[string][]busListener{}
+	b.mu.Unlock()
 }
 
 type Factory func(*API) error
@@ -123,6 +148,13 @@ func (api *API) RegisterCommand(name, description string) {
 }
 
 func (api *API) RegisterCommandHandler(name, description string, execute func(context.Context, string) (string, error)) {
+	api.RegisterCommandSource(name, description, "", execute)
+}
+
+// RegisterCommandSource is RegisterCommandHandler with the command's origin file
+// path, which becomes CommandInfo.SourceInfo {"path": ...} on the get_commands
+// wire (TS ResolvedCommand.sourceInfo). An empty sourcePath leaves SourceInfo nil.
+func (api *API) RegisterCommandSource(name, description, sourcePath string, execute func(context.Context, string) (string, error)) {
 	if api == nil {
 		return
 	}
@@ -130,9 +162,13 @@ func (api *API) RegisterCommandHandler(name, description string, execute func(co
 	if name == "" {
 		return
 	}
+	var sourceInfo map[string]any
+	if sourcePath != "" {
+		sourceInfo = map[string]any{"path": sourcePath}
+	}
 	api.mu.Lock()
 	defer api.mu.Unlock()
-	api.Commands = append(api.Commands, CommandInfo{Name: name, Description: description, Source: "extension", Execute: execute})
+	api.Commands = append(api.Commands, CommandInfo{Name: name, Description: description, Source: "extension", SourceInfo: sourceInfo, Execute: execute})
 }
 
 func (api *API) RegisterShortcut(shortcut ShortcutDefinition) {
@@ -611,7 +647,39 @@ func (r *Runner) RegisteredCommands() []CommandInfo {
 	if r == nil || r.API == nil {
 		return nil
 	}
-	return r.API.SnapshotCommands()
+	commands := r.API.SnapshotCommands()
+	// Compute deduplicated invocation names, mirroring TS runner
+	// getRegisteredCommands: when a command name occurs more than once, each
+	// occurrence after disambiguation becomes "name:N"; collisions with an
+	// already-taken invocation name bump the suffix until unique.
+	counts := map[string]int{}
+	for _, c := range commands {
+		counts[c.Name]++
+	}
+	seen := map[string]int{}
+	taken := map[string]bool{}
+	for i := range commands {
+		name := commands[i].Name
+		occurrence := seen[name] + 1
+		seen[name] = occurrence
+		invocation := name
+		if counts[name] > 1 {
+			invocation = fmt.Sprintf("%s:%d", name, occurrence)
+		}
+		if taken[invocation] {
+			suffix := occurrence
+			for {
+				suffix++
+				invocation = fmt.Sprintf("%s:%d", name, suffix)
+				if !taken[invocation] {
+					break
+				}
+			}
+		}
+		taken[invocation] = true
+		commands[i].InvocationName = invocation
+	}
+	return commands
 }
 
 func (r *Runner) RegisteredShortcuts() []ShortcutDefinition {

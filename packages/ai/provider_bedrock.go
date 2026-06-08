@@ -57,7 +57,26 @@ func (r *ModelRegistry) bedrockChat(ctx context.Context, req ChatRequest) (ChatR
 }
 func (r *ModelRegistry) bedrockRuntimeClient(ctx context.Context, req ChatRequest, headers map[string]string) (*bedrockruntime.Client, error) {
 	model := req.Model
-	region := aiproviders.BedrockRegion(model.BaseURL)
+	// Mirror amazon-bedrock.ts: only pin a standard bedrock-runtime endpoint when
+	// no region/profile is configured, so AWS_PROFILE's (or AWS_REGION's) region
+	// can win over the catalog default base URL. When AWS_PROFILE is set and no
+	// explicit region exists, leave region unset so the SDK resolves it from the
+	// profile config.
+	configuredRegion := aiproviders.BedrockConfiguredRegion()
+	hasProfile := aiproviders.BedrockHasConfiguredProfile()
+	endpointRegion := aiproviders.BedrockStandardEndpointRegion(model.BaseURL)
+	useExplicitEndpoint := aiproviders.ShouldUseExplicitBedrockEndpoint(model.BaseURL, configuredRegion, hasProfile)
+
+	region := ""
+	switch {
+	case configuredRegion != "":
+		region = configuredRegion
+	case endpointRegion != "" && useExplicitEndpoint:
+		region = endpointRegion
+	case !hasProfile:
+		region = "us-east-1"
+	}
+
 	loadOptions := []func(*awsconfig.LoadOptions) error{
 		awsconfig.WithHTTPClient(providerHTTPClient(req)),
 	}
@@ -69,9 +88,11 @@ func (r *ModelRegistry) bedrockRuntimeClient(ctx context.Context, req ChatReques
 		return nil, err
 	}
 	if region == "" {
+		// Region was deliberately left unset for the SDK to resolve from the
+		// AWS_PROFILE config chain.
 		region = cfg.Region
 	}
-	if region == "" {
+	if region == "" && !hasProfile {
 		region = "us-east-1"
 	}
 	baseEndpoint := aiproviders.BedrockBaseEndpoint(model.BaseURL, region)
@@ -100,8 +121,12 @@ func (r *ModelRegistry) bedrockRuntimeClient(ctx context.Context, req ChatReques
 		cfg.AuthSchemePreference = []string{"noAuth"}
 	}
 	client := bedrockruntime.NewFromConfig(cfg, func(o *bedrockruntime.Options) {
-		o.Region = region
-		o.BaseEndpoint = aws.String(baseEndpoint)
+		if region != "" {
+			o.Region = region
+		}
+		if useExplicitEndpoint {
+			o.BaseEndpoint = aws.String(baseEndpoint)
+		}
 		o.HTTPClient = providerHTTPClient(req)
 		o.RetryMaxAttempts = 1 + aiproviders.MaxInt(0, req.MaxRetries)
 	}, bedrockWithHeaders(headers, forcedHeaders), bedrockWithResponse(req))

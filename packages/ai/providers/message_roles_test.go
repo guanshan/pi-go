@@ -42,6 +42,103 @@ func TestProviderMessagesPreserveCustomRolesAsUser(t *testing.T) {
 	}
 }
 
+// TestAnthropicToolResultBlockShape locks the TS convertContentBlocks wire shape:
+// text-only tool results emit content as a concatenated string, image-bearing
+// results emit a block array (with a "(see attached image)" placeholder prepended
+// when there is no text).
+func TestAnthropicToolResultBlockShape(t *testing.T) {
+	t.Run("text-only emits a concatenated string", func(t *testing.T) {
+		block := AnthropicToolResultBlock(AnthropicMessage{
+			Role:       "toolResult",
+			ToolCallID: "toolu_1",
+			Blocks:     []AnthropicBlock{{Type: "text", Text: "line one"}, {Type: "text", Text: "line two"}},
+		})
+		var decoded map[string]any
+		raw, err := json.Marshal(block)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := json.Unmarshal(raw, &decoded); err != nil {
+			t.Fatal(err)
+		}
+		content, ok := decoded["content"].(string)
+		if !ok {
+			t.Fatalf("expected string content, got %T: %s", decoded["content"], raw)
+		}
+		if content != "line one\nline two" {
+			t.Fatalf("content=%q", content)
+		}
+	})
+
+	t.Run("image-only prepends the placeholder text block", func(t *testing.T) {
+		block := AnthropicToolResultBlock(AnthropicMessage{
+			Role:       "toolResult",
+			ToolCallID: "toolu_1",
+			Blocks:     []AnthropicBlock{{Type: "image", MimeType: "image/png", Data: "AAAA"}},
+		})
+		raw, err := json.Marshal(block)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var decoded map[string]any
+		if err := json.Unmarshal(raw, &decoded); err != nil {
+			t.Fatal(err)
+		}
+		arr, ok := decoded["content"].([]any)
+		if !ok || len(arr) != 2 {
+			t.Fatalf("expected 2-element content array, got %s", raw)
+		}
+		first, _ := arr[0].(map[string]any)
+		if first["type"] != "text" || first["text"] != "(see attached image)" {
+			t.Fatalf("expected placeholder first block, got %s", raw)
+		}
+		second, _ := arr[1].(map[string]any)
+		if second["type"] != "image" {
+			t.Fatalf("expected image second block, got %s", raw)
+		}
+	})
+
+	t.Run("text plus image emits an array without the placeholder", func(t *testing.T) {
+		block := AnthropicToolResultBlock(AnthropicMessage{
+			Role:       "toolResult",
+			ToolCallID: "toolu_1",
+			Blocks:     []AnthropicBlock{{Type: "text", Text: "caption"}, {Type: "image", MimeType: "image/png", Data: "AAAA"}},
+		})
+		raw, err := json.Marshal(block)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var decoded map[string]any
+		if err := json.Unmarshal(raw, &decoded); err != nil {
+			t.Fatal(err)
+		}
+		arr, ok := decoded["content"].([]any)
+		if !ok || len(arr) != 2 {
+			t.Fatalf("expected 2-element content array, got %s", raw)
+		}
+		first, _ := arr[0].(map[string]any)
+		if first["type"] != "text" || first["text"] != "caption" {
+			t.Fatalf("expected text first block, got %s", raw)
+		}
+	})
+}
+
+// TestAnthropicMessagesSkipsEmptyContent mirrors TS convertMessages: a user
+// message whose text is empty/whitespace after filtering is omitted entirely, and
+// no empty placeholder text block is synthesized.
+func TestAnthropicMessagesSkipsEmptyContent(t *testing.T) {
+	out := AnthropicMessages([]AnthropicMessage{
+		{Role: "user", Blocks: []AnthropicBlock{{Type: "text", Text: "   "}}},
+		{Role: "user", Blocks: []AnthropicBlock{{Type: "text", Text: "keep me"}}},
+	}, anthropic.CacheControlEphemeralParam{}, false, false, false)
+	if len(out) != 1 {
+		t.Fatalf("expected whitespace-only user message to be skipped, got %d messages", len(out))
+	}
+	if !jsonContains(t, out[0], "keep me") {
+		t.Fatalf("expected surviving message to carry text, got %#v", out[0])
+	}
+}
+
 func jsonContains(t *testing.T, value any, needle string) bool {
 	t.Helper()
 	raw, err := json.Marshal(value)

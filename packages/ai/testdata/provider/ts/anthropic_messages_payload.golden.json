@@ -30,12 +30,7 @@
     {
       "content": [
         {
-          "content": [
-            {
-              "text": "result text",
-              "type": "text"
-            }
-          ],
+          "content": "result text",
           "is_error": false,
           "tool_use_id": "toolu_1",
           "type": "tool_result"

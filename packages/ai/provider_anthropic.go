@@ -166,7 +166,24 @@ func anthropicApplyStreamEvent(event anthropic.MessageStreamEventUnion, partial 
 			stream.Push(contentEndEvent((*blocks)[index], index, *partial))
 		}
 	case "message_delta":
-		partial.Usage = anthropicUsage(aiproviders.AnthropicUsageFromDeltaUsage(event.Usage))
+		// Mirror anthropic.ts:665-682: only overwrite a usage field when it is
+		// present (non-null) in the delta, preserving input/cacheRead/cacheWrite
+		// captured at message_start when a proxy omits them in message_delta. Then
+		// recompute the total from the four components.
+		usage := event.Usage
+		if usage.JSON.InputTokens.Valid() {
+			partial.Usage.Input = int(usage.InputTokens)
+		}
+		if usage.JSON.OutputTokens.Valid() {
+			partial.Usage.Output = int(usage.OutputTokens)
+		}
+		if usage.JSON.CacheReadInputTokens.Valid() {
+			partial.Usage.CacheRead = int(usage.CacheReadInputTokens)
+		}
+		if usage.JSON.CacheCreationInputTokens.Valid() {
+			partial.Usage.CacheWrite = int(usage.CacheCreationInputTokens)
+		}
+		partial.Usage.TotalTokens = partial.Usage.Input + partial.Usage.Output + partial.Usage.CacheRead + partial.Usage.CacheWrite
 		stopReason, errorMessage := aiproviders.AnthropicStopReason(string(event.Delta.StopReason))
 		partial.StopReason = stopReason
 		partial.ErrorMessage = errorMessage
@@ -215,7 +232,9 @@ func applyAnthropicDelta(blocks *[]ContentBlock, index int, delta anthropic.Mess
 		return delta.Thinking, "thinking_delta"
 	case "signature_delta":
 		block.Type = "thinking"
-		block.Signature = delta.Signature
+		// Mirror anthropic.ts:621-628: signature fragments accumulate across
+		// successive signature_delta events.
+		block.Signature += delta.Signature
 		(*blocks)[index] = block
 		return "", "thinking_delta"
 	case "input_json_delta":

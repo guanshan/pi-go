@@ -59,6 +59,76 @@ func BedrockBaseEndpoint(baseURL, region string) string {
 	return strings.ReplaceAll(base, "{region}", region)
 }
 
+// BedrockConfiguredRegion mirrors TS getConfiguredBedrockRegion: the region is
+// taken from AWS_REGION or AWS_DEFAULT_REGION only — NOT from the endpoint
+// hostname. Used by the endpoint-pinning decision so that an AWS_PROFILE-derived
+// region can win over the catalog default base URL.
+func BedrockConfiguredRegion() string {
+	if region := os.Getenv("AWS_REGION"); region != "" {
+		return region
+	}
+	if region := os.Getenv("AWS_DEFAULT_REGION"); region != "" {
+		return region
+	}
+	return ""
+}
+
+// BedrockHasConfiguredProfile mirrors TS hasConfiguredBedrockProfile.
+func BedrockHasConfiguredProfile() bool {
+	return os.Getenv("AWS_PROFILE") != ""
+}
+
+// BedrockStandardEndpointRegion mirrors TS getStandardBedrockEndpointRegion: it
+// returns the region only when the base URL host fully matches the standard
+// bedrock-runtime(-fips).<region>.amazonaws.com(.cn) pattern, otherwise "".
+func BedrockStandardEndpointRegion(baseURL string) string {
+	if baseURL == "" {
+		return ""
+	}
+	parsed, err := url.Parse(baseURL)
+	if err != nil {
+		return ""
+	}
+	host := strings.ToLower(parsed.Hostname())
+	for _, prefix := range []string{"bedrock-runtime.", "bedrock-runtime-fips."} {
+		if !strings.HasPrefix(host, prefix) {
+			continue
+		}
+		rest := strings.TrimPrefix(host, prefix)
+		for _, suffix := range []string{".amazonaws.com.cn", ".amazonaws.com"} {
+			if strings.HasSuffix(rest, suffix) {
+				region := strings.TrimSuffix(rest, suffix)
+				if region != "" && isBedrockRegionToken(region) {
+					return region
+				}
+			}
+		}
+	}
+	return ""
+}
+
+func isBedrockRegionToken(region string) bool {
+	for _, r := range region {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '-' {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+// ShouldUseExplicitBedrockEndpoint mirrors TS shouldUseExplicitBedrockEndpoint:
+// pin the endpoint when the base URL is a non-standard host, or when it is a
+// standard bedrock-runtime host but no region/profile is configured. When a
+// standard host is paired with a configured region or AWS_PROFILE, the endpoint
+// is left unpinned so the SDK can honor that region/profile.
+func ShouldUseExplicitBedrockEndpoint(baseURL, configuredRegion string, hasConfiguredProfile bool) bool {
+	if BedrockStandardEndpointRegion(baseURL) == "" {
+		return true
+	}
+	return configuredRegion == "" && !hasConfiguredProfile
+}
+
 func BedrockEnvCredentials() (string, string, bool) {
 	access := os.Getenv("AWS_ACCESS_KEY_ID")
 	secret := os.Getenv("AWS_SECRET_ACCESS_KEY")
@@ -102,11 +172,42 @@ func BedrockThinkingEffort(level string, levelMap map[string]*string, supportsNa
 	}
 }
 
+// BedrockThinkingBudget mirrors amazon-bedrock.ts defaultBudgets for non-adaptive
+// Claude models: minimal=1024, low=2048, medium=8192, high=16384, xhigh=16384.
+// Custom budgets (options.thinkingBudgets) override the defaults; since
+// ThinkingBudgets has no xhigh field, an xhigh request looks up the custom budget
+// under "high" (TS: `level = reasoning === "xhigh" ? "high" : reasoning`) while the
+// default still comes from defaultBudgets[reasoning]. This intentionally diverges
+// from the shared ThinkingBudgetWithBudgets helper used by Anthropic-direct.
 func BedrockThinkingBudget(level string, budgets ThinkingBudgets) int {
-	if level == "xhigh" {
+	switch level {
+	case "minimal":
+		if budgets.Minimal > 0 {
+			return budgets.Minimal
+		}
+		return 1024
+	case "low":
+		if budgets.Low > 0 {
+			return budgets.Low
+		}
+		return 2048
+	case "high":
+		if budgets.High > 0 {
+			return budgets.High
+		}
 		return 16384
+	case "xhigh":
+		// Custom budgets are keyed under "high" for xhigh; default is 16384.
+		if budgets.High > 0 {
+			return budgets.High
+		}
+		return 16384
+	default:
+		if budgets.Medium > 0 {
+			return budgets.Medium
+		}
+		return 8192
 	}
-	return ThinkingBudgetWithBudgets(level, budgets)
 }
 
 func BedrockImageFormat(mimeType string) bedrocktypes.ImageFormat {
@@ -176,7 +277,7 @@ func BedrockSupportsThinkingSignature(modelID, modelName string) bool {
 
 func BedrockSupportsAdaptiveThinking(modelID, modelName string) bool {
 	for _, value := range BedrockModelCandidates(modelID, modelName) {
-		if strings.Contains(value, "opus-4-6") || strings.Contains(value, "opus-4-7") || strings.Contains(value, "sonnet-4-6") {
+		if strings.Contains(value, "opus-4-6") || strings.Contains(value, "opus-4-7") || strings.Contains(value, "opus-4-8") || strings.Contains(value, "sonnet-4-6") {
 			return true
 		}
 	}
@@ -185,7 +286,7 @@ func BedrockSupportsAdaptiveThinking(modelID, modelName string) bool {
 
 func BedrockSupportsNativeXHigh(modelID, modelName string) bool {
 	for _, value := range BedrockModelCandidates(modelID, modelName) {
-		if strings.Contains(value, "opus-4-7") {
+		if strings.Contains(value, "opus-4-7") || strings.Contains(value, "opus-4-8") {
 			return true
 		}
 	}

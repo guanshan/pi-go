@@ -153,10 +153,11 @@ func TestAuthStorageListStatusHasAuthAndDelete(t *testing.T) {
 	}
 }
 
-// TestAuthStatusBedrockAmbientCredentials covers P2-02c: ambient AWS auth
-// (AWS_PROFILE / IAM keys / container / web-identity) must report bedrock as
-// configured via an "environment" source, matching TS getEnvApiKey/getAuthStatus
-// which resolves these sources to "<authenticated>".
+// TestAuthStatusBedrockAmbientCredentials covers P3-15: ambient AWS auth
+// (AWS_PROFILE / IAM keys / container / web-identity) must be DETECTED and
+// surfaced via an "environment" source+label, but reported Configured:false.
+// TS getAuthStatus reserves configured:true exclusively for credentials stored
+// in auth.json by provider name; ambient creds fall through to configured:false.
 func TestAuthStatusBedrockAmbientCredentials(t *testing.T) {
 	// Clear every ambient AWS source so the test starts from a clean slate.
 	for _, env := range []string{
@@ -173,19 +174,20 @@ func TestAuthStatusBedrockAmbientCredentials(t *testing.T) {
 		t.Fatalf("expected unconfigured bedrock with no ambient creds, got %#v", got)
 	}
 
-	// AWS_PROFILE alone is enough ambient auth for bedrock.
+	// AWS_PROFILE alone is enough ambient auth for bedrock detection, but it is
+	// not a stored credential, so Configured must remain false.
 	t.Setenv("AWS_PROFILE", "my-profile")
 	got := auth.AuthStatus("amazon-bedrock")
-	if !got.Configured || got.Source != "environment" || got.Label == "" {
-		t.Fatalf("expected bedrock configured via ambient AWS_PROFILE, got %#v", got)
+	if got.Configured || got.Source != "environment" || got.Label == "" {
+		t.Fatalf("expected bedrock detected (unconfigured) via ambient AWS_PROFILE, got %#v", got)
 	}
 
-	// IAM access+secret keys also count as ambient auth.
+	// IAM access+secret keys also count as ambient auth (detected, not configured).
 	os.Unsetenv("AWS_PROFILE")
 	t.Setenv("AWS_ACCESS_KEY_ID", "AKIAFAKE")
 	t.Setenv("AWS_SECRET_ACCESS_KEY", "secret")
-	if got := auth.AuthStatus("amazon-bedrock"); !got.Configured || got.Source != "environment" {
-		t.Fatalf("expected bedrock configured via ambient IAM keys, got %#v", got)
+	if got := auth.AuthStatus("amazon-bedrock"); got.Configured || got.Source != "environment" {
+		t.Fatalf("expected bedrock detected (unconfigured) via ambient IAM keys, got %#v", got)
 	}
 }
 

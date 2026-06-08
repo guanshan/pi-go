@@ -250,8 +250,12 @@ func DataURL(mimeType, data string) string {
 	return "data:" + mimeType + ";base64," + data
 }
 
+// SanitizeProviderText mirrors TS sanitizeSurrogates: it DELETES invalid/unpaired
+// surrogate bytes (replaces them with the empty string) rather than inserting a
+// U+FFFD replacement character, so the output matches upstream byte-for-byte on
+// malformed (WTF-8) input.
 func SanitizeProviderText(text string) string {
-	return strings.ToValidUTF8(text, "\uFFFD")
+	return strings.ToValidUTF8(text, "")
 }
 
 func ParseDataURLImage(value string) (mimeType string, data string, ok bool) {

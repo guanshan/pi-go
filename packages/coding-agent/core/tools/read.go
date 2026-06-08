@@ -47,8 +47,10 @@ func (t ReadTool) Execute(ctx context.Context, raw json.RawMessage, _ ToolUpdate
 	if !t.ModelSupportsImages {
 		nonVisionImageNote = "[Current model does not support images. The image will be omitted from this request.]"
 	}
-	if isImagePath(abs, data) {
-		mimeType := detectMime(abs, data)
+	// Mirror read.ts:243-247: classify the file purely by content sniffing
+	// (utils/mime.ts detectSupportedImageMimeType). A non-empty MIME means the
+	// content is a supported inline image; otherwise the file is read as text.
+	if mimeType := detectMime(abs, data); mimeType != "" {
 		if !t.AutoResize {
 			textNote := fmt.Sprintf("Read image file [%s]", mimeType)
 			if nonVisionImageNote != "" {

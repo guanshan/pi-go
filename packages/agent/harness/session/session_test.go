@@ -133,6 +133,56 @@ func TestSessionCustomNameAndBranchMove(t *testing.T) {
 	}
 }
 
+// TestSessionMoveToAppendsBranchSummaryForEmptySummary locks the TS behavior
+// (session.ts:254-264): MoveTo appends a branch_summary ENTRY whenever a summary
+// OBJECT is supplied, even when its text is "". A present *BranchMove with an
+// empty Summary must still produce a branch_summary entry in the session tree;
+// only a nil move (no summary object) skips the append. (Note: buildContext
+// still omits empty-summary branch_summary entries from the LLM context, both in
+// TS session.ts:56 `entry.summary` and Go context.go — so the entry is asserted
+// at the storage level, not via BuildContext.)
+func TestSessionMoveToAppendsBranchSummaryForEmptySummary(t *testing.T) {
+	ctx := context.Background()
+	sess, err := NewMemory(Metadata{ID: "s1", CreatedAt: "now"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rootID, err := sess.AppendMessage(ctx, ai.NewUserMessage("root", nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	countBranchSummaries := func() int {
+		entries, err := sess.Entries(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		n := 0
+		for _, e := range entries {
+			if _, ok := e.(BranchSummaryEntry); ok {
+				n++
+			}
+		}
+		return n
+	}
+
+	// Empty-summary BranchMove: a present summary object still appends an entry.
+	if _, err := sess.MoveTo(ctx, &rootID, &BranchMove{Summary: ""}); err != nil {
+		t.Fatal(err)
+	}
+	if got := countBranchSummaries(); got != 1 {
+		t.Fatalf("empty-summary move should append exactly one branch_summary entry, got %d", got)
+	}
+
+	// A nil move (no summary object) must NOT append a branch_summary entry.
+	if _, err := sess.MoveTo(ctx, &rootID, nil); err != nil {
+		t.Fatal(err)
+	}
+	if got := countBranchSummaries(); got != 1 {
+		t.Fatalf("nil move must not append a branch_summary entry, branch_summary count=%d", got)
+	}
+}
+
 func TestMemoryRepoCreateForkDelete(t *testing.T) {
 	ctx := context.Background()
 	repo := NewMemoryRepo()

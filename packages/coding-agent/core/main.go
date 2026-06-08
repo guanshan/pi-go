@@ -95,6 +95,10 @@ func MainWithOptions(ctx context.Context, argv []string, options MainOptions) er
 	if err := validateRuntimeArgs(args); err != nil {
 		return err
 	}
+	trustInteractive := !args.Print && args.Mode == cli.ModeText && !args.Help && args.ListModels == nil && isInputTTY()
+	projectTrusted := resolveProjectTrusted(cwd, agentDir, args, trustInteractive, os.Stdin, os.Stderr)
+	settings = NewSettingsManagerWithTrust(cwd, agentDir, projectTrusted)
+
 	resourceOptions := DefaultResourceLoaderOptions{
 		AdditionalExtensionPaths:      append([]string(nil), args.Extensions...),
 		AdditionalSkillPaths:          append([]string(nil), args.Skills...),
@@ -155,11 +159,18 @@ func MainWithOptions(ctx context.Context, argv []string, options MainOptions) er
 		}
 		return err
 	}
+	sessionCWD := firstNonEmpty(session.CWD(), cwd)
+	sessionProjectTrusted := projectTrusted
+	if canonicalizeTrustPath(sessionCWD) != canonicalizeTrustPath(cwd) {
+		sessionProjectTrusted = resolveProjectTrusted(sessionCWD, agentDir, args, trustInteractive, os.Stdin, os.Stderr)
+	}
 	if session.CWD() != "" && session.CWD() != services.Cwd {
+		targetSettings := NewSettingsManagerWithTrust(session.CWD(), agentDir, sessionProjectTrusted)
 		services, err = CreateAgentSessionServices(ctx, CreateAgentSessionServicesOptions{
 			Cwd:                   session.CWD(),
 			AgentDir:              agentDir,
 			AuthStorage:           auth,
+			SettingsManager:       targetSettings,
 			ResourceLoaderOptions: resourceOptions,
 			ExtensionFlagValues:   args.UnknownFlags,
 		})
@@ -255,15 +266,26 @@ func MainWithOptions(ctx context.Context, argv []string, options MainOptions) er
 		nextServices := services
 		if nextServices == nil || nextServices.Cwd != options.Cwd || nextServices.AgentDir != options.AgentDir || options.SessionManager != session {
 			var err error
+			targetTrusted := runtimeProjectTrusted(options.Cwd, sessionCWD, agentDir, args, sessionProjectTrusted)
 			nextServices, err = CreateAgentSessionServices(ctx, CreateAgentSessionServicesOptions{
 				Cwd:                   options.Cwd,
 				AgentDir:              options.AgentDir,
 				AuthStorage:           auth,
+				SettingsManager:       NewSettingsManagerWithTrust(options.Cwd, options.AgentDir, targetTrusted),
 				ResourceLoaderOptions: resourceOptions,
 				ExtensionFlagValues:   args.UnknownFlags,
 			})
 			if err != nil {
 				return CreateAgentSessionRuntimeResult{}, err
+			}
+		}
+
+		if options.LastActiveModel.Provider != "" && options.SessionManager != nil && nextServices != nil && nextServices.ModelRegistry != nil {
+			swapCtx := options.SessionManager.BuildContext()
+			if swapCtx.ModelProvider != "" && swapCtx.ModelID != "" {
+				if restored, found := nextServices.ModelRegistry.Find(swapCtx.ModelProvider, swapCtx.ModelID); found && nextServices.ModelRegistry.HasAuth(restored) {
+					activeModel = restored
+				}
 			}
 		}
 
@@ -329,7 +351,11 @@ func MainWithOptions(ctx context.Context, argv []string, options MainOptions) er
 	if !isInputTTY() {
 		data, _ := io.ReadAll(os.Stdin)
 		stdinContent = strings.TrimSpace(string(data))
-		if stdinContent != "" && !args.Print && args.Mode != cli.ModeJSON {
+		// TS resolveAppMode (main.ts:100-111) chooses print mode whenever stdin is
+		// not a TTY, regardless of whether the pipe carried any content — so an
+		// empty pipe (e.g. `pi < /dev/null`) runs print mode with no message and
+		// exits 0 silently, instead of dropping into the interactive banner (P2-34).
+		if !args.Print && args.Mode != cli.ModeJSON && args.Mode != cli.ModeRPC {
 			args.Print = true
 		}
 	}
@@ -364,6 +390,45 @@ func fatalDiagnostic(diagnostics []Diagnostic) error {
 // the user (print/json/rpc), matching the TS `appMode !== "interactive"` checks.
 func isNonInteractiveMode(args cli.Args) bool {
 	return args.Print || args.Mode == cli.ModeJSON || args.Mode == cli.ModeRPC
+}
+
+func resolveProjectTrusted(cwd, agentDir string, args cli.Args, interactive bool, stdin io.Reader, stderr io.Writer) bool {
+	if args.ProjectTrustOverride != nil {
+		return *args.ProjectTrustOverride
+	}
+	if !HasProjectTrustInputs(cwd) {
+		return true
+	}
+	store := NewProjectTrustStore(agentDir)
+	if decision, err := store.Get(cwd); err == nil && decision != nil {
+		return *decision
+	}
+	if !interactive {
+		return false
+	}
+	trusted, err := cli.Confirm(stdin, stderr, fmt.Sprintf("Trust the project files in %s? This loads its .pi settings, extensions, and skills.", cwd))
+	if err != nil {
+		return false
+	}
+	_ = store.Set(cwd, &trusted)
+	return trusted
+}
+
+func runtimeProjectTrusted(cwd, initialSessionCWD, agentDir string, args cli.Args, initialProjectTrusted bool) bool {
+	if canonicalizeTrustPath(cwd) == canonicalizeTrustPath(initialSessionCWD) {
+		return initialProjectTrusted
+	}
+	if args.ProjectTrustOverride != nil {
+		return *args.ProjectTrustOverride
+	}
+	if !HasProjectTrustInputs(cwd) {
+		return true
+	}
+	store := NewProjectTrustStore(agentDir)
+	if decision, err := store.Get(cwd); err == nil && decision != nil {
+		return *decision
+	}
+	return false
 }
 
 // capitalizeASCII upper-cases the first byte of s. It is used for short,

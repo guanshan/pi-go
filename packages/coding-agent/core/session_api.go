@@ -175,10 +175,39 @@ type ForkableUserMessage struct {
 	Text    string
 }
 
+// ContextUsage mirrors the TS ExtensionContext ContextUsage shape
+// ({ tokens, contextWindow, percent }). UsedTokens/EstimatedAt remain as Go
+// struct fields for internal callers (GetContextUsage, auto-compaction), but the
+// JSON wire form serialized into the extension snapshot is exactly the TS shape:
+// tokens and percent are null when the token count is unknown (e.g. right after a
+// compaction, before the next LLM response). See agent-session.ts getContextUsage.
 type ContextUsage struct {
-	UsedTokens    int       `json:"usedTokens"`
-	ContextWindow int       `json:"contextWindow"`
-	EstimatedAt   time.Time `json:"estimatedAt"`
+	UsedTokens    int
+	ContextWindow int
+	EstimatedAt   time.Time
+	// tokensUnknown marks the post-compaction state where the context token
+	// count cannot be trusted yet; tokens and percent serialize as null.
+	tokensUnknown bool
+}
+
+// MarshalJSON emits the TS ContextUsage wire shape { tokens, contextWindow,
+// percent }. tokens/percent are null when the count is unknown.
+func (c ContextUsage) MarshalJSON() ([]byte, error) {
+	out := map[string]any{
+		"contextWindow": c.ContextWindow,
+	}
+	if c.tokensUnknown {
+		out["tokens"] = nil
+		out["percent"] = nil
+	} else {
+		out["tokens"] = c.UsedTokens
+		if c.ContextWindow > 0 {
+			out["percent"] = float64(c.UsedTokens) / float64(c.ContextWindow) * 100
+		} else {
+			out["percent"] = nil
+		}
+	}
+	return marshalJSONNoHTMLEscape(out)
 }
 
 type SessionStats struct {

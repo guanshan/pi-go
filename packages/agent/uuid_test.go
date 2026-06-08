@@ -49,3 +49,22 @@ func TestEncodeSessionCWD(t *testing.T) {
 		t.Fatalf("encoded windows=%q", got)
 	}
 }
+
+// TestEncodeSessionCWDStripsExactlyOneLeadingSeparator locks EncodeSessionCWD to
+// the TS behavior cwd.replace(/^[/\\]/, "") (jsonl-repo.ts:35): exactly ONE
+// leading slash OR backslash is removed, and the two separators form a single
+// alternation class (so "\/foo" strips only the first "\", leaving "/foo").
+func TestEncodeSessionCWDStripsExactlyOneLeadingSeparator(t *testing.T) {
+	cases := map[string]string{
+		"//foo":           "---foo--",          // second slash survives -> "/foo"
+		`\\server\share`:  "---server-share--", // UNC: one backslash survives
+		`\/foo`:           "---foo--",          // strip only first "\", "/foo" survives
+		`/\foo`:           "---foo--",          // strip only first "/", "\foo" survives
+		"/single/leading": "--single-leading--",
+	}
+	for in, want := range cases {
+		if got := EncodeSessionCWD(in); got != want {
+			t.Fatalf("EncodeSessionCWD(%q)=%q, want %q", in, got, want)
+		}
+	}
+}

@@ -267,3 +267,47 @@ func (recordingImagesProvider) Generate(_ context.Context, model ImagesModel, _ 
 		StopReason: "stop",
 	}, nil
 }
+
+// P2-11: ImagesModel cost serializes only the 4 rate fields (input/output/
+// cacheRead/cacheWrite), never the runtime-only `total` field, matching the TS
+// ImagesModel catalog shape.
+func TestImagesModelCostWireShapeOmitsTotal(t *testing.T) {
+	model := ImagesModel{
+		Provider: "openrouter",
+		ID:       "google/gemini-image",
+		API:      "openrouter-images",
+		Cost:     Cost{Input: 0.015, Output: 0.03},
+	}
+	raw, err := json.Marshal(model)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatal(err)
+	}
+	var cost map[string]json.RawMessage
+	if err := json.Unmarshal(got["cost"], &cost); err != nil {
+		t.Fatalf("cost not present/object: %s", raw)
+	}
+	if _, ok := cost["total"]; ok {
+		t.Fatalf("cost must not emit total: %s", raw)
+	}
+	for _, key := range []string{"input", "output", "cacheRead", "cacheWrite"} {
+		if _, ok := cost[key]; !ok {
+			t.Fatalf("cost missing %q: %s", key, raw)
+		}
+	}
+	if len(cost) != 4 {
+		t.Fatalf("cost must have exactly 4 fields: %s", raw)
+	}
+
+	// Round-trip preserves the rate values.
+	var back ImagesModel
+	if err := json.Unmarshal(raw, &back); err != nil {
+		t.Fatal(err)
+	}
+	if back.Cost.Input != 0.015 || back.Cost.Output != 0.03 || back.Cost.Total != 0 {
+		t.Fatalf("round-trip cost=%#v", back.Cost)
+	}
+}

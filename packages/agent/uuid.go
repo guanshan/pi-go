@@ -35,7 +35,14 @@ func CreateTimestamp() string {
 const iso8601Millis = "2006-01-02T15:04:05.000Z07:00"
 
 func EncodeSessionCWD(cwd string) string {
-	clean := strings.TrimPrefix(strings.TrimPrefix(cwd, "/"), `\`)
+	// TS encodeCwd strips exactly ONE leading slash OR backslash:
+	// cwd.replace(/^[/\\]/, "") (jsonl-repo.ts:35). The two separators are a
+	// single character class, so only the first one is removed (e.g. "\/foo" ->
+	// "/foo", "//foo" -> "/foo"), not one of each.
+	clean := cwd
+	if len(clean) > 0 && (clean[0] == '/' || clean[0] == '\\') {
+		clean = clean[1:]
+	}
 	replacer := strings.NewReplacer("/", "-", "\\", "-", ":", "-")
 	return "--" + replacer.Replace(clean) + "--"
 }

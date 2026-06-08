@@ -7,9 +7,13 @@ import (
 )
 
 // FuzzyMatch is the result of FuzzyMatchString. Lower Score is better.
+//
+// Score is float64 to match the TS upstream (fuzzy.ts), whose `score` is a
+// JS number and accumulates a fractional "later position" penalty of i*0.1
+// per matched char. Using float64 preserves TS's fine-grained tie-breaking.
 type FuzzyMatch struct {
 	Value string
-	Score int
+	Score float64
 }
 
 // FuzzyMatchScore reports whether pattern fuzzy-matches text and returns a
@@ -17,7 +21,7 @@ type FuzzyMatch struct {
 // boundaries, and exact equality; gaps and late positions add penalty.
 //
 // The bool return is false when pattern is not a subsequence of text.
-func FuzzyMatchScore(pattern, text string) (int, bool) {
+func FuzzyMatchScore(pattern, text string) (float64, bool) {
 	if pattern == "" {
 		return 0, true
 	}
@@ -55,9 +59,9 @@ func FuzzyMatchString(pattern, value string) (FuzzyMatch, bool) {
 	return FuzzyMatch{Value: value, Score: score}, true
 }
 
-func primaryFuzzy(pl, tl string) (int, bool) {
+func primaryFuzzy(pl, tl string) (float64, bool) {
 	queryIdx := 0
-	score := 0
+	score := 0.0
 	lastMatchIdx := -1
 	consecutive := 0
 	pr := []rune(pl)
@@ -77,17 +81,20 @@ func primaryFuzzy(pl, tl string) (int, bool) {
 		}
 		if lastMatchIdx == i-1 {
 			consecutive++
-			score -= consecutive * 5
+			score -= float64(consecutive * 5)
 		} else {
 			consecutive = 0
 			if lastMatchIdx >= 0 {
-				score += (i - lastMatchIdx - 1) * 2
+				score += float64((i - lastMatchIdx - 1) * 2)
 			}
 		}
 		if isWordBoundary {
 			score -= 10
 		}
-		score += i / 10 // small "later position" penalty (was *0.1 in upstream)
+		// Slight penalty for later matches, matching TS `score += i * 0.1`
+		// (fractional). Earlier Go used integer `i / 10`, a step function that
+		// is 0 for i<10 and coarsened the positional tie-breaker by 10x.
+		score += float64(i) * 0.1
 		lastMatchIdx = i
 		queryIdx++
 	}
@@ -170,12 +177,12 @@ func FuzzyFilter[T any](items []T, query string, getText func(T) string) []T {
 	tokens := strings.Fields(q)
 	type scored struct {
 		item  T
-		score int
+		score float64
 	}
 	var matched []scored
 	for _, item := range items {
 		text := getText(item)
-		total := 0
+		total := 0.0
 		ok := true
 		for _, tok := range tokens {
 			if score, hit := FuzzyMatchScore(tok, text); hit {

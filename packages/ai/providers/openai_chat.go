@@ -9,10 +9,11 @@ import (
 )
 
 type PreparedOpenAIChatRequest struct {
-	Key        string
-	Headers    map[string]string
-	Body       map[string]any
-	BearerAuth bool
+	Key                      string
+	Headers                  map[string]string
+	Body                     map[string]any
+	BearerAuth               bool
+	SupportsUsageInStreaming bool
 }
 
 type OpenAIChatRequestOptions struct {
@@ -38,6 +39,7 @@ type OpenAIChatRequestOptions struct {
 	SupportsStore                               bool
 	SupportsDeveloperRole                       bool
 	SupportsReasoningEffort                     bool
+	SupportsUsageInStreaming                    bool
 	CacheControlFormat                          string
 	SendSessionAffinityHeaders                  bool
 	SupportsLongCacheRetention                  *bool
@@ -137,9 +139,6 @@ func BuildOpenAIChatRequest(key string, options OpenAIChatRequestOptions) Prepar
 	if len(options.Tools) > 0 {
 		tools = OpenAIChatTools(options.Tools, options.SupportsStrictMode)
 		body["tools"] = tools
-		if options.ToolChoice == nil {
-			body["tool_choice"] = "auto"
-		}
 		if options.ZaiToolStream {
 			body["tool_stream"] = true
 		}
@@ -182,7 +181,7 @@ func BuildOpenAIChatRequest(key string, options OpenAIChatRequestOptions) Prepar
 		bearerAuth = false
 		headers = applyCloudflareGatewayAuthHeaders(headers, key)
 	}
-	return PreparedOpenAIChatRequest{Key: key, Headers: headers, Body: body, BearerAuth: bearerAuth}
+	return PreparedOpenAIChatRequest{Key: key, Headers: headers, Body: body, BearerAuth: bearerAuth, SupportsUsageInStreaming: options.SupportsUsageInStreaming}
 }
 
 func OpenAIChatMessages(options OpenAIChatRequestOptions) []map[string]any {
@@ -192,7 +191,7 @@ func OpenAIChatMessages(options OpenAIChatRequestOptions) []map[string]any {
 		if options.Reasoning && options.SupportsDeveloperRole {
 			role = "developer"
 		}
-		out = append(out, map[string]any{"role": role, "content": options.SystemPrompt})
+		out = append(out, map[string]any{"role": role, "content": SanitizeProviderText(options.SystemPrompt)})
 	}
 	lastRole := ""
 	for i := 0; i < len(options.Messages); i++ {
@@ -224,8 +223,9 @@ func OpenAIChatMessages(options OpenAIChatRequestOptions) []map[string]any {
 				switch b.Type {
 				case "text":
 					if strings.TrimSpace(b.Text) != "" {
-						text += b.Text
-						textParts = append(textParts, map[string]any{"type": "text", "text": SanitizeProviderText(b.Text)})
+						sanitized := SanitizeProviderText(b.Text)
+						text += sanitized
+						textParts = append(textParts, map[string]any{"type": "text", "text": sanitized})
 					}
 				case "thinking":
 					if options.RequiresThinkingAsText {
@@ -346,13 +346,13 @@ func openAIChatMessageHasContent(content any) bool {
 
 func openAIChatContent(msg OpenAIChatMessage) any {
 	if len(msg.Blocks) == 0 {
-		return msg.Text
+		return SanitizeProviderText(msg.Text)
 	}
 	var out []map[string]any
 	for _, b := range msg.Blocks {
 		switch b.Type {
 		case "text":
-			out = append(out, map[string]any{"type": "text", "text": b.Text})
+			out = append(out, map[string]any{"type": "text", "text": SanitizeProviderText(b.Text)})
 		case "image":
 			out = append(out, map[string]any{"type": "image_url", "image_url": map[string]any{"url": DataURL(b.MimeType, b.Data)}})
 		}
@@ -409,9 +409,9 @@ func openAIChatToolResultText(msg OpenAIChatMessage) string {
 	}
 	text := strings.Join(parts, "\n")
 	if text == "" && hasImage {
-		return "(see attached image)"
+		return SanitizeProviderText("(see attached image)")
 	}
-	return text
+	return SanitizeProviderText(text)
 }
 
 // applyCloudflareGatewayAuthHeaders rewrites auth headers for the

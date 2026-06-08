@@ -33,8 +33,15 @@ func TestProcessFileArgumentsTextImageAndReadPathVariants(t *testing.T) {
 	curlyPath := filepath.Join(cwd, "Capture d\u2019ecran.txt")
 	fileURLPath := filepath.Join(cwd, "from url.txt")
 	for path, content := range map[string][]byte{
-		textPath:       []byte("plain text"),
-		imagePath:      {0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n'},
+		textPath: []byte("plain text"),
+		// Valid minimal PNG (signature + IHDR length 13); a bare signature is
+		// treated as text by the TS-faithful sniffer (utils/mime.ts requires IHDR).
+		imagePath: {
+			0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
+			0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
+			0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
+			0x08, 0x06, 0x00, 0x00, 0x00, 0x1f, 0x15, 0xc4, 0x89,
+		},
 		screenshotPath: []byte("screenshot"),
 		curlyPath:      []byte("curly"),
 		fileURLPath:    []byte("file url"),

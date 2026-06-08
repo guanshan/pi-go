@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"unicode/utf16"
 
 	"github.com/guanshan/pi-go/packages/agent/gitignore"
 	"github.com/guanshan/pi-go/packages/ai"
@@ -42,14 +43,21 @@ func (t GrepTool) Execute(ctx context.Context, raw json.RawMessage, _ ToolUpdate
 		IgnoreCase bool   `json:"ignoreCase"`
 		Literal    bool   `json:"literal"`
 		Context    int    `json:"context"`
-		Limit      int    `json:"limit"`
+		// Limit is a pointer so an explicit limit:0 is distinguished from an
+		// absent limit, matching grep.ts:35 Type.Optional(Type.Number()).
+		Limit *int `json:"limit"`
 	}
 	if err := json.Unmarshal(raw, &args); err != nil || args.Pattern == "" {
 		return toolError("Invalid grep input: pattern is required")
 	}
-	limit := args.Limit
-	if limit <= 0 {
-		limit = DefaultGrepLimit
+	// Mirror grep.ts:189 effectiveLimit = Math.max(1, limit ?? DEFAULT_LIMIT):
+	// absent -> 100, explicit 0 or negative -> clamped to 1.
+	limit := DefaultGrepLimit
+	if args.Limit != nil {
+		limit = *args.Limit
+	}
+	if limit < 1 {
+		limit = 1
 	}
 	if ctx == nil {
 		ctx = context.Background()
@@ -475,20 +483,47 @@ func globToRegexp(pattern string) *regexp.Regexp {
 
 func formatRel(path, root string, rootIsDir bool) string {
 	if rootIsDir {
-		if rel, err := filepath.Rel(root, path); err == nil {
+		// Mirror grep.ts formatPath: only use the relative path when it stays
+		// inside the search dir (does not start with ".."); otherwise fall back to
+		// the bare basename. This matters for matches that resolve outside root
+		// (e.g. via a symlink).
+		if rel, err := filepath.Rel(root, path); err == nil && rel != "" && !strings.HasPrefix(rel, "..") {
 			return filepath.ToSlash(rel)
 		}
 	}
 	return filepath.Base(path)
 }
 
-// truncateLine truncates a single line to maxChars runes, appending the
-// "... [truncated]" suffix (matching truncate.ts truncateLine) and reporting
-// whether truncation happened so callers can surface a notice.
+// truncateLine truncates a single line to maxChars UTF-16 code units, appending
+// the "... [truncated]" suffix (matching truncate.ts truncateLine, which uses
+// JavaScript string .length / .slice — UTF-16 code units) and reporting whether
+// truncation happened so callers can surface a notice.
 func truncateLine(line string, maxChars int) (string, bool) {
-	r := []rune(line)
-	if len(r) <= maxChars {
+	units := utf16Units(line)
+	if len(units) <= maxChars {
 		return line, false
 	}
-	return string(r[:maxChars]) + "... [truncated]", true
+	return utf16Slice(units, 0, maxChars) + "... [truncated]", true
+}
+
+// utf16Units returns the UTF-16 code units of s, matching the semantics of a
+// JavaScript string (where .length counts UTF-16 code units and non-BMP
+// characters occupy two units).
+func utf16Units(s string) []uint16 {
+	return utf16.Encode([]rune(s))
+}
+
+// utf16Slice decodes units[start:end] back to a UTF-8 string, mirroring
+// JavaScript String.prototype.slice over UTF-16 code units.
+func utf16Slice(units []uint16, start, end int) string {
+	if start < 0 {
+		start = 0
+	}
+	if end > len(units) {
+		end = len(units)
+	}
+	if start >= end {
+		return ""
+	}
+	return string(utf16.Decode(units[start:end]))
 }

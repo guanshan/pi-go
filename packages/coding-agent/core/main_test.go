@@ -2,7 +2,9 @@ package core
 
 import (
 	"bytes"
+	"context"
 	"errors"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -18,6 +20,17 @@ func TestValidateRuntimeArgsRejectsRPCFiles(t *testing.T) {
 	}
 }
 
+// flushTestSession records an assistant reply on a fixture session so it
+// represents a real, resumable session (one that has received a model reply),
+// matching how resume/listing/switch flows are exercised in practice.
+func flushTestSession(t *testing.T, sm *SessionManager) {
+	t.Helper()
+	reply := ai.NewAssistantMessageForModel(ai.Model{Provider: "faux", ID: "faux"}, ai.TextBlocks("ok"), ai.Usage{}, "stop")
+	if err := sm.AppendMessage(reply); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestCreateSessionResumeIncludesGlobalSessions(t *testing.T) {
 	sessionDir := t.TempDir()
 	cwdA := t.TempDir()
@@ -29,6 +42,7 @@ func TestCreateSessionResumeIncludesGlobalSessions(t *testing.T) {
 	if err := created.AppendMessage(ai.NewUserMessage("from A", nil)); err != nil {
 		t.Fatal(err)
 	}
+	flushTestSession(t, created)
 
 	resumed, err := createSession(cli.Args{Resume: true}, cwdB, sessionDir, nil, nil, nil)
 	if err != nil {
@@ -36,6 +50,77 @@ func TestCreateSessionResumeIncludesGlobalSessions(t *testing.T) {
 	}
 	if resumed.CWD() != cwdA {
 		t.Fatalf("resumed cwd=%q want %q", resumed.CWD(), cwdA)
+	}
+}
+
+func TestRuntimeProjectTrustedDoesNotInheritInitialTrustForDifferentCWD(t *testing.T) {
+	agentDir := t.TempDir()
+	initialCWD := t.TempDir()
+	targetCWD := t.TempDir()
+	if err := os.MkdirAll(ProjectPiDir(targetCWD), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if runtimeProjectTrusted(targetCWD, initialCWD, agentDir, cli.Args{}, true) {
+		t.Fatal("unknown target cwd with project trust inputs must default to untrusted")
+	}
+
+	trusted := true
+	if err := NewProjectTrustStore(agentDir).Set(targetCWD, &trusted); err != nil {
+		t.Fatal(err)
+	}
+	if !runtimeProjectTrusted(targetCWD, initialCWD, agentDir, cli.Args{}, false) {
+		t.Fatal("stored trusted target cwd should be trusted")
+	}
+
+	noApprove := false
+	if runtimeProjectTrusted(targetCWD, initialCWD, agentDir, cli.Args{ProjectTrustOverride: &noApprove}, true) {
+		t.Fatal("--no-approve should force target cwd untrusted")
+	}
+
+	if !runtimeProjectTrusted(initialCWD, initialCWD, agentDir, cli.Args{}, true) {
+		t.Fatal("initial session cwd should preserve the already-resolved decision")
+	}
+}
+
+func TestUntrustedTargetCWDServicesSkipProjectSettingsAndResources(t *testing.T) {
+	agentDir := t.TempDir()
+	initialCWD := t.TempDir()
+	targetCWD := t.TempDir()
+	if err := os.MkdirAll(ProjectPiDir(targetCWD), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(ProjectPiDir(targetCWD), "settings.json"), []byte(`{"defaultProvider":"project-provider"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(ProjectPiDir(targetCWD), "SYSTEM.md"), []byte("project system prompt"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	trusted := runtimeProjectTrusted(targetCWD, initialCWD, agentDir, cli.Args{}, true)
+	if trusted {
+		t.Fatal("target cwd should be untrusted without a stored decision")
+	}
+	settings := NewSettingsManagerWithTrust(targetCWD, agentDir, trusted)
+	services, err := CreateAgentSessionServices(context.Background(), CreateAgentSessionServicesOptions{
+		Cwd:             targetCWD,
+		AgentDir:        agentDir,
+		SettingsManager: settings,
+		ResourceLoaderOptions: DefaultResourceLoaderOptions{
+			NoContextFiles: true,
+			NoExtensions:   true,
+			NoSkills:       true,
+			NoThemes:       true,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if services.SettingsManager.Project.DefaultProvider != "" {
+		t.Fatalf("project settings loaded despite untrusted target: %#v", services.SettingsManager.Project)
+	}
+	if strings.Contains(services.ResourceLoader.SystemPrompt, "project system prompt") {
+		t.Fatalf("project SYSTEM.md loaded despite untrusted target: %q", services.ResourceLoader.SystemPrompt)
 	}
 }
 
@@ -148,6 +233,7 @@ func TestResolveSessionClassifiesMatches(t *testing.T) {
 	if err := local.AppendMessage(ai.NewUserMessage("local", nil)); err != nil {
 		t.Fatal(err)
 	}
+	flushTestSession(t, local)
 	other, err := NewSessionManager(cwdA, sessionDir)
 	if err != nil {
 		t.Fatal(err)
@@ -155,6 +241,7 @@ func TestResolveSessionClassifiesMatches(t *testing.T) {
 	if err := other.AppendMessage(ai.NewUserMessage("other", nil)); err != nil {
 		t.Fatal(err)
 	}
+	flushTestSession(t, other)
 
 	localRes := ResolveSession(local.SessionID(), cwdB, sessionDir)
 	if localRes.Type != ResolvedSessionLocal || localRes.Path != local.File() {
@@ -183,6 +270,7 @@ func TestCreateSessionCrossProjectErrorsInNonInteractiveMode(t *testing.T) {
 	if err := other.AppendMessage(ai.NewUserMessage("from A", nil)); err != nil {
 		t.Fatal(err)
 	}
+	flushTestSession(t, other)
 
 	// From cwdB, a --session matching the cwdA session must NOT silently open the
 	// other project in print/json mode.
@@ -206,6 +294,7 @@ func TestCreateSessionCrossProjectInteractiveForkConfirm(t *testing.T) {
 	if err := other.AppendMessage(ai.NewUserMessage("from A", nil)); err != nil {
 		t.Fatal(err)
 	}
+	flushTestSession(t, other)
 
 	t.Run("confirm forks into current project", func(t *testing.T) {
 		var out bytes.Buffer

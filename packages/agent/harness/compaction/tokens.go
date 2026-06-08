@@ -1,8 +1,10 @@
 package compaction
 
 import (
+	"bytes"
 	"encoding/json"
 	"math"
+	"strings"
 
 	"github.com/guanshan/pi-go/packages/agent"
 	"github.com/guanshan/pi-go/packages/agent/harness/session"
@@ -254,9 +256,16 @@ func estimateContentChars(blocks []ai.ContentBlock) int {
 }
 
 func safeJSON(value any) string {
-	raw, err := json.Marshal(value)
-	if err != nil {
+	// Mirror TS safeJsonStringify, which wraps JSON.stringify (compaction.ts:28-34).
+	// JSON.stringify does NOT HTML-escape <, >, or &, so the token-estimation
+	// character count must match: use an encoder with SetEscapeHTML(false)
+	// instead of json.Marshal (which escapes those to < etc.). The encoder
+	// appends a trailing newline that JSON.stringify omits, so trim it.
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(value); err != nil {
 		return "[unserializable]"
 	}
-	return string(raw)
+	return strings.TrimSuffix(buf.String(), "\n")
 }

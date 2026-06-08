@@ -140,7 +140,7 @@ func (r *ModelRegistry) runMistralChatStream(ctx context.Context, req ChatReques
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		raw, _ := io.ReadAll(resp.Body)
-		return mistralStreamError(partial, fmt.Errorf("HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(raw))), stream)
+		return mistralStreamError(partial, fmt.Errorf("%s", formatMistralError(resp.StatusCode, strings.TrimSpace(string(raw)))), stream)
 	}
 
 	stream.Push(AssistantMessageEvent{Type: "start", Partial: partial})
@@ -187,6 +187,25 @@ func (r *ModelRegistry) runMistralChatStream(ctx context.Context, req ChatReques
 	tracker.Finish(stream, message)
 	stream.Push(AssistantMessageEvent{Type: "done", Reason: doneReason(message.StopReason), Partial: message, Message: message})
 	return message, nil
+}
+
+const maxMistralErrorBodyChars = 4000
+
+// formatMistralError mirrors mistral.ts formatMistralError for the streaming HTTP
+// failure path: "Mistral API error (<statusCode>): <body>" with the body
+// truncated to maxMistralErrorBodyChars and a "... [truncated N chars]" suffix.
+// (The non-streaming mistralChat path surfaces errors through the shared doJSON
+// helper, which keeps the generic "HTTP <status>: <body>" wording.)
+func formatMistralError(statusCode int, body string) string {
+	return fmt.Sprintf("Mistral API error (%d): %s", statusCode, truncateErrorText(body, maxMistralErrorBodyChars))
+}
+
+func truncateErrorText(text string, maxChars int) string {
+	runes := []rune(text)
+	if len(runes) <= maxChars {
+		return text
+	}
+	return fmt.Sprintf("%s... [truncated %d chars]", string(runes[:maxChars]), len(runes)-maxChars)
 }
 
 func mistralMessages(messages []Message, model Model) []aiproviders.MistralMessage {
@@ -263,13 +282,13 @@ type mistralStreamUpdate struct {
 }
 
 type mistralStreamAccumulator struct {
-	blocks            []mistralStreamingBlock
-	toolBlocksByIndex map[int]int
-	finishReason      string
-	usage             aiproviders.MistralUsage
-	sawChunk          bool
-	responseID        string
-	responseModel     string
+	blocks          []mistralStreamingBlock
+	toolBlocksByKey map[string]int
+	finishReason    string
+	usage           aiproviders.MistralUsage
+	sawChunk        bool
+	responseID      string
+	responseModel   string
 }
 
 type mistralStreamingBlock struct {
@@ -283,7 +302,7 @@ type mistralStreamingBlock struct {
 }
 
 func newMistralStreamAccumulator() *mistralStreamAccumulator {
-	return &mistralStreamAccumulator{toolBlocksByIndex: map[int]int{}}
+	return &mistralStreamAccumulator{toolBlocksByKey: map[string]int{}}
 }
 
 func (s *mistralStreamAccumulator) SawChunk() bool {
@@ -357,14 +376,16 @@ func (s *mistralStreamAccumulator) Apply(raw []byte) ([]mistralStreamUpdate, err
 			}
 		}
 		for _, tc := range choice.Delta.ToolCalls {
-			index := s.toolBlock(tc.Index)
+			// Mirror mistral.ts: resolve the callId eagerly (deriving
+			// "toolcall:index" when the id is null/"null") and key the dedup map on
+			// the composite callId:index so distinct call ids that reuse a stream
+			// index are not merged.
+			callID := tc.ID
+			if callID == "" || callID == "null" {
+				callID = aiproviders.DeriveMistralToolCallID(fmt.Sprintf("toolcall:%d", tc.Index), 0)
+			}
+			index := s.toolBlock(callID, tc.Index, tc.Function.Name)
 			call := &s.blocks[index]
-			if tc.ID != "" {
-				call.id = tc.ID
-			}
-			if tc.Function.Name != "" {
-				call.name = tc.Function.Name
-			}
 			if tc.Function.Arguments != "" {
 				call.arguments.WriteString(tc.Function.Arguments)
 			}
@@ -382,13 +403,16 @@ func (s *mistralStreamAccumulator) contentBlock(typ string) int {
 	return len(s.blocks) - 1
 }
 
-func (s *mistralStreamAccumulator) toolBlock(index int) int {
-	if blockIndex, ok := s.toolBlocksByIndex[index]; ok {
+func (s *mistralStreamAccumulator) toolBlock(callID string, index int, name string) int {
+	key := fmt.Sprintf("%s:%d", callID, index)
+	if blockIndex, ok := s.toolBlocksByKey[key]; ok {
 		return blockIndex
 	}
-	s.blocks = append(s.blocks, mistralStreamingBlock{typ: "toolCall", streamIndex: index})
+	// Mirror mistral.ts: id and name are fixed when the block is created for a key
+	// and are not overwritten by subsequent deltas (those only append arguments).
+	s.blocks = append(s.blocks, mistralStreamingBlock{typ: "toolCall", streamIndex: index, id: callID, name: name})
 	blockIndex := len(s.blocks) - 1
-	s.toolBlocksByIndex[index] = blockIndex
+	s.toolBlocksByKey[key] = blockIndex
 	return blockIndex
 }
 

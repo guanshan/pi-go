@@ -99,15 +99,43 @@ func TestConvertToLLMPreservesArrayContentCustomMessage(t *testing.T) {
 	}
 }
 
-func TestConvertToLLMDropsEmptyCustomContent(t *testing.T) {
+// TestConvertToLLMKeepsEmptyCustomContent verifies that empty-content custom
+// messages are NOT dropped: TS convertToLlm unconditionally emits a user message
+// for every custom entry (messages.ts:133-139). An empty-string content becomes
+// a single empty text block [{type:text,text:""}]; nil/other empty content still
+// yields a kept user message (with empty content blocks).
+func TestConvertToLLMKeepsEmptyCustomContent(t *testing.T) {
+	// Empty-string content -> user message with [{type:text,text:""}].
 	llm, err := ConvertToLLM([]agent.AgentMessage{
+		CustomMessage{Role: "custom", CustomType: "empty", Content: "", TimestampMs: 5},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(llm) != 1 {
+		t.Fatalf("empty-string custom content should be kept, got %#v", llm)
+	}
+	if role := llm[0].MessageRole(); role != "user" {
+		t.Fatalf("converted message role = %q, want user", role)
+	}
+	blocks := ai.MessageBlocks(llm[0])
+	if len(blocks) != 1 || blocks[0].Type != "text" || blocks[0].Text != "" {
+		t.Fatalf("expected single empty text block [{type:text,text:\"\"}], got %#v", blocks)
+	}
+
+	// nil content -> still kept as a user message (TS emits a user message
+	// regardless; Go yields empty content blocks for nil).
+	llmNil, err := ConvertToLLM([]agent.AgentMessage{
 		CustomMessage{Role: "custom", CustomType: "empty", Content: nil, TimestampMs: 5},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(llm) != 0 {
-		t.Fatalf("empty custom content should be dropped, got %#v", llm)
+	if len(llmNil) != 1 {
+		t.Fatalf("nil custom content should be kept, got %#v", llmNil)
+	}
+	if role := llmNil[0].MessageRole(); role != "user" {
+		t.Fatalf("converted message role = %q, want user", role)
 	}
 }
 

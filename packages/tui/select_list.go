@@ -139,7 +139,7 @@ func (s *SelectList) SelectedItem() (SelectItem, bool) {
 // Render produces the list lines for the given width.
 func (s *SelectList) Render(width int) []string {
 	if len(s.filtered) == 0 {
-		return []string{s.theme.NoMatch("  No matching items")}
+		return []string{s.theme.NoMatch("  No matching commands")}
 	}
 	primary := s.primaryColumnWidth()
 	maxVis := s.maxVis

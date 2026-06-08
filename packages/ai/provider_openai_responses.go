@@ -80,10 +80,30 @@ func (r *ModelRegistry) openAIResponsesChat(ctx context.Context, req ChatRequest
 }
 
 func openAIResponsesParsedWithRequestDefaults(parsed aiproviders.OpenAIResponsesParsed, req ChatRequest) aiproviders.OpenAIResponsesParsed {
+	requestTier := metadataString(req.Metadata, "serviceTier")
+	if req.Model.API == "openai-codex-responses" {
+		parsed.ServiceTier = resolveCodexServiceTier(parsed.ServiceTier, requestTier)
+		return parsed
+	}
 	if parsed.ServiceTier == "" {
-		parsed.ServiceTier = metadataString(req.Metadata, "serviceTier")
+		parsed.ServiceTier = requestTier
 	}
 	return parsed
+}
+
+// resolveCodexServiceTier mirrors resolveCodexServiceTier in
+// openai-codex-responses.ts: when the response echoes "default" but the request
+// asked for "flex"/"priority", the requested tier is used for pricing; otherwise
+// the response tier is kept (falling back to the request tier when the response
+// reports none).
+func resolveCodexServiceTier(responseTier, requestTier string) string {
+	if responseTier == "default" && (requestTier == "flex" || requestTier == "priority") {
+		return requestTier
+	}
+	if responseTier != "" {
+		return responseTier
+	}
+	return requestTier
 }
 
 func openAIResponsesBody(req ChatRequest) (map[string]any, error) {

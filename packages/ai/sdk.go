@@ -345,6 +345,12 @@ func ClampThinkingLevel(model Model, level ThinkingLevel) ThinkingLevel {
 }
 
 func ModelsAreEqual(a, b Model) bool {
+	// Mirror the TS modelsAreEqual null/undefined guard: a zero-value Model
+	// (empty provider AND id) stands in for null in TS, so two such values must
+	// compare unequal rather than equal.
+	if (a.Provider == "" && a.ID == "") || (b.Provider == "" && b.ID == "") {
+		return false
+	}
 	return a.Provider == b.Provider && a.ID == b.ID
 }
 

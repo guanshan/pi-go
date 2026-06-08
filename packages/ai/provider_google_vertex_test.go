@@ -71,7 +71,13 @@ func TestGoogleVertexChatPayloadAndParse(t *testing.T) {
 		t.Fatalf("x-goog-api-key=%q", apiKey)
 	}
 	config := captured["generationConfig"].(map[string]any)
-	if config["maxOutputTokens"] != float64(123) || config["temperature"] != 0.1 {
+	// TS google-vertex.ts:438-440 sets maxOutputTokens ONLY when the caller
+	// passed options.maxTokens; this request did not, so the field is omitted
+	// (no fallback to the model's MaxOutput, no 1024 floor).
+	if _, ok := config["maxOutputTokens"]; ok {
+		t.Fatalf("maxOutputTokens should be omitted when MaxTokens unset: %#v", config)
+	}
+	if config["temperature"] != 0.1 {
 		t.Fatalf("generationConfig=%#v", config)
 	}
 	thinkingConfig := config["thinkingConfig"].(map[string]any)

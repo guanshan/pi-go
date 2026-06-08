@@ -93,6 +93,29 @@ func TestBoxRenderCache(t *testing.T) {
 	}
 }
 
+func TestSelectListEmptyStateMessage(t *testing.T) {
+	// Parity with TS select-list.ts:79 — the empty-state message is exactly
+	// "  No matching commands" (two leading spaces, word "commands"), not the
+	// previous generic "  No matching items".
+	identity := func(s string) string { return s }
+	theme := SelectListTheme{
+		SelectedPrefix: identity,
+		SelectedText:   identity,
+		Description:    identity,
+		ScrollInfo:     identity,
+		NoMatch:        identity,
+	}
+	s := NewSelectList([]SelectItem{{Value: "alpha"}}, 5, theme, SelectListLayoutOptions{})
+	s.SetFilter("zzzz") // matches nothing
+	out := s.Render(40)
+	if len(out) != 1 {
+		t.Fatalf("empty-state render should be a single line, got %d: %#v", len(out), out)
+	}
+	if out[0] != "  No matching commands" {
+		t.Fatalf("empty-state message: got %q want %q", out[0], "  No matching commands")
+	}
+}
+
 func TestSettingsListToggle(t *testing.T) {
 	SetKeybindings(nil)
 	s := &SettingsList{Items: []SettingItem{{Label: "x"}, {Label: "y"}}}

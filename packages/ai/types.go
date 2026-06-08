@@ -59,7 +59,7 @@ type modelJSON struct {
 	BaseURL          string             `json:"baseUrl"`
 	EnvKey           string             `json:"envKey,omitempty"`
 	Input            []string           `json:"input,omitempty"`
-	Reasoning        bool               `json:"reasoning,omitempty"`
+	Reasoning        *bool              `json:"reasoning,omitempty"`
 	ThinkingLevels   []ThinkingLevel    `json:"thinkingLevels,omitempty"`
 	ThinkingLevelMap map[string]*string `json:"thinkingLevelMap,omitempty"`
 	ContextWindow    int                `json:"contextWindow,omitempty"`
@@ -67,10 +67,21 @@ type modelJSON struct {
 	MaxOutput        int                `json:"maxOutput,omitempty"`
 	Cost             ModelCost          `json:"cost,omitempty"`
 	Headers          map[string]string  `json:"headers,omitempty"`
-	Compat           OpenAICompat       `json:"compat,omitempty"`
+	Compat           *OpenAICompat      `json:"compat,omitempty"`
 }
 
 func (m Model) MarshalJSON() ([]byte, error) {
+	// reasoning is a required boolean in the upstream TS Model shape and must
+	// always be serialized, even when false. Use a pointer so it is never
+	// dropped by omitempty.
+	reasoning := m.Reasoning
+	// compat is optional upstream (compat?:) and is omitted entirely when it
+	// carries no overrides; emit it only when non-zero.
+	var compat *OpenAICompat
+	if !isZeroCompat(m.Compat) {
+		c := m.Compat
+		compat = &c
+	}
 	return json.Marshal(modelJSON{
 		Provider:         m.Provider,
 		ID:               m.ID,
@@ -79,14 +90,14 @@ func (m Model) MarshalJSON() ([]byte, error) {
 		BaseURL:          m.BaseURL,
 		EnvKey:           m.EnvKey,
 		Input:            m.Input,
-		Reasoning:        m.Reasoning,
+		Reasoning:        &reasoning,
 		ThinkingLevels:   m.ThinkingLevels,
 		ThinkingLevelMap: m.ThinkingLevelMap,
 		ContextWindow:    m.ContextWindow,
 		MaxTokens:        m.MaxOutput,
 		Cost:             m.Cost,
 		Headers:          m.Headers,
-		Compat:           m.Compat,
+		Compat:           compat,
 	})
 }
 
@@ -94,6 +105,14 @@ func (m *Model) UnmarshalJSON(data []byte) error {
 	var raw modelJSON
 	if err := json.Unmarshal(data, &raw); err != nil {
 		return err
+	}
+	reasoning := false
+	if raw.Reasoning != nil {
+		reasoning = *raw.Reasoning
+	}
+	var compat OpenAICompat
+	if raw.Compat != nil {
+		compat = *raw.Compat
 	}
 	*m = Model{
 		Provider:         raw.Provider,
@@ -103,14 +122,14 @@ func (m *Model) UnmarshalJSON(data []byte) error {
 		BaseURL:          raw.BaseURL,
 		EnvKey:           raw.EnvKey,
 		Input:            raw.Input,
-		Reasoning:        raw.Reasoning,
+		Reasoning:        reasoning,
 		ThinkingLevels:   raw.ThinkingLevels,
 		ThinkingLevelMap: raw.ThinkingLevelMap,
 		ContextWindow:    raw.ContextWindow,
 		MaxOutput:        firstPositive(raw.MaxTokens, raw.MaxOutput),
 		Cost:             raw.Cost,
 		Headers:          raw.Headers,
-		Compat:           raw.Compat,
+		Compat:           compat,
 		Raw:              cloneRawMessage(data),
 	}
 	return nil

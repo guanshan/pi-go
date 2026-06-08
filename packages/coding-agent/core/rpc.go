@@ -543,7 +543,15 @@ func handleRPCCommand(ctx context.Context, runtime *AgentSessionRuntime, cmd rpc
 	case "get_available_models":
 		w.response(cmd.ID, "get_available_models", true, map[string]any{"models": agent.Registry.AvailableConfigured()}, "")
 	case "set_thinking_level":
-		if err := agent.SetThinkingLevel(cmd.Level); err != nil {
+		// TS rpc-mode set_thinking_level (rpc-mode.ts:491-494) calls
+		// session.setThinkingLevel synchronously and unconditionally returns
+		// success — agent-session.ts:1535 setThinkingLevel is void with no
+		// streaming guard. Go's SetThinkingLevel adds a mutex-safety streaming
+		// guard that TS lacks, so suppress only that streaming-guard error and
+		// still report success, matching TS. Other errors (e.g. invalid level)
+		// continue to surface.
+		if err := agent.SetThinkingLevel(cmd.Level); err != nil &&
+			err.Error() != "can't switch thinking level while a response is streaming" {
 			return err
 		}
 		w.response(cmd.ID, "set_thinking_level", true, nil, "")
@@ -654,11 +662,19 @@ func (a *AgentSession) rpcSlashCommands() []map[string]any {
 	commands := []map[string]any{}
 	if a.extensionRuntime != nil {
 		for _, cmd := range a.extensionRuntime.RegisteredCommands() {
-			commands = append(commands, map[string]any{
-				"name":        cmd.Name,
+			name := cmd.InvocationName
+			if name == "" {
+				name = cmd.Name
+			}
+			entry := map[string]any{
+				"name":        name,
 				"description": cmd.Description,
 				"source":      "extension",
-			})
+			}
+			if cmd.SourceInfo != nil {
+				entry["sourceInfo"] = cmd.SourceInfo
+			}
+			commands = append(commands, entry)
 		}
 	}
 	for _, template := range a.Resources.PromptTemplates {

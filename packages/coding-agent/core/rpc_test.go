@@ -37,6 +37,7 @@ func TestRunRPCSwitchSession(t *testing.T) {
 	if err := switched.AppendMessage(ai.NewUserMessage("switched", nil)); err != nil {
 		t.Fatal(err)
 	}
+	flushTestSession(t, switched)
 	in := new(bytes.Buffer)
 	writeRPCCommandLine(t, in, map[string]any{"id": "1", "type": "switch_session", "sessionPath": switched.File(), "cwd": cwd})
 	var out bytes.Buffer
@@ -94,6 +95,7 @@ func TestRunRPCImportSession(t *testing.T) {
 	if err := importSource.AppendMessage(ai.NewUserMessage("imported", nil)); err != nil {
 		t.Fatal(err)
 	}
+	flushTestSession(t, importSource)
 	in := new(bytes.Buffer)
 	writeRPCCommandLine(t, in, map[string]any{"id": "1", "type": "import_session", "path": importSource.File(), "cwd": cwd})
 	var out bytes.Buffer

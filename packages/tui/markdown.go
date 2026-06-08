@@ -256,6 +256,19 @@ func (r *mdRenderer) renderNode(n ast.Node, indent int) []string {
 			lines = r.renderParagraphFallback(v, r.width-indent)
 		}
 		if len(lines) > 0 {
+			// Parity note (accepted divergence): TS markdown.ts conditions the
+			// inter-block blank line on the source's blank-line structure — it
+			// renders an explicit marked "space" token per source blank line and
+			// suppresses a block's own trailing blank when the next token is a
+			// "space" (or, for paragraphs, a "list"). goldmark's AST has no
+			// blank-line/space node, so the source blank-line count is
+			// unrecoverable here. We therefore insert exactly one blank line
+			// between adjacent non-empty block renders. This matches TS for the
+			// common case (single blank line between blocks, e.g. a paragraph
+			// followed by a blank line then a list) but cannot reproduce TS for
+			// 2+ consecutive source blanks or tightly-packed blocks with no blank
+			// line. Inherent to the goldmark-vs-marked parser swap; see
+			// PARITY_AUDIT_2026-06-08.md P3-33.
 			if len(out) > 0 {
 				out = append(out, "")
 			}

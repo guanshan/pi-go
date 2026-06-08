@@ -306,15 +306,11 @@ func GoogleGenerateContentConfig(options GoogleRequestOptions) *genai.GenerateCo
 	if strings.TrimSpace(options.SystemPrompt) != "" {
 		config.SystemInstruction = &genai.Content{Parts: []*genai.Part{{Text: SanitizeProviderText(options.SystemPrompt)}}}
 	}
-	maxTokens := options.MaxTokens
-	if maxTokens == 0 {
-		maxTokens = options.MaxOutput
-	}
-	if !options.Vertex && maxTokens < 1024 {
-		maxTokens = 1024
-	}
-	if maxTokens > 0 {
-		config.MaxOutputTokens = int32(maxTokens)
+	// Mirror google.ts/google-vertex.ts: set maxOutputTokens ONLY when the caller
+	// explicitly passed maxTokens. No fallback to the model catalog MaxOutput and no
+	// 1024 floor, so the Gemini API uses its own default when the caller omits it.
+	if options.MaxTokens > 0 {
+		config.MaxOutputTokens = int32(options.MaxTokens)
 	}
 	if options.Temperature != nil {
 		value := float32(*options.Temperature)

@@ -130,11 +130,13 @@ func printModelRows(w io.Writer, rows []modelListRow) {
 func fuzzyFilterModels(models []ai.Model, pattern string) []ai.Model {
 	type scored struct {
 		model ai.Model
-		score int
+		score float64
 	}
 	var matches []scored
 	for _, model := range models {
-		haystack := model.Provider + " " + model.ID + " " + model.Name
+		// TS list-models.ts:45 keys the fuzzyFilter on `${m.provider} ${m.id}`
+		// only — the model's human-readable Name is NOT part of the haystack.
+		haystack := model.Provider + " " + model.ID
 		match, ok := tui.FuzzyMatchString(pattern, haystack)
 		if !ok {
 			continue

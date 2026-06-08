@@ -27,6 +27,14 @@ const defaultSyntaxStyle = "github-dark"
 //
 // The caller remains responsible for the per-line CodeBlockIndent prefix and
 // for the surrounding ``` border lines; this helper only colorizes the body.
+//
+// Parity note: TS highlightCode gates on supportsLanguage(lang) and explicitly
+// does NOT auto-detect — when lang is missing or unrecognized it returns plain
+// mdCodeBlock-colored lines, with a comment that auto-detection is unreliable
+// and can misidentify prose as AppleScript/LiveCodeServer (coloring random
+// English words as keywords). We mirror that here: an unknown language tag
+// (lexers.Get returns nil) yields (nil, false) so the caller falls back to the
+// theme's CodeBlock color; we never run lexers.Analyse or lexers.Fallback.
 func highlightCodeBlock(code, lang, styleName string) ([]string, bool) {
 	if strings.TrimSpace(lang) == "" {
 		return nil, false
@@ -37,14 +45,11 @@ func highlightCodeBlock(code, lang, styleName string) ([]string, bool) {
 		return nil, false
 	}
 
-	// Resolve a lexer: explicit by name, then content analysis, then fallback.
+	// Resolve a lexer strictly by the fence's language tag. If chroma does not
+	// recognize the language, bail out (nil, false) rather than auto-detecting
+	// the content or using the plain-text fallback lexer — matching TS, which
+	// only highlights languages recognized by supportsLanguage().
 	lexer := lexers.Get(lang)
-	if lexer == nil {
-		lexer = lexers.Analyse(code)
-	}
-	if lexer == nil {
-		lexer = lexers.Fallback
-	}
 	if lexer == nil {
 		return nil, false
 	}

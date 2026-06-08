@@ -120,15 +120,31 @@ func convertCustomAIMessage(custom ai.CustomMessage) []ai.Message {
 		}
 		return []ai.Message{ai.UserMessage{Role: "user", Content: ai.TextBlocks(BashExecutionToText(custom)), TimestampMs: custom.Timestamp()}}
 	case "custom":
-		if blocks, ok := ai.CustomContentBlocks(custom.Content); ok && len(blocks) > 0 {
-			return []ai.Message{ai.UserMessage{Role: "user", Content: blocks, TimestampMs: custom.Timestamp()}}
-		}
+		// TS convertToLlm always emits a user message for a custom entry, even
+		// when the content is empty: string "" becomes [{type:text,text:""}] and
+		// an empty/nil array stays as content [] (messages.ts:133-139). Do NOT
+		// drop empty-content custom messages.
+		return []ai.Message{ai.UserMessage{Role: "user", Content: customContentBlocksForLLM(custom.Content), TimestampMs: custom.Timestamp()}}
 	case "branchSummary":
 		return []ai.Message{ai.UserMessage{Role: "user", Content: ai.TextBlocks(ai.BranchSummaryText(custom.Summary)), TimestampMs: custom.Timestamp()}}
 	case "compactionSummary":
 		return []ai.Message{ai.UserMessage{Role: "user", Content: ai.TextBlocks(ai.CompactionSummaryText(custom.Summary)), TimestampMs: custom.Timestamp()}}
 	}
 	return nil
+}
+
+// customContentBlocksForLLM mirrors the TS convertToLlm "custom" branch
+// (messages.ts:133-139): string content always becomes a single text block
+// (an empty string yields [{type:text,text:""}], NOT an empty array), while
+// non-string content (arrays, scalars, nil) is converted via CustomContentBlocks
+// and may be empty. The caller always emits a user message, so empty-content
+// custom entries are kept in the LLM context rather than dropped.
+func customContentBlocksForLLM(content any) []ai.ContentBlock {
+	if text, ok := content.(string); ok {
+		return []ai.ContentBlock{{Type: "text", Text: ai.SanitizeUnicode(text)}}
+	}
+	blocks, _ := ai.CustomContentBlocks(content)
+	return blocks
 }
 
 func convertKnownHarnessMessage(message agent.AgentMessage) ([]ai.Message, bool) {
@@ -144,18 +160,14 @@ func convertKnownHarnessMessage(message agent.AgentMessage) ([]ai.Message, bool)
 		}
 		return []ai.Message{ai.UserMessage{Role: "user", Content: ai.TextBlocks(BashExecutionToText(m)), TimestampMs: m.Timestamp()}}, true
 	case CustomMessage:
-		if blocks, ok := ai.CustomContentBlocks(m.Content); ok && len(blocks) > 0 {
-			return []ai.Message{ai.UserMessage{Role: "user", Content: blocks, TimestampMs: m.Timestamp()}}, true
-		}
-		return nil, true
+		// TS convertToLlm always emits a user message for a custom entry, even
+		// when the content is empty (messages.ts:133-139). Do NOT drop it.
+		return []ai.Message{ai.UserMessage{Role: "user", Content: customContentBlocksForLLM(m.Content), TimestampMs: m.Timestamp()}}, true
 	case *CustomMessage:
 		if m == nil {
 			return nil, true
 		}
-		if blocks, ok := ai.CustomContentBlocks(m.Content); ok && len(blocks) > 0 {
-			return []ai.Message{ai.UserMessage{Role: "user", Content: blocks, TimestampMs: m.Timestamp()}}, true
-		}
-		return nil, true
+		return []ai.Message{ai.UserMessage{Role: "user", Content: customContentBlocksForLLM(m.Content), TimestampMs: m.Timestamp()}}, true
 	case BranchSummaryMessage:
 		return []ai.Message{ai.UserMessage{Role: "user", Content: m.ContentBlocks(), TimestampMs: m.Timestamp()}}, true
 	case *BranchSummaryMessage:

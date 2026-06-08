@@ -12,7 +12,16 @@ type CommandInfo struct {
 	Name        string
 	Description string
 	Source      string
-	Execute     func(context.Context, string) (string, error) `json:"-"`
+	// InvocationName is the deduplicated name used to invoke the command on the
+	// wire: when two extensions register the same command name, the second
+	// becomes "name:2", etc. (mirrors TS runner getRegisteredCommands). Populated
+	// by Runner.RegisteredCommands; equals Name when there is no collision.
+	InvocationName string
+	// SourceInfo carries the command's origin (e.g. {"path": <extension file>}),
+	// mirroring TS ResolvedCommand.sourceInfo. Nil for commands registered without
+	// a known source path.
+	SourceInfo map[string]any
+	Execute    func(context.Context, string) (string, error) `json:"-"`
 }
 
 type ShortcutDefinition struct {
@@ -77,6 +86,12 @@ type ProviderDefinition struct {
 	Source       string
 	Provider     ai.Provider     `json:"-"`
 	ModelConfig  json.RawMessage `json:"-"`
+	// OAuth is the extension provider's serializable OAuth login descriptor (TS
+	// registerProvider `oauth`); HasModifyModels reports whether it defined a
+	// modifyModels callback. Recorded for parity (X-02); the host does not yet
+	// wire ext OAuth into /login or invoke modifyModels (documented partial).
+	OAuth           json.RawMessage `json:"-"`
+	HasModifyModels bool            `json:"-"`
 }
 
 type MessageRenderRequest struct {
@@ -146,6 +161,34 @@ type ToolDefinition struct {
 	Description string
 	Parameters  map[string]any
 	Execute     func(context.Context, []byte) (ai.ToolResult, error)
+
+	// PromptSnippet is an optional one-line snippet for the Available tools
+	// section in the default system prompt. Custom tools are omitted from that
+	// section when this is empty (TS ToolDefinition.promptSnippet). Serializable
+	// metadata forwarded end-to-end from the script bridge.
+	PromptSnippet string
+	// PromptGuidelines are guideline bullets appended to the default system
+	// prompt Guidelines section when this tool is active
+	// (TS ToolDefinition.promptGuidelines). Serializable metadata.
+	PromptGuidelines []string
+	// RenderShell controls whether the standard colored shell is rendered or the
+	// tool renders its own framing ("default" | "self";
+	// TS ToolDefinition.renderShell). Serializable metadata.
+	RenderShell string
+	// ExecutionMode is the per-tool execution-mode override ("sequential" |
+	// "parallel"; TS ToolDefinition.executionMode). Serializable metadata.
+	ExecutionMode agentcore.ToolExecutionMode
+
+	// PrepareArguments, RenderCall, and RenderResult mirror the function-valued
+	// TS ToolDefinition fields. They are populated for native (in-process) Go
+	// extensions; script (Node) extensions cannot pass functions across the
+	// process boundary, so these stay nil for script-sourced tools (the
+	// serializable metadata above is still plumbed through). RenderCall/
+	// RenderResult are host-consumed (tool render display); they are typed as
+	// generic funcs to avoid a tui dependency in this package.
+	PrepareArguments func(context.Context, []byte) ([]byte, error) `json:"-"`
+	RenderCall       any                                           `json:"-"`
+	RenderResult     any                                           `json:"-"`
 }
 
 func DefineTool(name, description string, parameters map[string]any, execute func(context.Context, []byte) (ai.ToolResult, error)) ToolDefinition {

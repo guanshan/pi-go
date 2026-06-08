@@ -122,17 +122,19 @@ func RefreshJSONToken(ctx context.Context, refreshToken, tokenURL, clientID stri
 
 func ParseTokenResponse(raw []byte, expirySlack time.Duration) (Credentials, error) {
 	var payload struct {
-		AccessToken  string  `json:"access_token"`
-		RefreshToken string  `json:"refresh_token"`
-		ExpiresIn    float64 `json:"expires_in"`
+		AccessToken  string   `json:"access_token"`
+		RefreshToken string   `json:"refresh_token"`
+		ExpiresIn    *float64 `json:"expires_in"`
 	}
 	if err := json.Unmarshal(raw, &payload); err != nil {
 		return Credentials{}, err
 	}
-	if payload.AccessToken == "" || payload.RefreshToken == "" || payload.ExpiresIn == 0 {
+	// Mirror TS: only type-check expires_in; a value of 0 is a valid number
+	// and must be accepted (it yields an already-expired credential).
+	if payload.AccessToken == "" || payload.RefreshToken == "" || payload.ExpiresIn == nil {
 		return Credentials{}, fmt.Errorf("OAuth token response missing fields: %s", string(raw))
 	}
-	expires := time.Now().Add(DurationFromSeconds(payload.ExpiresIn) - expirySlack).UnixMilli()
+	expires := time.Now().Add(DurationFromSeconds(*payload.ExpiresIn) - expirySlack).UnixMilli()
 	return Credentials{Refresh: payload.RefreshToken, Access: payload.AccessToken, Expires: expires}, nil
 }
 

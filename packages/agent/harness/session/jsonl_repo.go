@@ -415,7 +415,13 @@ func (r JSONLRepo) createSessionFilePath(ctx context.Context, fs harnessenv.File
 }
 
 func encodeCwd(cwd string) string {
-	cwd = strings.TrimLeft(cwd, `/\`)
+	// TS encodeCwd strips exactly ONE leading slash/backslash:
+	// cwd.replace(/^[/\\]/, "") (jsonl-repo.ts:35). The regex is anchored at ^
+	// with no global flag, so only a single leading separator is removed (e.g.
+	// "//foo" -> "/foo", not "foo").
+	if len(cwd) > 0 && (cwd[0] == '/' || cwd[0] == '\\') {
+		cwd = cwd[1:]
+	}
 	replacer := strings.NewReplacer("/", "-", `\`, "-", ":", "-")
 	return "--" + replacer.Replace(cwd) + "--"
 }

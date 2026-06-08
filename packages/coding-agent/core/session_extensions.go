@@ -151,13 +151,7 @@ func (a *AgentSession) extensionContextSnapshot() coreext.ExtensionContextSnapsh
 		entries = session.EntriesSnapshot()
 		branch = append([]SessionEntry(nil), session.Branch()...)
 		leafID = session.CurrentLeafID()
-		if model.ContextWindow > 0 {
-			usage = &ContextUsage{
-				UsedTokens:    estimateMessageTokens(session.BuildContext().Messages),
-				ContextWindow: model.ContextWindow,
-				EstimatedAt:   time.Now(),
-			}
-		}
+		usage = buildExtensionContextUsage(session, model.ContextWindow)
 	}
 	var models []ai.Model
 	var available []ai.Model
@@ -192,6 +186,65 @@ func (a *AgentSession) extensionContextSnapshot() coreext.ExtensionContextSnapsh
 		LeafID:             leafID,
 		ContextUsage:       usage,
 	}
+}
+
+// buildExtensionContextUsage mirrors TS agent-session.ts getContextUsage(): it
+// returns nil when the model has no context window; { tokens: null, percent: null }
+// right after a compaction when no valid post-compaction assistant usage exists
+// (the token count is unknown until the next LLM response); otherwise the estimated
+// context tokens and their percentage of the context window. The JSON wire shape is
+// { tokens, contextWindow, percent } via ContextUsage.MarshalJSON.
+func buildExtensionContextUsage(session *SessionManager, contextWindow int) *ContextUsage {
+	if session == nil || contextWindow <= 0 {
+		return nil
+	}
+	branch := session.Branch()
+	if latestCompactionEntryIndex(branch) >= 0 && !hasPostCompactionAssistantUsage(branch) {
+		return &ContextUsage{ContextWindow: contextWindow, tokensUnknown: true}
+	}
+	return &ContextUsage{
+		UsedTokens:    estimateContextTokens(branch),
+		ContextWindow: contextWindow,
+		EstimatedAt:   time.Now(),
+	}
+}
+
+// latestCompactionEntryIndex returns the index of the last compaction entry in the
+// branch, or -1 if there is none.
+func latestCompactionEntryIndex(branch []SessionEntry) int {
+	for i := len(branch) - 1; i >= 0; i-- {
+		if branch[i].Type == "compaction" {
+			return i
+		}
+	}
+	return -1
+}
+
+// hasPostCompactionAssistantUsage reports whether a valid (non-aborted, non-error)
+// assistant message with usable usage tokens appears after the latest compaction
+// boundary. Mirrors the post-compaction usage scan in TS getContextUsage().
+func hasPostCompactionAssistantUsage(branch []SessionEntry) bool {
+	compactionIndex := latestCompactionEntryIndex(branch)
+	if compactionIndex < 0 {
+		return false
+	}
+	for i := len(branch) - 1; i > compactionIndex; i-- {
+		entry := branch[i]
+		if entry.Type != "message" || entry.Message == nil {
+			continue
+		}
+		assistant, ok := ai.AsAssistantMessage(entry.Message)
+		if !ok {
+			continue
+		}
+		// Mirror TS: aborted/error assistants are skipped (keep scanning earlier
+		// entries); the first usable assistant terminates the scan.
+		if assistant.StopReason == "aborted" || assistant.StopReason == "error" {
+			continue
+		}
+		return calculateContextTokens(assistant.Usage) > 0
+	}
+	return false
 }
 
 func (a *AgentSession) handleExtensionContextAction(ctx context.Context, action coreext.ExtensionContextAction) (json.RawMessage, error) {
@@ -818,6 +871,14 @@ func (a *AgentSession) HasExtensionHandlers(eventType string) bool {
 	}
 }
 
+// Reload mirrors TS agent-session.ts reload(): it captures the current extension
+// flag values, emits session_shutdown(reload), re-reads settings from disk, resets
+// the built-in API providers (so rotated keys take effect), reloads resources, and
+// then REBUILDS the extension runtime from the reloaded resources (restoring the
+// preserved flag values) — reassigning a.extensionRuntime and re-binding the host
+// context bridge so extension tools/commands/shortcuts/providers come back to life.
+// Finally it re-emits session_start(reload). Without the rebuild, the old runtime's
+// subprocess is killed and extensions die permanently after the first reload.
 func (a *AgentSession) Reload(ctx context.Context) error {
 	if ctx == nil {
 		ctx = context.Background()
@@ -825,22 +886,112 @@ func (a *AgentSession) Reload(ctx context.Context) error {
 	if a == nil || a.Session == nil {
 		return fmt.Errorf("session is nil")
 	}
+	// Snapshot the live runtime's flag values so the rebuilt runner restores them,
+	// mirroring TS previousFlagValues = this._extensionRunner.getFlagValues().
+	previousFlagValues := a.extensionFlagValuesSnapshot()
+
 	a.emitExtensionSessionShutdown(coreext.SessionShutdownReload, "")
-	a.shutdownExtensionRuntime(ctx)
-	args := resourceLoaderArgs(a.ResourceLoaderOptions)
-	resources := LoadResources(a.Session.CWD(), a.Settings.AgentDir, args, a.Settings)
-	applyResourceLoaderOverrides(&resources, a.Session.CWD(), a.ResourceLoaderOptions)
-	theme, _ := ResolveTheme(a.Settings, resources)
+
+	// Tear down the listeners bound to the outgoing runtime, then shut it down.
 	a.mu.Lock()
+	oldRuntime := a.extensionRuntime
+	errorStop := a.extensionErrorStop
+	providerStop := a.extensionProviderStop
+	a.extensionErrorStop = nil
+	a.extensionProviderStop = nil
+	a.mu.Unlock()
+	if providerStop != nil {
+		providerStop()
+	}
+	if errorStop != nil {
+		errorStop()
+	}
+	if oldRuntime != nil {
+		_ = oldRuntime.Shutdown(ctx)
+	}
+
+	cwd := a.Session.CWD()
+	agentDir := a.Settings.AgentDir
+	// Re-read settings from disk so edits to settings.json (provider, model,
+	// compaction, etc.) take effect, mirroring TS settingsManager.reload().
+	// Preserve the session's project-trust decision so a reload of an untrusted
+	// project does not start loading its project settings/resources.
+	projectTrusted := a.Settings == nil || a.Settings.ProjectTrusted
+	settings := NewSettingsManagerWithTrust(cwd, agentDir, projectTrusted)
+	// Reset the built-in API provider table so rotated API keys / auth changes are
+	// picked up, mirroring TS resetApiProviders().
+	ai.ResetAPIProviders()
+
+	args := resourceLoaderArgs(a.ResourceLoaderOptions)
+	resources := LoadResources(cwd, agentDir, args, settings)
+	applyResourceLoaderOverrides(&resources, cwd, a.ResourceLoaderOptions)
+	theme, _ := ResolveTheme(settings, resources)
+
+	// Rebuild the extension runtime from the reloaded resources, restoring the
+	// preserved flag values, mirroring TS _buildRuntime.
+	newRuntime, _ := loadExtensionRuntime(ctx, resources.Extensions, a.ResourceLoaderOptions.ExtensionFactories, previousFlagValues)
+
+	a.mu.Lock()
+	a.Settings = settings
 	a.Resources = resources
 	a.SystemPrompt = resources.BuildSystemPrompt(args, ToolPromptInfoFor(a.Tools))
 	a.Theme = theme
+	a.extensionRuntime = newRuntime
+	errorListener := a.extensionErrorListener
 	if a.Keybindings != nil {
 		a.Keybindings.Reload()
 	}
 	a.mu.Unlock()
+
+	// Re-bind the host context bridge (context provider, action handler, provider
+	// definitions + onProviderChange listener) onto the rebuilt runtime.
+	a.installExtensionContextBridge()
+	// Re-attach the error listener to the rebuilt runtime if one was registered.
+	if newRuntime != nil && errorListener != nil {
+		stop := newRuntime.OnError(coreext.ErrorListener(errorListener))
+		a.mu.Lock()
+		if !a.disposed && a.extensionRuntime == newRuntime {
+			a.extensionErrorStop = stop
+			stop = nil
+		}
+		a.mu.Unlock()
+		if stop != nil {
+			stop()
+		}
+	}
+
 	a.emitExtensionSessionStart(coreext.SessionStartReload, "")
 	return nil
+}
+
+// extensionFlagValuesSnapshot captures the resolved value of every flag the live
+// runtime has registered, so a reload can restore them onto the rebuilt runner.
+// Mirrors the intent of TS ExtensionRunner.getFlagValues(); only declared flags are
+// preserved (loadExtensionRuntime re-seeds defaults for the new extension set).
+func (a *AgentSession) extensionFlagValuesSnapshot() map[string]any {
+	a.mu.Lock()
+	runtime := a.extensionRuntime
+	a.mu.Unlock()
+	if runtime == nil {
+		return nil
+	}
+	flags := runtime.RegisteredFlags()
+	if len(flags) == 0 {
+		return nil
+	}
+	values := make(map[string]any, len(flags))
+	for _, flag := range flags {
+		if flag.Name == "" {
+			continue
+		}
+		if value := runtime.FlagValue(flag.Name); value != nil {
+			values[flag.Name] = value
+		}
+	}
+	if len(values) == 0 {
+		return nil
+	}
+	return values
 }
 
 func (a *AgentSession) Dispose() {

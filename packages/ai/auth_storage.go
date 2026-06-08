@@ -216,6 +216,11 @@ func (a *AuthStorage) HasAuth(provider string) bool {
 }
 
 func (a *AuthStorage) AuthStatus(provider string) AuthStatus {
+	// Mirror TS getAuthStatus (coding-agent/src/core/auth-storage.ts:351-370):
+	// configured:true is reserved EXCLUSIVELY for credentials physically stored
+	// in auth.json keyed by provider name. Runtime --api-key, environment vars,
+	// and ambient bedrock/vertex credentials are all reported configured:false
+	// (with a source/label so the auth-status display still surfaces them).
 	if a != nil {
 		if a.Has(provider) {
 			return AuthStatus{Configured: true, Source: "stored", Type: a.CredentialType(provider)}
@@ -225,7 +230,7 @@ func (a *AuthStorage) AuthStatus(provider string) AuthStatus {
 		}
 		for _, key := range ProviderEnvKeys(provider) {
 			if a.Data[key] != "" {
-				return AuthStatus{Configured: true, Source: "stored", Label: key, Type: "api_key"}
+				return AuthStatus{Source: "environment", Label: key, Type: "api_key"}
 			}
 		}
 	}
@@ -235,12 +240,11 @@ func (a *AuthStorage) AuthStatus(provider string) AuthStatus {
 		}
 	}
 	// Ambient credential sources are not listed in ProviderEnvKeys (which only
-	// enumerates explicit API-key vars), so probe them separately to match TS
-	// getEnvApiKey in packages/ai/src/env-api-keys.ts. amazon-bedrock can
-	// authenticate via AWS_PROFILE / IAM keys / container or web-identity creds;
-	// google-vertex via Application Default Credentials.
+	// enumerates explicit API-key vars), so probe them separately to keep the
+	// detection working. TS getAuthStatus has no ambient branch (such creds fall
+	// through to configured:false), so we report configured:false here as well.
 	if label, ok := ambientAuthLabel(provider); ok {
-		return AuthStatus{Configured: true, Source: "environment", Label: label}
+		return AuthStatus{Source: "environment", Label: label}
 	}
 	return AuthStatus{}
 }
@@ -305,6 +309,17 @@ func (a *AuthStorage) APIKey(model Model) string {
 		if key := os.Getenv(env); key != "" {
 			return key
 		}
+	}
+	// A custom-provider apiKey that is a config-value reference ("!command",
+	// "${VAR}", multi-part templates like "Bearer $TOKEN", or an escaped literal)
+	// is carried verbatim on Model.APIKey by LiteralAPIKey. Resolve it here at
+	// key-fetch time, mirroring TS getApiKeyAndHeaders -> resolveConfigValue.
+	// Built-in providers leave APIKey empty and are unaffected.
+	if model.APIKey != "" {
+		if resolved, ok := ResolveConfigValue(model.APIKey); ok {
+			return resolved
+		}
+		return ""
 	}
 	return ""
 }

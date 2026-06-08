@@ -80,6 +80,16 @@ func TestMarkdownSyntaxHighlightUnknownLangGraceful(t *testing.T) {
 	if bodyLineCount(on) != bodyLineCount(off) {
 		t.Fatalf("unknown-lang body line count mismatch: on=%d off=%d", bodyLineCount(on), bodyLineCount(off))
 	}
+
+	// Parity with TS: an unrecognized language tag must NOT be highlighted. TS
+	// gates on supportsLanguage(lang) and explicitly avoids auto-detection /
+	// fallback colorization for unknown languages (prose mis-coloring). The
+	// rendered output must therefore be byte-identical to the highlight-off
+	// render — falling back to the theme's plain CodeBlock color, never chroma's
+	// content-analysis or plain-text fallback colors.
+	if strings.Join(on, "\n") != strings.Join(off, "\n") {
+		t.Fatalf("unknown-lang must not be highlighted; on != off:\n on=%q\noff=%q", on, off)
+	}
 }
 
 func TestHighlightCodeBlockDirect(t *testing.T) {
@@ -103,6 +113,12 @@ func TestHighlightCodeBlockDirect(t *testing.T) {
 	// blank line vs the uniform 0-line render).
 	if got, ok := highlightCodeBlock("", "go", "github-dark"); ok {
 		t.Fatalf("expected not ok for empty body, got %d lines", len(got))
+	}
+	// Unknown (non-empty) lang => not ok. Parity with TS supportsLanguage gate:
+	// we do NOT auto-detect (lexers.Analyse) or use the plain-text fallback
+	// lexer; the caller falls back to the theme CodeBlock color instead.
+	if got, ok := highlightCodeBlock("plain english prose words here\n", "not-a-real-language-xyz", "github-dark"); ok {
+		t.Fatalf("expected not ok for unknown lang, got %d lines: %q", len(got), got)
 	}
 }
 

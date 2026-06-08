@@ -174,29 +174,37 @@ func openAICodexResponseError(status int, raw []byte) error {
 func openAICodexFriendlyUsageLimitMessage(status int, fields openAICodexErrorFields) string {
 	code := strings.ToLower(fields.code())
 	message := strings.ToLower(fields.message())
+	// Mirror openai-codex-responses.ts parseErrorResponse: the friendly message
+	// fires on a usage-limit/rate-limit code OR on any bare HTTP 429 (even
+	// without a plan_type or usage code).
 	usageLimit := code == "usage_limit_reached" ||
 		code == "usage_not_included" ||
+		code == "rate_limit_exceeded" ||
 		strings.Contains(message, "monthly usage limit") ||
 		strings.Contains(message, "free usage limit") ||
-		(status == http.StatusTooManyRequests && fields.planType() != "")
+		status == http.StatusTooManyRequests
 	if !usageLimit {
 		return ""
 	}
-	plan := strings.TrimSpace(fields.planType())
-	if plan == "" {
-		plan = "unknown"
+	// plan: ` (<plan> plan)` only when plan_type is present; otherwise omitted
+	// entirely (TS: err.plan_type ? ` (${plan} plan)` : "").
+	plan := ""
+	if planType := strings.TrimSpace(fields.planType()); planType != "" {
+		plan = fmt.Sprintf(" (%s plan)", strings.ToLower(planType))
 	}
-	out := fmt.Sprintf("You have hit your ChatGPT usage limit (%s plan).", plan)
-	if delay := fields.resetDelay(time.Now()); delay > 0 {
-		minutes := int(math.Ceil(delay.Minutes()))
-		if minutes < 1 {
-			minutes = 1
+	// when: ` Try again in ~N min.` only when resets_at is present; otherwise
+	// nothing is appended (TS: mins !== undefined ? ` ...` : "").
+	when := ""
+	if _, ok := fields.resetValue(); ok {
+		delay := fields.resetDelay(time.Now())
+		minutes := int(math.Round(delay.Minutes()))
+		if minutes < 0 {
+			minutes = 0
 		}
-		out += fmt.Sprintf(" Try again in ~%d min.", minutes)
-	} else {
-		out += " Try again later."
+		when = fmt.Sprintf(" Try again in ~%d min.", minutes)
 	}
-	return out
+	out := fmt.Sprintf("You have hit your ChatGPT usage limit%s.%s", plan, when)
+	return strings.TrimSpace(out)
 }
 
 func isOpenAICodexTerminalRateLimitError(message string) bool {
@@ -222,8 +230,17 @@ func (f openAICodexErrorFields) planType() string {
 	return firstNonEmpty(f["plan_type"], f["planType"], f["plan"], f["error.plan_type"], f["error.planType"], f["error.plan"])
 }
 
-func (f openAICodexErrorFields) resetDelay(now time.Time) time.Duration {
+// resetValue reports the raw resets_at field and whether it was present in the
+// error payload. TS distinguishes an absent resets_at (no "Try again" suffix)
+// from a present-but-elapsed one (~0 min), so callers must check presence
+// rather than relying on resetDelay returning 0.
+func (f openAICodexErrorFields) resetValue() (string, bool) {
 	value := firstNonEmpty(f["resets_at"], f["resetsAt"], f["reset_at"], f["resetAt"], f["error.resets_at"], f["error.resetsAt"])
+	return value, value != ""
+}
+
+func (f openAICodexErrorFields) resetDelay(now time.Time) time.Duration {
+	value, _ := f.resetValue()
 	if value == "" {
 		return 0
 	}

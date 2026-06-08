@@ -21,7 +21,7 @@ func TestDefaultResourceLoaderLoadsTSStyleResources(t *testing.T) {
 	writeTestFile(t, filepath.Join(agentDir, "APPEND_SYSTEM.md"), "global append")
 	writeTestFile(t, filepath.Join(cwd, ConfigDirName, "APPEND_SYSTEM.md"), "project append")
 	writeTestFile(t, filepath.Join(agentDir, "prompts", "foo.md"), "---\ntitle: Foo\n---\nfoo prompt")
-	writeTestFile(t, filepath.Join(agentDir, "skills", "demo", "SKILL.md"), "# Demo\nUse this skill for demos.")
+	writeTestFile(t, filepath.Join(agentDir, "skills", "demo", "SKILL.md"), "---\ndescription: Use this skill for demos.\n---\n# Demo\nUse this skill for demos.")
 	writeTestFile(t, filepath.Join(agentDir, "themes", "quiet.json"), `{"name":"quiet"}`)
 	writeTestFile(t, filepath.Join(agentDir, "extensions", "one.js"), "export default {};")
 
@@ -68,8 +68,8 @@ func TestDefaultResourceLoaderAdditionalPathsFactoriesAndExtend(t *testing.T) {
 	cwd := t.TempDir()
 	agentDir := t.TempDir()
 	external := filepath.Join(cwd, "external")
-	writeTestFile(t, filepath.Join(agentDir, "skills", "default", "SKILL.md"), "default skill")
-	writeTestFile(t, filepath.Join(external, "special", "SKILL.md"), "special skill")
+	writeTestFile(t, filepath.Join(agentDir, "skills", "default", "SKILL.md"), "---\ndescription: default skill\n---\ndefault skill")
+	writeTestFile(t, filepath.Join(external, "special", "SKILL.md"), "---\ndescription: special skill\n---\nspecial skill")
 	writeTestFile(t, filepath.Join(external, "prompts", "ask.md"), "ask prompt")
 	writeTestFile(t, filepath.Join(external, "theme.json"), `{"name":"theme"}`)
 	writeTestFile(t, filepath.Join(external, "ext.mjs"), "export default {};")
@@ -123,7 +123,7 @@ func TestDefaultResourceLoaderAdditionalPathsFactoriesAndExtend(t *testing.T) {
 	}
 
 	extensionRoot := filepath.Join(external, "pack")
-	writeTestFile(t, filepath.Join(extensionRoot, "new-skill", "SKILL.md"), "new skill")
+	writeTestFile(t, filepath.Join(extensionRoot, "new-skill", "SKILL.md"), "---\ndescription: new skill\n---\nnew skill")
 	writeTestFile(t, filepath.Join(extensionRoot, "prompts", "later.md"), "later prompt")
 	writeTestFile(t, filepath.Join(extensionRoot, "themes", "later.json"), `{"name":"later"}`)
 	metadata := PathMetadata{Source: "inline", Scope: "temporary", Origin: "top-level", BaseDir: extensionRoot}
@@ -152,7 +152,7 @@ func TestDefaultResourceLoaderUsesPackageManagerResolvedResources(t *testing.T) 
 	packageDir := filepath.Join(cwd, "manifest-package")
 	writeTestFile(t, filepath.Join(packageDir, "package.json"), `{"pi":{"prompts":["custom.md"],"skills":["skill/SKILL.md"]}}`)
 	writeTestFile(t, filepath.Join(packageDir, "custom.md"), "custom package prompt")
-	writeTestFile(t, filepath.Join(packageDir, "skill", "SKILL.md"), "custom package skill")
+	writeTestFile(t, filepath.Join(packageDir, "skill", "SKILL.md"), "---\ndescription: custom package skill\n---\ncustom package skill")
 	writeTestFile(t, filepath.Join(cwd, ConfigDirName, "extensions", "skip.js"), "disabled extension")
 	settings.Project.InstalledPackages = []core.PackageRecord{{Source: "manifest-package", Path: packageDir, Local: true}}
 

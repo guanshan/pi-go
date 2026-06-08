@@ -69,7 +69,15 @@ func TestPrepareInitialMessageUsesFirstMessageAndFileTags(t *testing.T) {
 func TestPrepareInitialMessageImageFileTagAndAttachment(t *testing.T) {
 	cwd := t.TempDir()
 	path := filepath.Join(cwd, "image.png")
-	data := []byte{0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n'}
+	// A valid minimal PNG (8-byte signature + IHDR chunk of length 13). The TS
+	// image sniffer (utils/mime.ts) requires a valid IHDR, so a bare signature
+	// is treated as text; this fixture exercises the image-attachment path.
+	data := []byte{
+		0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
+		0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
+		0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
+		0x08, 0x06, 0x00, 0x00, 0x00, 0x1f, 0x15, 0xc4, 0x89,
+	}
 	if err := os.WriteFile(path, data, 0o644); err != nil {
 		t.Fatal(err)
 	}

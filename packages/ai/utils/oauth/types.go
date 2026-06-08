@@ -67,5 +67,7 @@ func (c *Credentials) UnmarshalJSON(data []byte) error {
 }
 
 func (c Credentials) Expired(now time.Time) bool {
-	return c.Expires > 0 && now.UnixMilli() >= c.Expires
+	// Mirror TS getOAuthApiKey / auth-storage: refresh when now >= expires.
+	// A zero (or absent) expiry is therefore always treated as expired.
+	return now.UnixMilli() >= c.Expires
 }

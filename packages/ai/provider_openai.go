@@ -102,6 +102,7 @@ func (r *ModelRegistry) prepareOpenAIChatRequest(ctx context.Context, req ChatRe
 		SupportsStore:                    compat.SupportsStore,
 		SupportsDeveloperRole:            compat.SupportsDeveloperRole,
 		SupportsReasoningEffort:          compat.SupportsReasoningEffort,
+		SupportsUsageInStreaming:         compat.SupportsUsageInStreaming,
 		CacheControlFormat:               compat.CacheControlFormat,
 		SendSessionAffinityHeaders:       compat.SendSessionAffinityHeaders,
 		SupportsLongCacheRetention:       boolPtr(compat.SupportsLongCacheRetention),

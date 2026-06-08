@@ -627,8 +627,31 @@ func handleSlashWithPrompt(ctx context.Context, target any, line string, prompte
 		agent.mu.Unlock()
 		fmt.Fprintln(stdout, "Theme set to:", theme.Name)
 	case "scoped-models":
-		for _, model := range agent.Registry.AvailableConfigured() {
-			fmt.Fprintf(stdout, "%s/%s\n", model.Provider, model.ID)
+		// `/scoped-models` lists the currently scoped/available models; with
+		// arguments it SETS and persists the scope (comma/space-separated patterns,
+		// "clear"/"all" resets it), mirroring the persist behavior of TS
+		// /scoped-models (whose interactive multi-select toggles the same setting).
+		if arg == "" {
+			for _, model := range agent.Registry.AvailableConfigured() {
+				fmt.Fprintf(stdout, "%s/%s\n", model.Provider, model.ID)
+			}
+		} else {
+			var patterns []string
+			if lower := strings.ToLower(strings.TrimSpace(arg)); lower != "clear" && lower != "all" && lower != "none" {
+				for _, field := range strings.FieldsFunc(arg, func(r rune) bool { return r == ',' || r == ' ' || r == '\t' }) {
+					if field = strings.TrimSpace(field); field != "" {
+						patterns = append(patterns, field)
+					}
+				}
+			}
+			if err := agent.Settings.SetEnabledModels(patterns); err != nil {
+				return false, err
+			}
+			if len(patterns) == 0 {
+				fmt.Fprintln(stdout, "Cleared scoped models (all available models enabled).")
+			} else {
+				fmt.Fprintf(stdout, "Scoped models set: %s\n", strings.Join(patterns, ", "))
+			}
 		}
 	case "settings":
 		raw, _ := json.MarshalIndent(agent.State(), "", "  ")
@@ -896,6 +919,46 @@ func handleSlashWithPrompt(ctx context.Context, target any, line string, prompte
 			return false, err
 		}
 		fmt.Fprintln(stdout, "Removed stored credentials for", provider)
+	case "trust":
+		// Mirror TS /trust (interactive-mode showTrustSelector): view or change the
+		// stored project-trust decision for the current cwd. The decision is
+		// persisted to <agentDir>/trust.json and, like TS, takes effect on the next
+		// run (project settings/extensions/skills are loaded at startup). The TS
+		// TrustSelectorComponent is a navigable UI; the line/RPC handler exposes the
+		// same capability via a text subcommand.
+		store := NewProjectTrustStore(agent.Settings.AgentDir)
+		cwd := agent.Session.CWD()
+		switch strings.ToLower(strings.TrimSpace(arg)) {
+		case "":
+			status := "unset (resolved per run)"
+			if decision, derr := store.Get(cwd); derr == nil && decision != nil {
+				if *decision {
+					status = "trusted"
+				} else {
+					status = "untrusted"
+				}
+			}
+			fmt.Fprintf(stdout, "Project: %s\nTrust inputs present: %v\nStored decision: %s\nUse /trust trust|untrust|default to change (effective on restart).\n", cwd, HasProjectTrustInputs(cwd), status)
+		case "trust", "trusted", "yes":
+			trusted := true
+			if err := store.Set(cwd, &trusted); err != nil {
+				return false, err
+			}
+			fmt.Fprintf(stdout, "Marked trusted (effective on restart): %s\n", cwd)
+		case "untrust", "untrusted", "no":
+			trusted := false
+			if err := store.Set(cwd, &trusted); err != nil {
+				return false, err
+			}
+			fmt.Fprintf(stdout, "Marked untrusted (effective on restart): %s\n", cwd)
+		case "default", "clear", "reset":
+			if err := store.Set(cwd, nil); err != nil {
+				return false, err
+			}
+			fmt.Fprintf(stdout, "Cleared trust decision (resolved per run): %s\n", cwd)
+		default:
+			return false, fmt.Errorf("usage: /trust [trust|untrust|default]")
+		}
 	case "reload":
 		if err := agent.Reload(ctx); err != nil {
 			return false, err
@@ -974,7 +1037,7 @@ func slashHelp(agent *AgentSession) string {
 	base := `/login [provider key]  List auth status or save an API key
 /logout <provider>    Remove stored provider credentials
 /model [provider/id]  List or switch models
-/scoped-models        List configured models
+/scoped-models [patterns]  List, or set+persist, the scoped models
 /settings             Show current runtime state
 	/resume [session]     List sessions or switch to one
 /new                  Start a new session
@@ -989,6 +1052,7 @@ func slashHelp(agent *AgentSession) string {
 /fork <entry-id>      Fork a new session from an entry
 /clone                Clone current session branch
 /changelog [file]     Show changelog entries
+/trust [trust|untrust|default]  View or change project trust
 /reload               Reload session resources
 /hotkeys, /help       Show commands
 /quit                 Quit`

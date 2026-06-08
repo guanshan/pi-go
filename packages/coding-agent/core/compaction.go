@@ -229,7 +229,11 @@ func generateCompactionSummary(ctx context.Context, registry *ai.ModelRegistry, 
 	if customInstructions != "" {
 		basePrompt += "\n\nAdditional focus: " + customInstructions
 	}
-	conversationText := serializeConversation(messages)
+	// Convert to LLM messages first (handles custom types like bashExecution,
+	// custom, branchSummary, compactionSummary) so serializeConversation sees
+	// only role:user/assistant/toolResult messages, matching TS.
+	llmMessages, _ := convertSessionMessagesToLLM(messages)
+	conversationText := serializeConversation(llmMessages)
 	promptText := "<conversation>\n" + conversationText + "\n</conversation>\n\n"
 	if previousSummary != "" {
 		promptText += "<previous-summary>\n" + previousSummary + "\n</previous-summary>\n\n"
@@ -239,7 +243,8 @@ func generateCompactionSummary(ctx context.Context, registry *ai.ModelRegistry, 
 }
 
 func generateTurnPrefixSummary(ctx context.Context, registry *ai.ModelRegistry, model ai.Model, thinkingLevel ai.ThinkingLevel, messages []ai.Message, reserveTokens int) (string, error) {
-	conversationText := serializeConversation(messages)
+	llmMessages, _ := convertSessionMessagesToLLM(messages)
+	conversationText := serializeConversation(llmMessages)
 	promptText := "<conversation>\n" + conversationText + "\n</conversation>\n\n" + turnPrefixSummarizationPrompt
 	maxTokens := reserveTokens / 2
 	if maxTokens <= 0 {
@@ -607,50 +612,89 @@ func findCutPoint(entries []SessionEntry, startIndex, endIndex, keepRecentTokens
 	}
 }
 
+// serializeConversation mirrors TS compaction/utils.ts serializeConversation.
+// Callers MUST run messages through convertSessionMessagesToLLM first, so only
+// user/assistant/toolResult roles reach this function (bashExecution/custom/
+// branchSummary/compactionSummary are converted to role:user beforehand).
 func serializeConversation(messages []ai.Message) string {
 	parts := make([]string, 0, len(messages))
 	for _, msg := range messages {
 		switch ai.MessageRole(msg) {
 		case "user":
-			if text := strings.TrimSpace(ai.MessageText(msg)); text != "" {
-				parts = append(parts, "[User]: "+text)
+			if content := ai.MessageText(msg); content != "" {
+				parts = append(parts, "[User]: "+content)
 			}
 		case "assistant":
-			if thinking := strings.TrimSpace(ai.AssistantThinkingText(msg)); thinking != "" {
-				parts = append(parts, "[Assistant thinking]: "+thinking)
-			}
-			if text := strings.TrimSpace(ai.MessageText(msg)); text != "" {
-				parts = append(parts, "[Assistant]: "+text)
-			}
+			textParts := make([]string, 0)
+			thinkingParts := make([]string, 0)
 			toolCalls := make([]string, 0)
 			for _, block := range ai.MessageBlocks(msg) {
-				if block.Type != "toolCall" {
-					continue
+				switch block.Type {
+				case "text":
+					textParts = append(textParts, block.Text)
+				case "thinking":
+					thinkingParts = append(thinkingParts, block.Thinking)
+				case "toolCall":
+					toolCalls = append(toolCalls, fmt.Sprintf("%s(%s)", block.Name, serializeToolCallArguments(block.Arguments)))
 				}
-				toolCalls = append(toolCalls, fmt.Sprintf("%s(%s)", block.Name, strings.TrimSpace(string(block.Arguments))))
+			}
+			if len(thinkingParts) > 0 {
+				parts = append(parts, "[Assistant thinking]: "+strings.Join(thinkingParts, "\n"))
+			}
+			if len(textParts) > 0 {
+				parts = append(parts, "[Assistant]: "+strings.Join(textParts, "\n"))
 			}
 			if len(toolCalls) > 0 {
 				parts = append(parts, "[Assistant tool calls]: "+strings.Join(toolCalls, "; "))
 			}
 		case "toolResult":
-			if text := strings.TrimSpace(ai.MessageText(msg)); text != "" {
-				parts = append(parts, "[Tool result]: "+truncateCompactionText(text, toolResultSummaryMaxChars))
-			}
-		case "branchSummary", "compactionSummary":
-			if summary, ok := sessionSummaryText(msg); ok && strings.TrimSpace(summary) != "" {
-				label := "[Context summary]: "
-				if ai.MessageRole(msg) == "branchSummary" {
-					label = "[Branch summary]: "
-				}
-				parts = append(parts, label+summary)
-			}
-		case "custom":
-			if text := strings.TrimSpace(ai.MessageText(msg)); text != "" {
-				parts = append(parts, "[Custom message]: "+text)
+			if content := ai.MessageText(msg); content != "" {
+				parts = append(parts, "[Tool result]: "+truncateCompactionText(content, toolResultSummaryMaxChars))
 			}
 		}
 	}
 	return strings.Join(parts, "\n\n")
+}
+
+// serializeToolCallArguments renders toolCall arguments as TS does:
+// `Object.entries(args).map(([k, v]) => `${k}=${JSON.stringify(v)}`).join(", ")`.
+// Object key order matches the raw JSON byte order (JS object enumeration order).
+func serializeToolCallArguments(arguments json.RawMessage) string {
+	trimmed := strings.TrimSpace(string(arguments))
+	if trimmed == "" || trimmed == "null" {
+		return ""
+	}
+	dec := json.NewDecoder(strings.NewReader(trimmed))
+	dec.UseNumber()
+	tok, err := dec.Token()
+	if err != nil {
+		return ""
+	}
+	delim, ok := tok.(json.Delim)
+	if !ok || delim != '{' {
+		return ""
+	}
+	pairs := make([]string, 0)
+	for dec.More() {
+		keyTok, err := dec.Token()
+		if err != nil {
+			return strings.Join(pairs, ", ")
+		}
+		key, ok := keyTok.(string)
+		if !ok {
+			return strings.Join(pairs, ", ")
+		}
+		var value any
+		if err := dec.Decode(&value); err != nil {
+			return strings.Join(pairs, ", ")
+		}
+		encoded, err := marshalJSONNoHTMLEscape(value)
+		if err != nil {
+			return strings.Join(pairs, ", ")
+		}
+		pairs = append(pairs, key+"="+string(encoded))
+	}
+	return strings.Join(pairs, ", ")
 }
 
 func sessionSummaryText(message ai.Message) (string, bool) {

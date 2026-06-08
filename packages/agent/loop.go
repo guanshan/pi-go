@@ -128,11 +128,17 @@ func emitLoopFailure(ctx context.Context, model ai.Model, err error, newMessages
 		return emitErr
 	}
 	*newMessages = append(*newMessages, msg)
-	snapshot := append([]AgentMessage(nil), *newMessages...)
 	if emitErr := emit(ctx, TurnEndEvent{Message: msg, ToolResults: nil}); emitErr != nil {
 		return emitErr
 	}
-	return emit(ctx, AgentEndEvent{Messages: snapshot})
+	// On a thrown loop-internal failure (transform/convert/getApiKey/hook), the
+	// terminal agent_end carries ONLY the synthesized failure message, matching
+	// TS where the throw unwinds out of runAgentLoop and the wrapper
+	// (Agent.runWithLifecycle / AgentHarness.executeTurn) catches it and emits
+	// agent_end{messages:[failureMessage]} (agent.ts handleRunFailure /
+	// agent-harness.ts emitRunFailure). The in-stream error/aborted path in
+	// runLoop still emits the full transcript on both sides.
+	return emit(ctx, AgentEndEvent{Messages: []AgentMessage{msg}})
 }
 
 func runLoop(ctx context.Context, curr *AgentContext, newMessages *[]AgentMessage, cfg *AgentLoopConfig, emit AgentEventSink, streamFn StreamFn) error {

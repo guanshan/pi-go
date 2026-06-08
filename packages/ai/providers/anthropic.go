@@ -247,7 +247,7 @@ func AnthropicMessageParams(options AnthropicRequestOptions) anthropic.MessageNe
 		Messages:  AnthropicMessages(options.Messages, cacheControl, useCacheControl, options.AllowEmptySignature, options.IsOAuth),
 	}
 	if strings.TrimSpace(options.SystemPrompt) != "" {
-		block := anthropic.TextBlockParam{Text: options.SystemPrompt}
+		block := anthropic.TextBlockParam{Text: SanitizeProviderText(options.SystemPrompt)}
 		if useCacheControl {
 			block.CacheControl = cacheControl
 		}
@@ -401,37 +401,44 @@ func AnthropicMessages(messages []AnthropicMessage, cacheControl anthropic.Cache
 		msg.Role = providerMessageRoleAsUser(msg.Role)
 		switch msg.Role {
 		case "user":
-			out = append(out, anthropic.NewUserMessage(AnthropicUserContentBlocks(msg)...))
+			// Mirror TS anthropic.ts:1018-1055: text blocks that are empty after
+			// trimming are dropped, and a message whose filtered content is empty is
+			// skipped entirely (no empty user message is emitted).
+			userBlocks := AnthropicUserContentBlocks(msg)
+			if len(userBlocks) == 0 {
+				continue
+			}
+			out = append(out, anthropic.NewUserMessage(userBlocks...))
 		case "assistant":
+			// Mirror TS anthropic.ts:1056-1112: process each block individually,
+			// skipping text blocks that are empty after trimming and sanitizing the
+			// text that is kept.
 			blocks := []anthropic.ContentBlockParamUnion{}
-			text := ""
 			for _, b := range msg.Blocks {
 				switch b.Type {
 				case "text":
-					text += b.Text
-				case "thinking":
-					if text != "" {
-						blocks = append(blocks, anthropic.NewTextBlock(text))
-						text = ""
+					if strings.TrimSpace(b.Text) == "" {
+						continue
 					}
+					blocks = append(blocks, anthropic.NewTextBlock(SanitizeProviderText(b.Text)))
+				case "thinking":
 					if b.Redacted {
 						if strings.TrimSpace(b.ThinkingSignature) != "" {
 							blocks = append(blocks, anthropic.NewRedactedThinkingBlock(b.ThinkingSignature))
 						}
-					} else if b.Thinking != "" && (strings.TrimSpace(b.ThinkingSignature) != "" || allowEmptySignature) {
-						signature := b.ThinkingSignature
-						if strings.TrimSpace(signature) == "" {
-							signature = ""
-						}
-						blocks = append(blocks, anthropic.NewThinkingBlock(signature, b.Thinking))
-					} else if b.Thinking != "" {
-						blocks = append(blocks, anthropic.NewTextBlock(b.Thinking))
+						continue
+					}
+					if strings.TrimSpace(b.Thinking) == "" {
+						continue
+					}
+					if strings.TrimSpace(b.ThinkingSignature) != "" {
+						blocks = append(blocks, anthropic.NewThinkingBlock(b.ThinkingSignature, SanitizeProviderText(b.Thinking)))
+					} else if allowEmptySignature {
+						blocks = append(blocks, anthropic.NewThinkingBlock("", SanitizeProviderText(b.Thinking)))
+					} else {
+						blocks = append(blocks, anthropic.NewTextBlock(SanitizeProviderText(b.Thinking)))
 					}
 				case "toolCall":
-					if text != "" {
-						blocks = append(blocks, anthropic.NewTextBlock(text))
-						text = ""
-					}
 					var input any
 					_ = json.Unmarshal(b.Arguments, &input)
 					if input == nil {
@@ -443,9 +450,6 @@ func AnthropicMessages(messages []AnthropicMessage, cacheControl anthropic.Cache
 					}
 					blocks = append(blocks, anthropic.NewToolUseBlock(b.ID, input, name))
 				}
-			}
-			if text != "" {
-				blocks = append(blocks, anthropic.NewTextBlock(text))
 			}
 			if len(blocks) > 0 {
 				out = append(out, anthropic.NewAssistantMessage(blocks...))
@@ -466,16 +470,51 @@ func AnthropicMessages(messages []AnthropicMessage, cacheControl anthropic.Cache
 }
 
 func AnthropicToolResultBlock(msg AnthropicMessage) anthropic.ContentBlockParamUnion {
-	content := []anthropic.ToolResultBlockParamContentUnion{}
-	if len(msg.Blocks) == 0 && strings.TrimSpace(msg.Text) != "" {
-		content = append(content, anthropic.ToolResultBlockParamContentUnion{OfText: &anthropic.TextBlockParam{Text: msg.Text}})
+	// Mirror TS convertContentBlocks(anthropic.ts:110-157): the source content is
+	// the message's content blocks. A Text-only fallback preserves callers that
+	// only populate msg.Text.
+	blocks := msg.Blocks
+	if len(blocks) == 0 && msg.Text != "" {
+		blocks = []AnthropicBlock{{Type: "text", Text: msg.Text}}
 	}
-	for _, block := range msg.Blocks {
+
+	hasImages := false
+	for _, block := range blocks {
+		if block.Type == "image" {
+			hasImages = true
+			break
+		}
+	}
+
+	result := anthropic.ToolResultBlockParam{
+		ToolUseID: msg.ToolCallID,
+		IsError:   anthropic.Bool(msg.IsError),
+	}
+
+	if !hasImages {
+		// Text-only tool result: TS returns a CONCATENATED STRING
+		// (text.join("\n")) rather than a content-block array. The SDK struct
+		// only models Content as a block slice, so inject the bare string via
+		// SetExtraFields; the struct's other fields (and any cache_control
+		// attached later) still marshal normally.
+		texts := make([]string, 0, len(blocks))
+		for _, block := range blocks {
+			if block.Type == "text" {
+				texts = append(texts, block.Text)
+			}
+		}
+		joined := SanitizeProviderText(strings.Join(texts, "\n"))
+		result.SetExtraFields(map[string]any{"content": joined})
+		return anthropic.ContentBlockParamUnion{OfToolResult: &result}
+	}
+
+	content := []anthropic.ToolResultBlockParamContentUnion{}
+	hasText := false
+	for _, block := range blocks {
 		switch block.Type {
 		case "text":
-			if block.Text != "" {
-				content = append(content, anthropic.ToolResultBlockParamContentUnion{OfText: &anthropic.TextBlockParam{Text: block.Text}})
-			}
+			content = append(content, anthropic.ToolResultBlockParamContentUnion{OfText: &anthropic.TextBlockParam{Text: SanitizeProviderText(block.Text)}})
+			hasText = true
 		case "image":
 			image := anthropic.NewImageBlockBase64(block.MimeType, block.Data)
 			if image.OfImage != nil {
@@ -483,39 +522,41 @@ func AnthropicToolResultBlock(msg AnthropicMessage) anthropic.ContentBlockParamU
 			}
 		}
 	}
-	if len(content) == 0 {
-		content = append(content, anthropic.ToolResultBlockParamContentUnion{OfText: &anthropic.TextBlockParam{Text: ""}})
+	// TS unshifts a "(see attached image)" placeholder when there are images
+	// but no text block.
+	if !hasText {
+		content = append([]anthropic.ToolResultBlockParamContentUnion{
+			{OfText: &anthropic.TextBlockParam{Text: "(see attached image)"}},
+		}, content...)
 	}
-	block := anthropic.ToolResultBlockParam{
-		ToolUseID: msg.ToolCallID,
-		Content:   content,
-		IsError:   anthropic.Bool(msg.IsError),
-	}
-	return anthropic.ContentBlockParamUnion{OfToolResult: &block}
+	result.Content = content
+	return anthropic.ContentBlockParamUnion{OfToolResult: &result}
 }
 
 func AnthropicUserContentBlocks(msg AnthropicMessage) []anthropic.ContentBlockParamUnion {
-	if len(msg.Blocks) == 0 && msg.Text != "" {
-		return []anthropic.ContentBlockParamUnion{anthropic.NewTextBlock(msg.Text)}
+	blocks := msg.Blocks
+	if len(blocks) == 0 && msg.Text != "" {
+		blocks = []AnthropicBlock{{Type: "text", Text: msg.Text}}
 	}
-	return AnthropicContentBlocks(msg.Blocks)
+	return AnthropicContentBlocks(blocks)
 }
 
+// AnthropicContentBlocks mirrors TS anthropic.ts:1027-1054: text parts are
+// sanitized, text blocks that are empty after trimming are dropped, and no empty
+// placeholder text block is synthesized when nothing remains (the caller skips
+// the whole message in that case).
 func AnthropicContentBlocks(blocks []AnthropicBlock) []anthropic.ContentBlockParamUnion {
-	if len(blocks) == 0 {
-		return []anthropic.ContentBlockParamUnion{anthropic.NewTextBlock("")}
-	}
 	out := []anthropic.ContentBlockParamUnion{}
 	for _, b := range blocks {
 		switch b.Type {
 		case "text":
-			out = append(out, anthropic.NewTextBlock(b.Text))
+			if strings.TrimSpace(b.Text) == "" {
+				continue
+			}
+			out = append(out, anthropic.NewTextBlock(SanitizeProviderText(b.Text)))
 		case "image":
 			out = append(out, anthropic.NewImageBlockBase64(b.MimeType, b.Data))
 		}
-	}
-	if len(out) == 0 {
-		return []anthropic.ContentBlockParamUnion{anthropic.NewTextBlock("")}
 	}
 	return out
 }

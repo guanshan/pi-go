@@ -240,7 +240,7 @@ func streamWithRegistry(ctx context.Context, registry *ModelRegistry, model Mode
 }
 
 func publicMissingProviderError(api string) error {
-	return fmt.Errorf("no API provider registered for api: %s", api)
+	return fmt.Errorf("No API provider registered for api: %s", api) //nolint:staticcheck // ST1005: TS-faithful message (stream.ts:35 "No API provider registered for api: ...")
 }
 
 func registryMissingProviderError(api string) error {

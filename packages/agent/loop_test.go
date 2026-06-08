@@ -110,6 +110,7 @@ func TestRunAgentLoopTransformErrorEmitsFailureSequence(t *testing.T) {
 	model := ai.Model{Provider: "faux", ID: "faux", API: "faux"}
 	expected := errors.New("context hook failed")
 	var got []string
+	var agentEnd []AgentMessage
 	messages, err := RunAgentLoop(context.Background(), []AgentMessage{ai.NewUserMessage("hi", nil)}, AgentContext{}, AgentLoopConfig{
 		Model: model,
 		TransformContext: func(ctx context.Context, messages []AgentMessage) ([]AgentMessage, error) {
@@ -117,6 +118,9 @@ func TestRunAgentLoopTransformErrorEmitsFailureSequence(t *testing.T) {
 		},
 	}, func(ctx context.Context, ev AgentEvent) error {
 		got = append(got, AgentEventType(ev))
+		if end, ok := ev.(AgentEndEvent); ok {
+			agentEnd = end.Messages
+		}
 		return nil
 	}, nil)
 	if err != nil {
@@ -141,6 +145,16 @@ func TestRunAgentLoopTransformErrorEmitsFailureSequence(t *testing.T) {
 	assistant, ok := ai.AsAssistantMessage(messages[1])
 	if !ok || assistant.StopReason != "error" || assistant.ErrorMessage == "" {
 		t.Fatalf("assistant=%#v ok=%v", messages[1], ok)
+	}
+	// On a thrown loop-internal failure the terminal agent_end carries ONLY the
+	// synthesized failure message (not the full transcript), matching TS where
+	// the wrapper catches the throw and emits agent_end{messages:[failureMessage]}.
+	if len(agentEnd) != 1 {
+		t.Fatalf("agent_end messages=%#v", agentEnd)
+	}
+	endAssistant, ok := ai.AsAssistantMessage(agentEnd[0])
+	if !ok || endAssistant.StopReason != "error" || endAssistant.ErrorMessage != expected.Error() {
+		t.Fatalf("agent_end[0]=%#v ok=%v", agentEnd[0], ok)
 	}
 }
 

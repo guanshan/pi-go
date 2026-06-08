@@ -8,10 +8,12 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"unicode"
 
 	"github.com/guanshan/pi-go/packages/ai"
@@ -304,7 +306,11 @@ type SettingsManager struct {
 	AgentDir string
 	Global   Settings
 	Project  Settings
-	Errors   []error
+	// ProjectTrusted gates project-scoped settings and resources. When false
+	// (an untrusted project, mirroring TS SettingsManager projectTrusted), the
+	// project settings.json is not loaded and project writes are refused.
+	ProjectTrusted bool
+	Errors         []error
 }
 
 func HomeDir() string {
@@ -479,9 +485,23 @@ func ProjectPiDir(cwd string) string {
 }
 
 func NewSettingsManager(cwd, agentDir string) *SettingsManager {
-	sm := &SettingsManager{CWD: cwd, AgentDir: agentDir}
+	// Default to trusted, preserving the behavior of callers that predate the
+	// project-trust system (mirrors TS loadFromStorage's projectTrusted=true
+	// default). The real entry point (main.go) resolves the trust decision and
+	// uses NewSettingsManagerWithTrust.
+	return NewSettingsManagerWithTrust(cwd, agentDir, true)
+}
+
+// NewSettingsManagerWithTrust mirrors TS SettingsManager.create({projectTrusted}):
+// the project-scoped settings.json is loaded only when the project is trusted;
+// for an untrusted project the project scope stays empty (TS loadFromStorage
+// returns {} for scope=="project" && !projectTrusted).
+func NewSettingsManagerWithTrust(cwd, agentDir string, projectTrusted bool) *SettingsManager {
+	sm := &SettingsManager{CWD: cwd, AgentDir: agentDir, ProjectTrusted: projectTrusted}
 	sm.Global, _ = sm.load(filepath.Join(agentDir, "settings.json"))
-	sm.Project, _ = sm.load(filepath.Join(ProjectPiDir(cwd), "settings.json"))
+	if projectTrusted {
+		sm.Project, _ = sm.load(filepath.Join(ProjectPiDir(cwd), "settings.json"))
+	}
 	return sm
 }
 
@@ -504,11 +524,78 @@ func (s *SettingsManager) load(path string) (Settings, bool) {
 }
 
 func (s *SettingsManager) SaveGlobal() error {
-	return writeJSON(filepath.Join(s.AgentDir, "settings.json"), s.Global)
+	return writeSettingsPreservingUnknown(filepath.Join(s.AgentDir, "settings.json"), s.Global)
 }
 
 func (s *SettingsManager) SaveProject() error {
-	return writeJSON(filepath.Join(ProjectPiDir(s.CWD), "settings.json"), s.Project)
+	if !s.ProjectTrusted {
+		return errors.New("project is not trusted; refusing to write project settings")
+	}
+	return writeSettingsPreservingUnknown(filepath.Join(ProjectPiDir(s.CWD), "settings.json"), s.Project)
+}
+
+// writeSettingsPreservingUnknown writes settings.json by merging the known Go
+// Settings struct fields OVER the keys already on disk, so hand-edited or
+// future/unknown keys (e.g. websocketConnectTimeoutMs) survive a save. This
+// mirrors TS persistScopedSettings, which re-reads the file and only rewrites
+// the session-modified fields, leaving every other key intact (P1-09). The
+// previous whole-struct marshal silently dropped any key not modeled by the
+// Settings struct.
+func writeSettingsPreservingUnknown(path string, settings Settings) error {
+	structBytes, err := json.Marshal(settings)
+	if err != nil {
+		return err
+	}
+	structMap := map[string]json.RawMessage{}
+	if err := json.Unmarshal(structBytes, &structMap); err != nil {
+		return err
+	}
+	merged := map[string]json.RawMessage{}
+	if existing, rerr := os.ReadFile(path); rerr == nil {
+		// Best-effort: preserve keys from the current file. A parse failure just
+		// means we start from the struct fields alone.
+		_ = json.Unmarshal(existing, &merged)
+	}
+	// Every key MODELED by the Settings struct is authoritative from memory:
+	// present in structMap -> overwrite; dropped by omitempty (i.e. cleared to its
+	// zero value) -> delete from the on-disk file. Keys NOT modeled by the struct
+	// (unknown/future, e.g. websocketConnectTimeoutMs) are left untouched so a
+	// save does not silently drop them (P1-09).
+	for _, key := range settingsJSONKeys() {
+		if value, ok := structMap[key]; ok {
+			merged[key] = value
+		} else {
+			delete(merged, key)
+		}
+	}
+	return writeJSON(path, merged)
+}
+
+var (
+	settingsJSONKeysOnce  sync.Once
+	settingsJSONKeysCache []string
+)
+
+// settingsJSONKeys returns the JSON object keys modeled by the Settings struct
+// (skipping json:"-" fields like Raw), so writeSettingsPreservingUnknown can tell
+// a "known but cleared" field apart from a genuinely unknown on-disk key.
+func settingsJSONKeys() []string {
+	settingsJSONKeysOnce.Do(func() {
+		t := reflect.TypeOf(Settings{})
+		for i := 0; i < t.NumField(); i++ {
+			field := t.Field(i)
+			tag := field.Tag.Get("json")
+			name := strings.SplitN(tag, ",", 2)[0]
+			if name == "-" {
+				continue
+			}
+			if name == "" {
+				name = field.Name
+			}
+			settingsJSONKeysCache = append(settingsJSONKeysCache, name)
+		}
+	})
+	return settingsJSONKeysCache
 }
 
 func (s *SettingsManager) mergedString(global, project, fallback string) string {
@@ -549,6 +636,14 @@ func (s *SettingsManager) EnabledModels() []string {
 		return append([]string(nil), s.Project.EnabledModels...)
 	}
 	return append([]string(nil), s.Global.EnabledModels...)
+}
+
+// SetEnabledModels persists the scoped/enabled model patterns as the global
+// default (mirrors TS settings-manager setEnabledModels, used by /scoped-models).
+// An empty list clears the scope so all available models are enabled again.
+func (s *SettingsManager) SetEnabledModels(patterns []string) error {
+	s.Global.EnabledModels = append([]string(nil), patterns...)
+	return s.SaveGlobal()
 }
 
 // SetDefaultModelAndProvider persists the selected model+provider as the global

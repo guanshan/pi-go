@@ -75,6 +75,42 @@ func TestRunRPCSetModelPersistsDefault(t *testing.T) {
 	}
 }
 
+// TestRunRPCSetThinkingLevelSucceedsWhileStreaming locks P2-32: TS rpc-mode
+// set_thinking_level (rpc-mode.ts:491-494) always returns {success:true} because
+// agent-session.ts setThinkingLevel is void with no streaming guard. Go's
+// SetThinkingLevel adds a mutex-safety streaming guard that TS lacks; the RPC
+// handler must suppress that guard's error and still report success so embedding
+// hosts changing thinking level mid-stream see TS-identical wire behavior.
+func TestRunRPCSetThinkingLevelSucceedsWhileStreaming(t *testing.T) {
+	runtime := newRPCTestRuntime(t)
+	// Simulate an active stream so SetThinkingLevel hits the streaming guard.
+	agent := runtime.Session()
+	agent.mu.Lock()
+	agent.streaming = true
+	agent.mu.Unlock()
+	out := runRPCCommands(t, runtime, map[string]any{"id": "1", "type": "set_thinking_level", "level": string(ai.ThinkingMedium)})
+	if !strings.Contains(out, `"command":"set_thinking_level"`) {
+		t.Fatalf("set_thinking_level response missing: %s", out)
+	}
+	if !strings.Contains(out, `"success":true`) {
+		t.Fatalf("set_thinking_level during streaming must succeed (TS parity): %s", out)
+	}
+	if strings.Contains(out, "can't switch thinking level while a response is streaming") {
+		t.Fatalf("streaming-guard error must be suppressed on the wire: %s", out)
+	}
+}
+
+// TestRunRPCSetThinkingLevelInvalidStillFails locks the P2-32 boundary: only the
+// streaming guard is suppressed. An invalid level continues to surface as a
+// failure response (the streaming-guard suppression must not mask other errors).
+func TestRunRPCSetThinkingLevelInvalidStillFails(t *testing.T) {
+	runtime := newRPCTestRuntime(t)
+	out := runRPCCommands(t, runtime, map[string]any{"id": "1", "type": "set_thinking_level", "level": "bogus"})
+	if !strings.Contains(out, `"success":false`) || !strings.Contains(out, "invalid thinking level: bogus") {
+		t.Fatalf("invalid level must still fail: %s", out)
+	}
+}
+
 // TestRunRPCOutputDoesNotHTMLEscape locks 7.md P0-1 (RPC part): RPC JSONL output
 // must not HTML-escape `<`, `>`, `&`, mirroring TS serializeJsonLine
 // (`${JSON.stringify(value)}\n`). Go's default json.Marshal escapes them, which
@@ -140,11 +176,13 @@ func TestRunRPCSessionStatsAndExport(t *testing.T) {
 	}
 }
 
-func TestRunRPCCloneRequiresLeaf(t *testing.T) {
+func TestRunRPCCloneSucceedsOnSeededSession(t *testing.T) {
 	runtime := newRPCTestRuntime(t)
-	// Fresh session has no current entry -> clone should fail clearly.
+	// A new session is seeded with model_change + thinking_level_change entries
+	// (TS sdk.ts:361-373), so getLeafId() is non-nil and clone succeeds — matching
+	// TS rpc-mode clone, which only errors when there is genuinely no leaf.
 	out := runRPCCommands(t, runtime, map[string]any{"id": "1", "type": "clone"})
-	if !strings.Contains(out, `"command":"clone"`) || !strings.Contains(out, `"success":false`) {
-		t.Fatalf("expected clone failure on empty session: %s", out)
+	if !strings.Contains(out, `"command":"clone"`) || !strings.Contains(out, `"success":true`) {
+		t.Fatalf("expected clone success on seeded session: %s", out)
 	}
 }

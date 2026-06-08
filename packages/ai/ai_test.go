@@ -631,8 +631,53 @@ func TestCompleteSimplePropagatesTools(t *testing.T) {
 	if function["name"] != "lookup" || function["description"] != "Lookup data" {
 		t.Fatalf("tool function=%#v", function)
 	}
-	if captured["tool_choice"] != "auto" {
-		t.Fatalf("tool_choice=%#v", captured["tool_choice"])
+	if value, ok := captured["tool_choice"]; ok {
+		t.Fatalf("tool_choice should be absent when no explicit choice is set, got %#v", value)
+	}
+}
+
+// TestResponsesAssistantItemsDifferentModelItemID locks in the P2-07 fix at the
+// builder level: for a different-model assistant message the function_call item
+// id is omitted ONLY when it starts with "fc_" (to dodge OpenAI's rs_/fc_
+// pairing validation); a different-model tool call whose id does not start with
+// "fc_" keeps its id, mirroring openai-responses-shared.ts:207.
+func TestResponsesAssistantItemsDifferentModelItemID(t *testing.T) {
+	options := aiproviders.OpenAIResponsesRequestOptions{
+		API:      "openai-responses",
+		Provider: "openai",
+		ModelID:  "gpt-5.5",
+	}
+	differentModel := func(itemID string) aiproviders.OpenAIResponsesMessage {
+		return aiproviders.OpenAIResponsesMessage{
+			Role:     "assistant",
+			API:      "openai-responses",
+			Provider: "openai",
+			Model:    "other-model",
+			Blocks: []aiproviders.OpenAIResponsesMessageBlock{{
+				Type:      "toolCall",
+				ID:        "call_x|" + itemID,
+				Name:      "lookup",
+				Arguments: json.RawMessage(`{"q":"x"}`),
+			}},
+		}
+	}
+
+	// fc_-prefixed item id for a different-model message: id must be omitted.
+	fcItems := aiproviders.ResponsesAssistantItems(options, differentModel("fc_pair"), 0)
+	if len(fcItems) != 1 {
+		t.Fatalf("expected 1 item, got %d", len(fcItems))
+	}
+	if _, ok := fcItems[0]["id"]; ok {
+		t.Fatalf("fc_-prefixed different-model tool call should omit item id, got %#v", fcItems[0]["id"])
+	}
+
+	// Non-fc_ item id for a different-model message: id must be preserved.
+	rsItems := aiproviders.ResponsesAssistantItems(options, differentModel("rs_pair"), 0)
+	if len(rsItems) != 1 {
+		t.Fatalf("expected 1 item, got %d", len(rsItems))
+	}
+	if rsItems[0]["id"] != "rs_pair" {
+		t.Fatalf("non-fc_ different-model tool call should keep item id, got %#v", rsItems[0]["id"])
 	}
 }
 

@@ -47,6 +47,8 @@ function providerMetadata(provider) {
 		providerName: provider.providerName ?? "",
 		hasHandler: provider.hasHandler === true,
 		modelConfig: provider.modelConfig,
+		oauth: provider.oauth,
+		hasModifyModels: provider.hasModifyModels === true,
 	};
 }
 
@@ -97,6 +99,16 @@ function sendUIRequest(method, params) {
 		uiPending.set(uiId, { resolve, reject });
 		write({ type: "ui_request", uiId, method, params: params ?? {} });
 	});
+}
+
+// dialogTimeout extracts the timeout (ms) from an ExtensionUIDialogOptions opts
+// object. Returns undefined when absent/invalid so JSON.stringify omits the key
+// and the host's optional timeout field stays unset (TS rpc-mode.ts:136-149
+// forwards opts?.timeout the same way).
+function dialogTimeout(opts) {
+	if (!opts || typeof opts !== "object") return undefined;
+	const timeout = opts.timeout;
+	return typeof timeout === "number" && Number.isFinite(timeout) ? timeout : undefined;
 }
 
 let contextActionSeq = 0;
@@ -419,6 +431,10 @@ function normalizeProviderDefinition(apiOrProvider, maybeProvider) {
 		api: apiName,
 		hasHandler,
 		modelConfig,
+		// X-02: capture the serializable OAuth login descriptor and whether a
+		// modifyModels(models, credentials) callback was provided.
+		oauth: provider.oauth && typeof provider.oauth === "object" ? provider.oauth : undefined,
+		hasModifyModels: typeof provider.modifyModels === "function",
 		complete: typeof complete === "function" ? complete : undefined,
 		stream: typeof stream === "function" ? stream : undefined,
 		completeSimple: typeof completeSimple === "function" ? completeSimple : undefined,
@@ -821,9 +837,14 @@ const api = {
 	// confirm(message, detail) -> boolean, input(message, options) -> string.
 	ui: {
 		notify(message, level) { return sendUIRequest("notify", { message: String(message ?? ""), level: level ?? "info" }).catch(() => { process.stderr.write(String(message ?? "") + "\n"); }); },
-		select(message, choices) { return sendUIRequest("select", { message: String(message ?? ""), choices: Array.isArray(choices) ? choices : [] }); },
-		confirm(message, detail) { return sendUIRequest("confirm", { message: String(message ?? ""), detail: detail == null ? "" : String(detail) }); },
-		input(message, options) { return sendUIRequest("input", { message: String(message ?? ""), options: options ?? {} }); },
+		// select/confirm/input accept an optional ExtensionUIDialogOptions {signal,
+		// timeout} as the 3rd arg (TS types.ts:124-132). opts.timeout is forwarded
+		// into the wire payload (the RPC host reads it; the interactive host's
+		// countdown/signal-dismiss is host-side and not yet wired). opts.signal
+		// cannot cross the process boundary, so programmatic dismissal is a no-op.
+		select(message, choices, opts) { return sendUIRequest("select", { message: String(message ?? ""), choices: Array.isArray(choices) ? choices : [], timeout: dialogTimeout(opts) }); },
+		confirm(message, detail, opts) { return sendUIRequest("confirm", { message: String(message ?? ""), detail: detail == null ? "" : String(detail), timeout: dialogTimeout(opts) }); },
+		input(message, options, opts) { return sendUIRequest("input", { message: String(message ?? ""), options: options ?? {}, timeout: dialogTimeout(opts) }); },
 		setStatus(key, text) {
 			if (!hasUIState) return;
 			sendUIRequest("setStatus", { key: String(key ?? ""), text: text === undefined ? undefined : String(text) })
@@ -931,6 +952,30 @@ const api = {
 		custom() {
 			console.warn("pi.ui.custom is not supported in the Go bridge; skipping (custom overlays are unavailable).");
 			return Promise.resolve(undefined);
+		},
+		// Theme/tools-expanded accessors mirror TS rpc-mode.ts:285-309 safe defaults
+		// so an extension reading ctx.ui.theme or calling getAllThemes/getTheme/
+		// setTheme/getToolsExpanded/setToolsExpanded never throws "is not a
+		// function". The Node child has no IPC channel to the live Go theme, so
+		// theme exposes the same fixed-table styling helpers as message renderers
+		// (undefined-safe: ctx.ui.theme.fg/bg/bold all work) and theme switching /
+		// tool-expansion are host-side concerns the bridge cannot drive.
+		get theme() {
+			return messageRendererTheme;
+		},
+		getAllThemes() {
+			return [];
+		},
+		getTheme(_name) {
+			return undefined;
+		},
+		setTheme(_theme) {
+			return { success: false, error: "Theme switching is not supported in the Go bridge" };
+		},
+		getToolsExpanded() {
+			return false;
+		},
+		setToolsExpanded(_expanded) {
 		},
 	},
 };

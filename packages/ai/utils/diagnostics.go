@@ -2,7 +2,7 @@ package utils
 
 import (
 	"fmt"
-	"runtime/debug"
+	"reflect"
 	"time"
 )
 
@@ -29,9 +29,50 @@ func FormatThrownValue(value any) string {
 
 func ExtractDiagnosticError(value any) DiagnosticErrorInfo {
 	if err, ok := value.(error); ok {
-		return DiagnosticErrorInfo{Name: "Error", Message: err.Error(), Stack: string(debug.Stack())}
+		// Mirror TS extractDiagnosticError: preserve the concrete error type
+		// name (analog of JS error.name), populate code when the error exposes
+		// one, and omit the stack when none is available (Go errors carry no
+		// stack, so we do not synthesize one).
+		return DiagnosticErrorInfo{
+			Name:    diagnosticErrorName(err),
+			Message: err.Error(),
+			Code:    diagnosticErrorCode(err),
+		}
 	}
 	return DiagnosticErrorInfo{Name: "ThrownValue", Message: FormatThrownValue(value)}
+}
+
+// diagnosticErrorName returns the concrete error type name (best-effort analog
+// of JS error.name), dereferencing pointers. Falls back to "Error" when the
+// type carries no useful name (e.g. anonymous types).
+func diagnosticErrorName(err error) string {
+	t := reflect.TypeOf(err)
+	for t != nil && t.Kind() == reflect.Ptr {
+		t = t.Elem()
+	}
+	if t != nil {
+		if name := t.Name(); name != "" {
+			return name
+		}
+	}
+	return "Error"
+}
+
+// diagnosticErrorCode returns a string|number code when the error exposes one,
+// mirroring TS reading (error as { code?: unknown }).code. Returns nil when no
+// usable code is present.
+func diagnosticErrorCode(err error) any {
+	switch c := err.(type) {
+	case interface{ Code() string }:
+		return c.Code()
+	case interface{ Code() int }:
+		return c.Code()
+	case interface{ Code() int64 }:
+		return c.Code()
+	case interface{ Code() float64 }:
+		return c.Code()
+	}
+	return nil
 }
 
 func CreateAssistantMessageDiagnostic(kind string, err any, details map[string]any) AssistantMessageDiagnostic {

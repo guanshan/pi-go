@@ -220,7 +220,7 @@ func loadScriptExtension(ctx context.Context, api *API, path string, flagValues 
 	for _, command := range ready.Commands {
 		command := command
 		if command.Name != "" {
-			api.RegisterCommandHandler(command.Name, command.Description, func(ctx context.Context, args string) (string, error) {
+			api.RegisterCommandSource(command.Name, command.Description, path, func(ctx context.Context, args string) (string, error) {
 				return runtime.ExecuteCommand(ctx, command.Name, args)
 			})
 		}
@@ -307,11 +307,13 @@ func registerScriptProvider(api *API, runtime *scriptRuntime, path string, provi
 		return
 	}
 	api.RegisterProvider(ProviderDefinition{
-		API:          apiID,
-		ProviderName: providerName,
-		Source:       path,
-		Provider:     adapter,
-		ModelConfig:  provider.ModelConfig,
+		API:             apiID,
+		ProviderName:    providerName,
+		Source:          path,
+		Provider:        adapter,
+		ModelConfig:     provider.ModelConfig,
+		OAuth:           provider.OAuth,
+		HasModifyModels: provider.HasModifyModels,
 	})
 }
 

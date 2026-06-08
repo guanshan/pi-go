@@ -70,6 +70,7 @@ func NewAgentSession(session *SessionManager, settings *SettingsManager, registr
 	if thinking == "" {
 		thinking = settings.DefaultThinkingLevel()
 	}
+	seedInitialSessionEntries(session, model, thinking)
 	return &AgentSession{
 		Session:               session,
 		Settings:              settings,
@@ -86,6 +87,30 @@ func NewAgentSession(session *SessionManager, settings *SettingsManager, registr
 		steeringMode:          settings.SteeringMode(),
 		followUpMode:          settings.FollowUpMode(),
 		sessionListeners:      map[uint64]SessionEventListener{},
+	}
+}
+
+// seedInitialSessionEntries records the starting model and thinking level into a
+// brand-new session so a later /resume restores them, mirroring TS sdk.ts:361-373:
+// a new session (no messages) appends model_change + thinking_level_change; an
+// existing session lacking any thinking entry gets one. No-op for a resumed
+// session that already carries both.
+func seedInitialSessionEntries(session *SessionManager, model ai.Model, thinking ai.ThinkingLevel) {
+	if session == nil {
+		return
+	}
+	ctx := session.BuildContext()
+	if len(ctx.Messages) == 0 {
+		if model.Provider != "" && model.ID != "" {
+			_ = session.AppendModelChange(model.Provider, model.ID)
+		}
+		if thinking != "" {
+			_ = session.AppendThinkingChange(thinking)
+		}
+		return
+	}
+	if thinking != "" && !sessionBranchHasThinkingChange(session) {
+		_ = session.AppendThinkingChange(thinking)
 	}
 }
 
@@ -501,20 +526,28 @@ func (a *AgentSession) popFollowUp() (queuedPrompt, bool) {
 	return q, true
 }
 
+// AgentSessionState mirrors the TS RpcSessionState wire shape
+// (modes/rpc/rpc-types.ts:91-104): model, sessionFile, and sessionName are
+// optional (omitted when unset), and there is no autoRetryEnabled field. The
+// auto-retry toggle is tracked internally on AgentSession but excluded from the
+// serialized state.
 type AgentSessionState struct {
-	Model                 ai.Model         `json:"model"`
+	Model                 ai.Model         `json:"model,omitzero"`
 	ThinkingLevel         ai.ThinkingLevel `json:"thinkingLevel"`
 	IsStreaming           bool             `json:"isStreaming"`
 	IsCompacting          bool             `json:"isCompacting"`
 	SteeringMode          string           `json:"steeringMode"`
 	FollowUpMode          string           `json:"followUpMode"`
-	SessionFile           string           `json:"sessionFile"`
+	SessionFile           string           `json:"sessionFile,omitempty"`
 	SessionID             string           `json:"sessionId"`
-	SessionName           string           `json:"sessionName"`
+	SessionName           string           `json:"sessionName,omitempty"`
 	AutoCompactionEnabled bool             `json:"autoCompactionEnabled"`
-	AutoRetryEnabled      bool             `json:"autoRetryEnabled"`
 	MessageCount          int              `json:"messageCount"`
 	PendingMessageCount   int              `json:"pendingMessageCount"`
+	// AutoRetryEnabled is tracked internally (and read by the interactive
+	// /settings toggle) but excluded from the wire shape: TS RpcSessionState
+	// has no autoRetryEnabled field (P3-29).
+	AutoRetryEnabled bool `json:"-"`
 }
 
 func (a *AgentSession) State() AgentSessionState {
@@ -532,9 +565,9 @@ func (a *AgentSession) State() AgentSessionState {
 		SessionID:             a.Session.SessionID(),
 		SessionName:           ctx.Name,
 		AutoCompactionEnabled: a.autoCompactionEnabled,
-		AutoRetryEnabled:      a.autoRetryEnabled,
 		MessageCount:          len(ctx.Messages),
 		PendingMessageCount:   len(a.steeringQueue) + len(a.followUpQueue),
+		AutoRetryEnabled:      a.autoRetryEnabled,
 	}
 }
 

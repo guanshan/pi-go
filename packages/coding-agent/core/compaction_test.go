@@ -113,6 +113,65 @@ func TestPrepareCompactionCarriesPreviousSummaryAndFileDetails(t *testing.T) {
 	}
 }
 
+func TestSerializeConversationRendersToolCallArgsAsKeyValue(t *testing.T) {
+	model := ai.Model{Provider: "unit", ID: "compaction-model", API: "unit-api"}
+	messages := []ai.Message{
+		ai.NewUserMessage("please edit", nil),
+		assistantToolCallMessage(model, "editing now",
+			ai.ContentBlock{Type: "toolCall", ID: "edit-1", Name: "edit", Arguments: json.RawMessage(`{"path":"a.go","oldString":"x","replaceAll":true}`)},
+		),
+	}
+	got := serializeConversation(messages)
+	want := "[User]: please edit\n\n" +
+		"[Assistant]: editing now\n\n" +
+		`[Assistant tool calls]: edit(path="a.go", oldString="x", replaceAll=true)`
+	if got != want {
+		t.Fatalf("serializeConversation mismatch:\n got=%q\nwant=%q", got, want)
+	}
+}
+
+func TestSerializeConversationToolCallArgsPreserveValueTypes(t *testing.T) {
+	model := ai.Model{Provider: "unit", ID: "compaction-model", API: "unit-api"}
+	messages := []ai.Message{
+		assistantToolCallMessage(model, "",
+			ai.ContentBlock{Type: "toolCall", ID: "grep-1", Name: "grep", Arguments: json.RawMessage(`{"pattern":"foo<bar>","limit":5,"paths":["x","y"],"nested":{"k":"v"}}`)},
+		),
+	}
+	got := serializeConversation(messages)
+	want := `[Assistant tool calls]: grep(pattern="foo<bar>", limit=5, paths=["x","y"], nested={"k":"v"})`
+	if got != want {
+		t.Fatalf("serializeConversation mismatch:\n got=%q\nwant=%q", got, want)
+	}
+}
+
+func TestSerializeConversationAfterConvertEmitsSummariesAsUser(t *testing.T) {
+	exit := 0
+	messages := []ai.Message{
+		BranchSummaryMessage{Role: "branchSummary", Summary: "branch work"},
+		CompactionSummaryMessage{Role: "compactionSummary", Summary: "old context"},
+		CustomSessionMessage{Role: "custom", CustomType: "note", Content: "a custom note"},
+		BashExecutionMessage{Role: "bashExecution", Command: "ls", Output: "file.txt", ExitCode: &exit},
+		ai.NewUserMessage("now continue", nil),
+	}
+	converted, err := convertSessionMessagesToLLM(messages)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := serializeConversation(converted)
+
+	wantParts := []string{
+		"[User]: " + ai.BranchSummaryText("branch work"),
+		"[User]: " + ai.CompactionSummaryText("old context"),
+		"[User]: a custom note",
+		"[User]: " + ai.FormatBashExecutionText("ls", "file.txt", &exit, false, false, ""),
+		"[User]: now continue",
+	}
+	want := strings.Join(wantParts, "\n\n")
+	if got != want {
+		t.Fatalf("serializeConversation after convert mismatch:\n got=%q\nwant=%q", got, want)
+	}
+}
+
 func TestAgentSessionCompactUsesRegistryCompleteSimpleAndPersistsDetails(t *testing.T) {
 	provider := &recordingCompactionProvider{
 		api:       "compaction-test-api",

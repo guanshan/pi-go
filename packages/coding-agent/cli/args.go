@@ -61,10 +61,14 @@ type Args struct {
 	ListModels         *string
 	Offline            bool
 	Verbose            bool
-	Messages           []string
-	FileArgs           []string
-	UnknownFlags       map[string]any
-	Diagnostics        []Diagnostic
+	// ProjectTrustOverride mirrors TS args.ts projectTrustOverride: --approve/-a
+	// forces the current project trusted for this run, --no-approve/-na forces it
+	// untrusted; nil means no override (resolve via the trust store / prompt).
+	ProjectTrustOverride *bool
+	Messages             []string
+	FileArgs             []string
+	UnknownFlags         map[string]any
+	Diagnostics          []Diagnostic
 }
 
 func ParseArgs(argv []string) Args {
@@ -248,6 +252,12 @@ func ParseArgs(argv []string) Args {
 			result.Verbose = true
 		case arg == "--offline":
 			result.Offline = true
+		case arg == "--approve" || arg == "-a":
+			trusted := true
+			result.ProjectTrustOverride = &trusted
+		case arg == "--no-approve" || arg == "-na":
+			trusted := false
+			result.ProjectTrustOverride = &trusted
 		case strings.HasPrefix(arg, "@"):
 			result.FileArgs = append(result.FileArgs, strings.TrimPrefix(arg, "@"))
 		case strings.HasPrefix(arg, "--"):
@@ -335,6 +345,8 @@ Options:
   --export <file>                Export session file to HTML and exit
   --list-models [search]         List available models (with optional fuzzy search)
   --verbose                      Force verbose startup (overrides quietStartup setting)
+  --approve, -a                  Trust project-local files for this run
+  --no-approve, -na              Ignore project-local files for this run
   --offline                      Disable startup network operations (same as PI_OFFLINE=1)
   --help, -h                     Show this help
   --version, -v                  Show version number

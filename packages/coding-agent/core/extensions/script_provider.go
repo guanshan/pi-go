@@ -16,6 +16,13 @@ type scriptProviderMetadata struct {
 	ProviderName string          `json:"providerName"`
 	HasHandler   bool            `json:"hasHandler"`
 	ModelConfig  json.RawMessage `json:"modelConfig"`
+	// OAuth carries the extension provider's serializable OAuth login descriptor
+	// (TS registerProvider `oauth`); HasModifyModels reports whether the provider
+	// defined a modifyModels(models, credentials) callback. Captured so the
+	// capability is not silently dropped (X-02); host /login wiring + the
+	// modifyModels IPC callback remain a documented partial.
+	OAuth           json.RawMessage `json:"oauth,omitempty"`
+	HasModifyModels bool            `json:"hasModifyModels"`
 }
 
 type scriptAIProvider struct {

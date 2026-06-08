@@ -65,7 +65,9 @@ func LoginGitHubCopilot(callbacks OAuthLoginCallbacks) (OAuthCredentials, error)
 	if callbacks.OnProgress != nil {
 		callbacks.OnProgress("Enabling models...")
 	}
-	enableAllGitHubCopilotModelsFunc(ctx, credentials.Access, enterpriseDomain, httpClient, callbacks.OnProgress)
+	// Mirror TS loginGitHubCopilot: the per-model enable fan-out runs SILENTLY
+	// (TS does not forward onProgress into enableAllGitHubCopilotModels).
+	enableAllGitHubCopilotModelsFunc(ctx, credentials.Access, enterpriseDomain, httpClient, nil)
 	return credentials, nil
 }
 
@@ -120,10 +122,16 @@ func startGitHubCopilotDeviceFlow(ctx context.Context, domain string, client *ht
 	if payload.DeviceCode == "" || payload.UserCode == "" || payload.VerificationURI == "" || payload.ExpiresIn == 0 {
 		return gitHubCopilotDeviceCode{}, fmt.Errorf("invalid device code response: %s", string(raw))
 	}
+	// The verification URI is opened in the user's browser and to prevent `open` from
+	// opening an executable or similar, we force it to be a URL.
+	parsedURI, err := url.Parse(payload.VerificationURI)
+	if err != nil || (parsedURI.Scheme != "https" && parsedURI.Scheme != "http") {
+		return gitHubCopilotDeviceCode{}, errors.New("Untrusted verification_uri in device code response") //nolint:staticcheck // ST1005: TS-faithful message (github-copilot.ts:136-153)
+	}
 	return gitHubCopilotDeviceCode{
 		DeviceCode:       payload.DeviceCode,
 		UserCode:         payload.UserCode,
-		VerificationURI:  payload.VerificationURI,
+		VerificationURI:  parsedURI.String(),
 		IntervalSeconds:  payload.Interval,
 		ExpiresInSeconds: payload.ExpiresIn,
 	}, nil

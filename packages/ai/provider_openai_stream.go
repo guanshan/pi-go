@@ -25,7 +25,9 @@ func (r *ModelRegistry) runOpenAIChatStream(ctx context.Context, req ChatRequest
 	if err != nil {
 		return openAIStreamError(partial, err, stream)
 	}
-	sdkStream, usedSDK := aiproviders.OpenAIChatCompletionSDKStream(ctx, openAISDKRequest(req, prepared.Key, prepared.Headers, prepared.Body, prepared.BearerAuth))
+	sdkRequest := openAISDKRequest(req, prepared.Key, prepared.Headers, prepared.Body, prepared.BearerAuth)
+	sdkRequest.SupportsUsageInStreaming = prepared.SupportsUsageInStreaming
+	sdkStream, usedSDK := aiproviders.OpenAIChatCompletionSDKStream(ctx, sdkRequest)
 	if !usedSDK {
 		return r.runOpenAIChatHTTPStream(ctx, req, prepared, partial, stream)
 	}
@@ -79,8 +81,12 @@ func (r *ModelRegistry) runOpenAIChatStream(ctx context.Context, req ChatRequest
 func (r *ModelRegistry) runOpenAIChatHTTPStream(ctx context.Context, req ChatRequest, prepared aiproviders.PreparedOpenAIChatRequest, partial AssistantMessage, stream *AssistantMessageEventStream) (AssistantMessage, error) {
 	body := aiproviders.CloneOpenAIChatBody(prepared.Body)
 	body["stream"] = true
-	if _, ok := body["stream_options"]; !ok {
-		body["stream_options"] = map[string]any{"include_usage": true}
+	// Mirror openai-completions.ts: only request usage in the stream when
+	// compat.supportsUsageInStreaming !== false.
+	if prepared.SupportsUsageInStreaming {
+		if _, ok := body["stream_options"]; !ok {
+			body["stream_options"] = map[string]any{"include_usage": true}
+		}
 	}
 	// MarshalJSON keeps < > & literal to match the TS upstream wire bytes (the
 	// SDK path already disables HTML escaping; this is the manual HTTP fallback).

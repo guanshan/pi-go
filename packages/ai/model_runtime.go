@@ -129,10 +129,22 @@ func (r *ModelRegistry) InitialModel(options InitialModelOptions) (Model, bool, 
 			return model, true, ""
 		}
 	}
+
+	// Collect available (auth-configured, non-faux) models, preserving catalog
+	// order, mirroring TS modelRegistry.getAvailable().
+	var available []Model
 	for _, m := range r.ModelsSnapshot() {
 		if m.Provider != "faux" && r.HasAuth(m) {
-			return m, true, ""
+			available = append(available, m)
 		}
+	}
+	if len(available) > 0 {
+		// Prefer each known provider's curated default model before falling back
+		// to the first available model, mirroring step 4 of TS findInitialModel.
+		if model, ok := defaultModelForAvailable(available); ok {
+			return model, true, ""
+		}
+		return available[0], true, ""
 	}
 	return Model{}, false, "No models available"
 }
@@ -202,10 +214,14 @@ func (r *ModelRegistry) APIKey(ctx context.Context, model Model) (string, error)
 					return result.NewCredentials, nil
 				})
 				if err != nil {
-					if errors.Is(err, errOAuthRefreshUnavailable) {
-						return "", nil
-					}
-					return "", err
+					// Mirror TS getApiKey (auth-storage.ts:487-508): a hard refresh
+					// failure (network/HTTP error, or no refresh path available) is
+					// non-fatal. RefreshOAuthCredentials already re-reads auth.json
+					// under the file lock and returns the credentials a sibling
+					// process may have refreshed, so any error reaching here means
+					// the provider should simply be skipped during model discovery
+					// rather than surfacing the error to the caller.
+					return "", nil
 				}
 				if !ok {
 					return "", nil

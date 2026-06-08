@@ -181,6 +181,10 @@ type OpenAISDKRequest struct {
 	BearerAuth     bool
 	HTTPClient     *http.Client
 	RequestOptions RequestOptions
+	// SupportsUsageInStreaming gates the stream_options.include_usage injection
+	// in the SDK chat stream. Mirrors openai-completions.ts which adds it only
+	// when compat.supportsUsageInStreaming !== false.
+	SupportsUsageInStreaming bool
 }
 
 func OpenAIChatCompletionSDK(ctx context.Context, req OpenAISDKRequest) (OpenAIChatParsed, bool, error) {
@@ -205,8 +209,10 @@ func OpenAIChatCompletionSDKStream(ctx context.Context, req OpenAISDKRequest) (*
 	}
 	client := NewOpenAIClient(req.Key, baseURL, SDKHeadersWithoutAuth(req.Headers), true, req.HTTPClient, req.RequestOptions)
 	streamBody := CloneOpenAIChatBody(req.Body)
-	if _, ok := streamBody["stream_options"]; !ok {
-		streamBody["stream_options"] = map[string]any{"include_usage": true}
+	if req.SupportsUsageInStreaming {
+		if _, ok := streamBody["stream_options"]; !ok {
+			streamBody["stream_options"] = map[string]any{"include_usage": true}
+		}
 	}
 	params := OpenAIChatCompletionSDKParams(streamBody)
 	return client.Chat.Completions.NewStreaming(ctx, params), true

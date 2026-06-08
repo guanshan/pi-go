@@ -109,7 +109,7 @@ func TestBedrockChatPayloadAndParse(t *testing.T) {
 	}
 	additional := captured["additionalModelRequestFields"].(map[string]any)
 	thinking := additional["thinking"].(map[string]any)
-	if thinking["type"] != "enabled" || thinking["budget_tokens"] != float64(8192) || thinking["display"] != "summarized" {
+	if thinking["type"] != "enabled" || thinking["budget_tokens"] != float64(16384) || thinking["display"] != "summarized" {
 		t.Fatalf("thinking=%#v", thinking)
 	}
 	if additional["anthropic_beta"].([]any)[0] != "interleaved-thinking-2025-05-14" {

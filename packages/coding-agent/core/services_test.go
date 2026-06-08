@@ -227,7 +227,9 @@ func TestCreateAgentSessionFromServicesBindsScriptExtensionContext(t *testing.T)
 	if probe.CWD != cwd ||
 		probe.Mode != "print" ||
 		probe.Model != "faux/faux" ||
-		probe.Branch != 1 ||
+		// NewAgentSession seeds an initial model_change + thinking_level_change
+		// entry (TS sdk.ts:361-373), so a fresh branch carries those entries.
+		probe.Branch != 3 ||
 		probe.Models != 1 ||
 		!probe.Idle {
 		t.Fatalf("context output = %#v, raw %s", probe, got)

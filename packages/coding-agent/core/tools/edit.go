@@ -20,11 +20,11 @@ func (EditTool) Description() string {
 	return "Edit a single file using exact text replacement. Every edits[].oldText must match a unique, non-overlapping region of the original file. If two changes affect the same block or nearby lines, merge them into one edit instead of emitting overlapping edits. Do not include large unchanged regions just to connect distant changes."
 }
 func (EditTool) Schema() map[string]any {
-	edit := objectSchema(map[string]any{
+	edit := strictObjectSchema(map[string]any{
 		"oldText": stringSchema("Exact text for one targeted replacement. It must be unique in the original file and must not overlap with any other edits[].oldText in the same call."),
 		"newText": stringSchema("Replacement text for this targeted edit."),
 	}, []string{"oldText", "newText"})
-	return objectSchema(map[string]any{
+	return strictObjectSchema(map[string]any{
 		"path": stringSchema("Path to the file to edit (relative or absolute)"),
 		"edits": map[string]any{
 			"type":        "array",
@@ -80,11 +80,13 @@ func (t EditTool) Execute(ctx context.Context, raw json.RawMessage, _ ToolUpdate
 		if err := atomicWriteFile(abs, []byte(final), fileWriteMode(abs, 0o644)); err != nil {
 			return toolError(err.Error())
 		}
-		diff := simpleDiff(base, updated)
+		// Mirror edit.ts:350,359: both the display diff and firstChangedLine derive
+		// from generateDiffString's LCS line diff (not a naive positional scan).
+		diff, changedLine := generateDiffString(base, updated, 4)
 		details := map[string]any{
 			"diff":             diff,
 			"patch":            unifiedPatch(args.Path, base, updated),
-			"firstChangedLine": firstChangedLine(base, updated),
+			"firstChangedLine": changedLine,
 		}
 		return ai.ToolResult{Content: ai.TextBlocks(fmt.Sprintf("Successfully replaced %d block(s) in %s.", len(edits), args.Path)), Details: details}
 	})
@@ -328,46 +330,8 @@ func applyEdits(content string, edits []Edit, path string) (string, string, erro
 	return base, updated, nil
 }
 
-func simpleDiff(oldText, newText string) string {
-	oldLines := strings.Split(oldText, "\n")
-	newLines := strings.Split(newText, "\n")
-	var b strings.Builder
-	maxLen := max(len(oldLines), len(newLines))
-	for i := 0; i < maxLen; i++ {
-		var oldLine, newLine string
-		if i < len(oldLines) {
-			oldLine = oldLines[i]
-		}
-		if i < len(newLines) {
-			newLine = newLines[i]
-		}
-		if i >= len(oldLines) {
-			fmt.Fprintf(&b, "+%d %s\n", i+1, newLine)
-		} else if i >= len(newLines) {
-			fmt.Fprintf(&b, "-%d %s\n", i+1, oldLine)
-		} else if oldLine != newLine {
-			fmt.Fprintf(&b, "-%d %s\n+%d %s\n", i+1, oldLine, i+1, newLine)
-		}
-	}
-	return strings.TrimRight(b.String(), "\n")
-}
-
 func unifiedPatch(path, oldText, newText string) string {
 	return generateUnifiedPatch(path, oldText, newText, 4)
-}
-
-func firstChangedLine(oldText, newText string) int {
-	oldLines := strings.Split(oldText, "\n")
-	newLines := strings.Split(newText, "\n")
-	for i := 0; i < min(len(oldLines), len(newLines)); i++ {
-		if oldLines[i] != newLines[i] {
-			return i + 1
-		}
-	}
-	if len(oldLines) != len(newLines) {
-		return min(len(oldLines), len(newLines)) + 1
-	}
-	return 0
 }
 
 // generateUnifiedPatch produces a standard unified diff (with @@ hunks) between

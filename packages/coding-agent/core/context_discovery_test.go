@@ -33,7 +33,7 @@ func TestDiscoverContextFilesMatchesTSOrderingAndVariants(t *testing.T) {
 	workAgents := write(work, "AGENTS.md")
 	write(work, "CLAUDE.md") // both present in cwd: only AGENTS.md (first match) must win
 
-	got := discoverContextFiles(work, agentDir)
+	got := discoverContextFiles(work, agentDir, true)
 
 	want := []string{agentClaude, projAgentsMD, workAgents}
 	if len(got) != len(want) {

@@ -209,7 +209,10 @@ func NewSessionManagerWithID(cwd, sessionDir, id string) (*SessionManager, error
 	if id == "" {
 		id = uuid()
 	}
-	path := filepath.Join(sessionDir, encodeCWD(cwd), fmt.Sprintf("%s_%s.jsonl", time.Now().Format("20060102T150405"), id))
+	// Match TS session-manager.ts fileTimestamp: new Date().toISOString() with
+	// ':' and '.' replaced by '-' (e.g. 2026-06-08T12-34-56-789Z_<id>.jsonl).
+	stamp := strings.NewReplacer(":", "-", ".", "-").Replace(time.Now().UTC().Format("2006-01-02T15:04:05.000Z07:00"))
+	path := filepath.Join(sessionDir, encodeCWD(cwd), fmt.Sprintf("%s_%s.jsonl", stamp, id))
 	sm := &SessionManager{
 		Header: SessionHeader{
 			Type:      "session",

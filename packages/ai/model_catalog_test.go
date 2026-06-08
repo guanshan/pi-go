@@ -1,10 +1,12 @@
 package ai
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"reflect"
 	"slices"
+	"strings"
 	"testing"
 )
 
@@ -184,5 +186,132 @@ func TestLoadCustomModelsBareArrayKeepsMaxTokens(t *testing.T) {
 	}
 	if model.MaxOutput != 3072 {
 		t.Fatalf("MaxOutput=%d", model.MaxOutput)
+	}
+}
+
+// P2-10: Model JSON must always emit `reasoning` (a required boolean upstream),
+// even when false, and must OMIT `compat` entirely when it carries no overrides
+// (TS compat is optional). This mirrors the @earendil-works/pi-ai Model shape.
+func TestModelJSONReasoningAndCompatShape(t *testing.T) {
+	raw, err := json.Marshal(Model{Provider: "openai", ID: "gpt-4o", API: "openai-completions", Reasoning: false})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatal(err)
+	}
+	if v, ok := got["reasoning"]; !ok || string(v) != "false" {
+		t.Fatalf("reasoning must always be present and false: %s", raw)
+	}
+	if _, ok := got["compat"]; ok {
+		t.Fatalf("compat must be omitted when zero: %s", raw)
+	}
+
+	// reasoning:true still serializes, and a non-zero compat is emitted.
+	enabled := true
+	withCompat := Model{Provider: "openai", ID: "gpt-5", API: "openai-completions", Reasoning: true, Compat: OpenAICompat{SupportsStore: &enabled}}
+	raw2, err := json.Marshal(withCompat)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw2), `"reasoning":true`) {
+		t.Fatalf("reasoning:true expected: %s", raw2)
+	}
+	if !strings.Contains(string(raw2), `"compat"`) {
+		t.Fatalf("non-zero compat expected: %s", raw2)
+	}
+
+	// Round-trip preserves both fields.
+	var back Model
+	if err := json.Unmarshal(raw2, &back); err != nil {
+		t.Fatal(err)
+	}
+	if !back.Reasoning || back.Compat.SupportsStore == nil || !*back.Compat.SupportsStore {
+		t.Fatalf("round-trip lost fields: %#v", back)
+	}
+}
+
+// P2-18: partial matching prefers an alias (no -YYYYMMDD suffix) over a dated
+// version, and among aliases picks the highest-sorting id.
+func TestMatchPrefersAliasOverDated(t *testing.T) {
+	models := []Model{
+		{Provider: "anthropic", ID: "claude-sonnet-4-5-20250929", API: "anthropic"},
+		{Provider: "anthropic", ID: "claude-sonnet-4-5", API: "anthropic"},
+	}
+	m, ok, _ := Match(models, "", "sonnet")
+	if !ok || m.ID != "claude-sonnet-4-5" {
+		t.Fatalf("expected alias claude-sonnet-4-5, got ok=%v id=%q", ok, m.ID)
+	}
+
+	// With only dated versions, the latest (highest-sorting) dated id wins.
+	dated := []Model{
+		{Provider: "anthropic", ID: "claude-sonnet-4-5-20250101", API: "anthropic"},
+		{Provider: "anthropic", ID: "claude-sonnet-4-5-20250929", API: "anthropic"},
+	}
+	m2, ok2, _ := Match(dated, "", "sonnet")
+	if !ok2 || m2.ID != "claude-sonnet-4-5-20250929" {
+		t.Fatalf("expected latest dated, got ok=%v id=%q", ok2, m2.ID)
+	}
+}
+
+// P2-18: a bare model id that matches the same id across multiple providers is
+// ambiguous and must NOT resolve to an arbitrary first match (TS returns
+// undefined / no match).
+func TestMatchRejectsAmbiguousBareID(t *testing.T) {
+	models := []Model{
+		{Provider: "openai", ID: "gpt-5", API: "openai-completions"},
+		{Provider: "github-copilot", ID: "gpt-5", API: "openai-completions"},
+	}
+	if _, ok, _ := Match(models, "", "gpt-5"); ok {
+		t.Fatal("ambiguous bare id must not match across providers")
+	}
+	// A provider-qualified reference disambiguates and resolves.
+	if m, ok, _ := Match(models, "", "openai/gpt-5"); !ok || m.Provider != "openai" {
+		t.Fatalf("qualified reference should resolve to openai: ok=%v provider=%q", ok, m.Provider)
+	}
+	// Single-provider bare id still resolves.
+	single := []Model{{Provider: "openai", ID: "gpt-5", API: "openai-completions"}}
+	if m, ok, _ := Match(single, "", "gpt-5"); !ok || m.Provider != "openai" {
+		t.Fatalf("unambiguous bare id should resolve: ok=%v provider=%q", ok, m.Provider)
+	}
+}
+
+// P3-08: ClampThinking with an empty level must fall through to the model's
+// first supported level (off for non-reasoning models), mirroring TS
+// clampThinkingLevel which has no empty-string special case.
+func TestClampThinkingEmptyFallsThrough(t *testing.T) {
+	nonReasoning := Model{Provider: "openai", ID: "gpt-4o", API: "openai-completions", Reasoning: false}
+	if got := ClampThinking(nonReasoning, ""); got != ThinkingOff {
+		t.Fatalf("empty level on non-reasoning model: got %q, want off", got)
+	}
+}
+
+// P1-07: with only an Anthropic key configured, initial-model auto-selection
+// must prefer the curated default (claude-opus-4-8) over the first
+// auth-configured catalog entry.
+func TestDefaultModelForAvailablePrefersCuratedDefault(t *testing.T) {
+	available := []Model{
+		{Provider: "anthropic", ID: "claude-3-5-haiku-20241022", API: "anthropic"},
+		{Provider: "anthropic", ID: "claude-opus-4-8", API: "anthropic"},
+	}
+	m, ok := defaultModelForAvailable(available)
+	if !ok || m.ID != "claude-opus-4-8" {
+		t.Fatalf("expected curated default claude-opus-4-8, got ok=%v id=%q", ok, m.ID)
+	}
+}
+
+// P3-11: ModelsAreEqual must treat a zero-value Model (empty provider AND id)
+// as not equal, mirroring the TS null/undefined guard.
+func TestModelsAreEqualZeroValueGuard(t *testing.T) {
+	if ModelsAreEqual(Model{}, Model{}) {
+		t.Fatal("two zero-value models must not be equal")
+	}
+	real := Model{Provider: "anthropic", ID: "claude-opus-4-8"}
+	if ModelsAreEqual(real, Model{}) || ModelsAreEqual(Model{}, real) {
+		t.Fatal("a real model must not equal a zero-value model")
+	}
+	if !ModelsAreEqual(real, real) {
+		t.Fatal("identical models must be equal")
 	}
 }

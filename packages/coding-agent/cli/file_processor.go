@@ -45,12 +45,15 @@ func ProcessFileArguments(cwd string, fileArgs []string, options ...ProcessFileO
 		data, err := os.ReadFile(path)
 		if err != nil {
 			// Mirror file-processor.ts wording: a missing file reports "File not
-			// found: <path>"; any other read failure reports "Could not read file:
-			// <path>". The absolute, cleaned path is used (matching TS resolve()).
+			// found: <path>" (the access() check at file-processor.ts:37); any
+			// other read failure reports "Could not read file <path>: <message>"
+			// with the colon AFTER the path and the underlying error appended
+			// (file-processor.ts:92). The absolute, cleaned path is used (matching
+			// TS resolve()).
 			if os.IsNotExist(err) {
 				return ProcessedFiles{}, fmt.Errorf("File not found: %s", abs) //nolint:staticcheck // TS-compatible user-facing message.
 			}
-			return ProcessedFiles{}, fmt.Errorf("Could not read file: %s", abs) //nolint:staticcheck // TS-compatible user-facing message.
+			return ProcessedFiles{}, fmt.Errorf("Could not read file %s: %s", abs, err) //nolint:staticcheck // TS-compatible user-facing message.
 		}
 		if len(data) == 0 {
 			continue
@@ -155,20 +158,98 @@ func expandTilde(path string) string {
 	return filepath.Join(home, path[2:])
 }
 
+// pngSignature is the 8-byte PNG magic, matching utils/mime.ts PNG_SIGNATURE.
+var pngSignature = []byte{0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a}
+
+// detectSupportedImageMime mirrors utils/mime.ts detectSupportedImageMimeType:
+// header sniffing with PNG validated via IHDR (and animated PNG rejected), and
+// GIF matched on the 3-byte "GIF" prefix only.
 func detectSupportedImageMime(data []byte) string {
-	if len(data) >= 8 && bytes.Equal(data[:8], []byte{0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n'}) {
-		return "image/png"
-	}
-	if len(data) >= 3 && data[0] == 0xff && data[1] == 0xd8 && data[2] == 0xff && (len(data) <= 3 || data[3] != 0xf7) {
+	// JPEG: ff d8 ff, but ff d8 ff f7 (JPEG-LS) is rejected. A buffer of exactly
+	// 3 bytes (no data[3]) is still treated as JPEG, matching TS's undefined !==
+	// 0xf7 comparison.
+	if startsWith(data, []byte{0xff, 0xd8, 0xff}) {
+		if len(data) > 3 && data[3] == 0xf7 {
+			return ""
+		}
 		return "image/jpeg"
 	}
-	if len(data) >= 6 && (string(data[:6]) == "GIF87a" || string(data[:6]) == "GIF89a") {
+	if startsWith(data, pngSignature) {
+		if isPng(data) && !isAnimatedPng(data) {
+			return "image/png"
+		}
+		return ""
+	}
+	if startsWithASCII(data, 0, "GIF") {
 		return "image/gif"
 	}
-	if len(data) >= 12 && string(data[:4]) == "RIFF" && string(data[8:12]) == "WEBP" {
+	if startsWithASCII(data, 0, "RIFF") && startsWithASCII(data, 8, "WEBP") {
 		return "image/webp"
 	}
 	return ""
+}
+
+// isPng requires a valid IHDR chunk (length 13) immediately after the signature,
+// matching utils/mime.ts isPng().
+func isPng(data []byte) bool {
+	return len(data) >= 16 && readUint32BE(data, len(pngSignature)) == 13 && startsWithASCII(data, 12, "IHDR")
+}
+
+// isAnimatedPng walks PNG chunks looking for an acTL chunk before the first
+// IDAT, matching utils/mime.ts isAnimatedPng().
+func isAnimatedPng(data []byte) bool {
+	offset := len(pngSignature)
+	for offset+8 <= len(data) {
+		chunkLength := readUint32BE(data, offset)
+		chunkTypeOffset := offset + 4
+		if startsWithASCII(data, chunkTypeOffset, "acTL") {
+			return true
+		}
+		if startsWithASCII(data, chunkTypeOffset, "IDAT") {
+			return false
+		}
+		nextOffset := offset + 8 + chunkLength + 4
+		if nextOffset <= offset || nextOffset > len(data) {
+			return false
+		}
+		offset = nextOffset
+	}
+	return false
+}
+
+// readUint32BE reads a big-endian uint32 at offset, returning 0 for any byte
+// past the end of the buffer (matching the `?? 0` reads in utils/mime.ts).
+func readUint32BE(data []byte, offset int) int {
+	return int(byteAt(data, offset))<<24 |
+		int(byteAt(data, offset+1))<<16 |
+		int(byteAt(data, offset+2))<<8 |
+		int(byteAt(data, offset+3))
+}
+
+func byteAt(data []byte, offset int) byte {
+	if offset < 0 || offset >= len(data) {
+		return 0
+	}
+	return data[offset]
+}
+
+func startsWith(data, prefix []byte) bool {
+	if len(data) < len(prefix) {
+		return false
+	}
+	return bytes.Equal(data[:len(prefix)], prefix)
+}
+
+func startsWithASCII(data []byte, offset int, text string) bool {
+	if len(data) < offset+len(text) {
+		return false
+	}
+	for i := 0; i < len(text); i++ {
+		if data[offset+i] != text[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func fileExists(path string) bool {

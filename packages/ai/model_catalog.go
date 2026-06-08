@@ -5,12 +5,17 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 
 	aiproviders "github.com/guanshan/pi-go/packages/ai/providers"
 	aiutils "github.com/guanshan/pi-go/packages/ai/utils"
 )
+
+// datedModelIDPattern matches a trailing -YYYYMMDD date suffix on a model id,
+// mirroring the /-\d{8}$/ test in TS model-resolver.ts isAlias.
+var datedModelIDPattern = regexp.MustCompile(`-\d{8}$`)
 
 func GeneratedModels() []Model {
 	return append([]Model(nil), generatedModels...)
@@ -499,23 +504,133 @@ func Match(models []Model, provider, pattern string) (Model, bool, string) {
 			}
 		}
 	}
-	for _, m := range candidates {
-		if m.ID == pattern || strings.EqualFold(m.Name, pattern) {
-			return m, true, ""
+
+	// 1. Exact reference match (mirrors TS findExactModelReferenceMatch):
+	// prefer an exact id/name match, but reject a bare id that is ambiguous
+	// across multiple providers rather than silently picking the first.
+	if model, decided, ok := findExactModelReferenceMatch(pattern, provider, candidates); decided {
+		if ok {
+			return model, true, ""
 		}
+		return Model{}, false, fmt.Sprintf("No model found matching %q", pattern)
 	}
+
+	// 2. Glob match (Go-specific): among glob matches, prefer the highest-sorting
+	// alias, otherwise the latest dated version (mirrors tryMatchModel's tie-break).
+	var globMatches []Model
 	for _, m := range candidates {
 		if aiutils.GlobToRegexp(strings.ToLower(pattern)).MatchString(strings.ToLower(m.ID)) {
-			return m, true, ""
+			globMatches = append(globMatches, m)
 		}
 	}
+	if len(globMatches) > 0 {
+		return preferAliasOrLatestModel(globMatches), true, ""
+	}
+
+	// 3. Partial substring match (mirrors tryMatchModel partial phase): prefer
+	// alias over dated version, choosing the highest-sorting alias or latest dated.
 	patternLower := strings.ToLower(pattern)
+	var partialMatches []Model
 	for _, m := range candidates {
-		if strings.Contains(strings.ToLower(m.ID), patternLower) || strings.Contains(strings.ToLower(m.Name), patternLower) {
-			return m, true, ""
+		if strings.Contains(strings.ToLower(m.ID), patternLower) || (m.Name != "" && strings.Contains(strings.ToLower(m.Name), patternLower)) {
+			partialMatches = append(partialMatches, m)
 		}
 	}
+	if len(partialMatches) > 0 {
+		return preferAliasOrLatestModel(partialMatches), true, ""
+	}
+
 	return Model{}, false, fmt.Sprintf("No model found matching %q", pattern)
+}
+
+// modelIDIsAlias reports whether a model id looks like an alias (no -YYYYMMDD
+// date suffix and not the -latest pointer is treated as dated), mirroring TS
+// isAlias in model-resolver.ts.
+func modelIDIsAlias(id string) bool {
+	if strings.HasSuffix(id, "-latest") {
+		return true
+	}
+	return !datedModelIDPattern.MatchString(id)
+}
+
+// preferAliasOrLatestModel picks the best candidate among partial/glob matches:
+// prefer aliases (sorted by id descending, mirroring localeCompare), otherwise
+// pick the latest dated version (sorted by id descending). Mirrors the
+// alias-vs-dated tie-break in TS tryMatchModel.
+func preferAliasOrLatestModel(matches []Model) Model {
+	var aliases, dated []Model
+	for _, m := range matches {
+		if modelIDIsAlias(m.ID) {
+			aliases = append(aliases, m)
+		} else {
+			dated = append(dated, m)
+		}
+	}
+	pool := dated
+	if len(aliases) > 0 {
+		pool = aliases
+	}
+	best := pool[0]
+	for _, m := range pool[1:] {
+		if m.ID > best.ID {
+			best = m
+		}
+	}
+	return best
+}
+
+// findExactModelReferenceMatch mirrors TS findExactModelReferenceMatch. The
+// returned decided flag reports whether the exact-match phase reached a verdict:
+// when decided is true and ok is false, the reference was ambiguous and the
+// caller must NOT fall through to fuzzy matching (TS returns undefined).
+func findExactModelReferenceMatch(reference, provider string, candidates []Model) (model Model, decided bool, ok bool) {
+	trimmed := strings.TrimSpace(reference)
+	if trimmed == "" {
+		return Model{}, false, false
+	}
+	normalized := strings.ToLower(trimmed)
+
+	// Canonical provider/id match against the full (unfiltered-by-provider) form.
+	var canonical []Model
+	for _, m := range candidates {
+		if strings.ToLower(m.Provider+"/"+m.ID) == normalized {
+			canonical = append(canonical, m)
+		}
+	}
+	if len(canonical) == 1 {
+		return canonical[0], true, true
+	}
+	if len(canonical) > 1 {
+		return Model{}, true, false
+	}
+
+	// Bare id match: reject when the same id resolves across multiple providers.
+	var idMatches []Model
+	for _, m := range candidates {
+		if strings.ToLower(m.ID) == normalized {
+			idMatches = append(idMatches, m)
+		}
+	}
+	if len(idMatches) == 1 {
+		return idMatches[0], true, true
+	}
+	if len(idMatches) > 1 {
+		return Model{}, true, false
+	}
+
+	// Name match (Go-specific convenience retained from prior behaviour): an
+	// exact, unambiguous display-name match resolves directly.
+	var nameMatches []Model
+	for _, m := range candidates {
+		if m.Name != "" && strings.EqualFold(m.Name, trimmed) {
+			nameMatches = append(nameMatches, m)
+		}
+	}
+	if len(nameMatches) == 1 {
+		return nameMatches[0], true, true
+	}
+
+	return Model{}, false, false
 }
 
 func List(models []Model, search string) []Model {
@@ -548,9 +663,6 @@ func SupportsInput(model Model, input string) bool {
 }
 
 func ClampThinking(model Model, level ThinkingLevel) ThinkingLevel {
-	if level == "" {
-		return ThinkingMedium
-	}
 	available := GetSupportedThinkingLevels(model)
 	for _, l := range available {
 		if l == level {

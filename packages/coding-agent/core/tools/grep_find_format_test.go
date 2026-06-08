@@ -60,11 +60,42 @@ func TestGrepLongLineTruncationSuffix(t *testing.T) {
 	res := GrepTool{CWD: root}.Execute(context.Background(), raw(map[string]any{"pattern": "NEEDLE"}), nil)
 	got := toolText(res.Content)
 
-	wantBody := "a.txt:1: " + string([]rune(long)[:GrepMaxLineLength]) + "... [truncated]"
+	wantBody := "a.txt:1: " + utf16Slice(utf16Units(long), 0, GrepMaxLineLength) + "... [truncated]"
 	wantNotice := "[Some lines truncated to 500 chars. Use read tool to see full lines]"
 	want := wantBody + "\n\n" + wantNotice
 	if got != want {
 		t.Fatalf("long-line truncation mismatch\n got: %q\nwant: %q", got, want)
+	}
+}
+
+// TestGrepTruncatesByUTF16CodeUnits locks the truncate.ts semantics: the cut
+// point is measured in UTF-16 code units, so a non-BMP character (2 units) near
+// the boundary is dropped whole rather than counted as a single rune.
+func TestGrepTruncatesByUTF16CodeUnits(t *testing.T) {
+	root := t.TempDir()
+	// "NEEDLE" is 6 units; then enough emoji (each 2 UTF-16 units, 1 rune) so the
+	// line exceeds GrepMaxLineLength in UTF-16 units. A line built from emoji
+	// truncates at a different rune index than UTF-16 index.
+	body := "NEEDLE" + strings.Repeat("\U0001F600", GrepMaxLineLength)
+	writeFile(t, root, "a.txt", body+"\n")
+	res := GrepTool{CWD: root}.Execute(context.Background(), raw(map[string]any{"pattern": "NEEDLE"}), nil)
+	got := toolText(res.Content)
+
+	units := utf16Units(body)
+	if len(units) <= GrepMaxLineLength {
+		t.Fatalf("test setup: body must exceed %d UTF-16 units, got %d", GrepMaxLineLength, len(units))
+	}
+	wantBody := "a.txt:1: " + utf16Slice(units, 0, GrepMaxLineLength) + "... [truncated]"
+	wantNotice := "[Some lines truncated to 500 chars. Use read tool to see full lines]"
+	want := wantBody + "\n\n" + wantNotice
+	if got != want {
+		t.Fatalf("UTF-16 truncation mismatch\n got: %q\nwant: %q", got, want)
+	}
+	// Sanity: a rune-count truncation (the old, wrong behavior) would slice the
+	// rune slice at GrepMaxLineLength, producing a different body.
+	runeBody := "a.txt:1: " + string([]rune(body)[:GrepMaxLineLength]) + "... [truncated]"
+	if want == runeBody+"\n\n"+wantNotice {
+		t.Fatalf("test does not distinguish rune vs UTF-16 semantics")
 	}
 }
 

@@ -143,7 +143,13 @@ func (s *Session) MoveTo(ctx context.Context, entryID *string, moves ...*BranchM
 	if err := s.storage.SetLeafID(ctx, entryID); err != nil {
 		return "", err
 	}
-	if len(moves) > 0 && moves[0] != nil && moves[0].Summary != "" {
+	// Append a branch_summary entry whenever a summary object is supplied, even
+	// when its text is "". TS gates only on object presence
+	// (session.ts:254 `if (!summary) return undefined;`) and then always appends
+	// with summary.summary, so a present summary object with an empty string
+	// still produces a branch_summary entry. Do NOT additionally gate on
+	// Summary != "".
+	if len(moves) > 0 && moves[0] != nil {
 		fromID := ""
 		if entryID != nil {
 			fromID = *entryID

@@ -295,7 +295,8 @@ func GetOAuthAPIKey(ctx context.Context, providerID OAuthProviderID, credentials
 	if creds.Expired(time.Now()) {
 		refreshed, err := provider.RefreshToken(ctx, creds)
 		if err != nil {
-			return nil, fmt.Errorf("failed to refresh OAuth token for %s: %w", providerID, err)
+			// Mirror TS: capital F, no wrapped underlying cause.
+			return nil, fmt.Errorf("Failed to refresh OAuth token for %s", providerID) //nolint:staticcheck // ST1005: TS-faithful message (oauth/index.ts:150-155, capital F, no wrapped cause)
 		}
 		creds = refreshed
 	}
