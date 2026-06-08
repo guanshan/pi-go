@@ -457,8 +457,8 @@ Now wired (previously ported-but-dead helpers):
   reports unknown/invalid bindings as startup diagnostics, and wires effective
   bindings into the real Bubble TUI for interrupt/clear/exit/suspend,
   model/thinking cycling, model select, follow-up, dequeue, thinking visibility,
-  external editor, and placeholder status paths for tool expansion and clipboard
-  image paste.
+  external editor, tool expansion (`ctrl+o` toggles the transcript collapse/expand),
+  and clipboard image paste (`ctrl+v` reads the OS clipboard into an image block).
 - Rich transcript slice: the live Bubble TUI now tracks tool execution metadata
   (tool name, call id, args, partial/error state) and bash command metadata, then
   renders tool/bash output with TS-style 20-line collapsed previews, `ctrl+o`
@@ -669,8 +669,13 @@ Intentional behavioral divergences (safer or platform-specific; documented rathe
   is resolved through the same managed GitHub-release download path as TS
   `ensureTool("fd")` (including the macOS x64 `10.3.0` pin); download/offline
   failures keep the Go `walkFiltered` fallback but include an `engineFallback`
-  detail and visible notice. Covered by `TestFindToolUsesFdWhenAvailable` and
-  `TestManagedToolDownloadsIntoCache`.
+  detail and visible notice. A path-containing glob (e.g. `src/**/*.ts`) is
+  rewritten to `**/src/**/*.ts` under `fd --full-path` so it matches against the
+  candidate path exactly like TS `find.ts` (without this prefix `fd --full-path`
+  anchors the glob and silently misses matches); `fd` also runs with
+  `--max-results` and (like grep) always excludes `.git` via `--exclude .git`.
+  Covered by `TestFindToolUsesFdWhenAvailable`, `TestFindToolFdEffectivePattern`,
+  and `TestManagedToolDownloadsIntoCache`.
 
 ## Accepted Intentional Divergences
 

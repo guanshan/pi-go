@@ -889,8 +889,10 @@ func readSessionInfo(path string) (SessionInfo, error) {
 					}
 					if preview == "" && role == "user" {
 						preview = ai.MessageText(entry.Message)
-						if len(preview) > 120 {
-							preview = preview[:120] + "..."
+						// Truncate by rune, not byte, so a non-ASCII first
+						// message never yields invalid UTF-8 in the preview.
+						if runes := []rune(preview); len(runes) > 120 {
+							preview = string(runes[:120]) + "..."
 						}
 					}
 				}

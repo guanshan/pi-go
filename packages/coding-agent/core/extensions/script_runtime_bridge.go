@@ -1017,6 +1017,32 @@ function extensionContext(payload = {}, snapshot = {}) {
 				});
 		},
 		getSystemPrompt() { return String(systemPrompt ?? ""); },
+		// Command-context methods (TS ExtensionCommandContext). Serializable options
+		// only — the withSession/setup callbacks cannot cross the process boundary,
+		// so they are dropped. navigateTree/reload/waitForIdle are host-backed;
+		// newSession/fork/switchSession/getSystemPromptOptions reject with a clear
+		// "not supported by this host" message (see EXTENSIONS_DESIGN.md).
+		getSystemPromptOptions() { return sendContextAction("getSystemPromptOptions"); },
+		waitForIdle() { return sendContextAction("waitForIdle"); },
+		newSession(options = {}) {
+			return sendContextAction("newSession", { parentSession: options?.parentSession ?? "" });
+		},
+		fork(entryId, options = {}) {
+			return sendContextAction("fork", { entryId: String(entryId ?? ""), position: options?.position ?? "at" });
+		},
+		navigateTree(targetId, options = {}) {
+			return sendContextAction("navigateTree", {
+				targetId: String(targetId ?? ""),
+				summarize: options?.summarize === true,
+				customInstructions: options?.customInstructions ?? "",
+				replaceInstructions: options?.replaceInstructions === true,
+				label: options?.label ?? "",
+			});
+		},
+		switchSession(sessionPath, options = {}) {
+			return sendContextAction("switchSession", { sessionPath: String(sessionPath ?? "") });
+		},
+		reload() { return sendContextAction("reload"); },
 		sessionManager: {
 			getEntries() { return Array.isArray(entries) ? entries : []; },
 			getBranch(fromId) { return branchFromEntries(entries, fromId, branch); },

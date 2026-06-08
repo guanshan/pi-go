@@ -567,6 +567,31 @@ func (s *SettingsManager) SetDefaultThinkingLevel(level ai.ThinkingLevel) error 
 	return s.SaveGlobal()
 }
 
+// SetTheme persists the selected theme name as the global default so the next
+// launch remembers it. Mirrors TS rpc-mode/settings setTheme persistence.
+func (s *SettingsManager) SetTheme(name string) error {
+	s.Global.Theme = name
+	return s.SaveGlobal()
+}
+
+// SetShowImages persists the terminal inline-image preference.
+func (s *SettingsManager) SetShowImages(value bool) error {
+	s.Global.Terminal.ShowImages = &value
+	return s.SaveGlobal()
+}
+
+// SetAutoCompactionEnabled persists the auto-compaction preference.
+func (s *SettingsManager) SetAutoCompactionEnabled(value bool) error {
+	s.Global.Compaction.Enabled = &value
+	return s.SaveGlobal()
+}
+
+// SetAutoRetryEnabled persists the auto-retry preference.
+func (s *SettingsManager) SetAutoRetryEnabled(value bool) error {
+	s.Global.Retry.Enabled = &value
+	return s.SaveGlobal()
+}
+
 func (s *SettingsManager) SessionDir() string {
 	if s.Project.SessionDir != "" {
 		return ExpandTilde(s.Project.SessionDir)

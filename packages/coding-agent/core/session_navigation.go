@@ -114,13 +114,19 @@ func (a *AgentSession) NavigateTree(ctx context.Context, targetID string, opts N
 	return result, nil
 }
 
+// GetUserMessagesForForking returns every user message in the session that can
+// serve as a fork/branch point. It mirrors TS agent-session.ts
+// getUserMessagesForForking, which iterates the full entry list
+// (sessionManager.getEntries()) rather than only the current branch — so user
+// messages on abandoned/sibling branches are forkable too. Both the interactive
+// /fork overlay and the RPC get_fork_messages command read through this.
 func (a *AgentSession) GetUserMessagesForForking() []ForkableUserMessage {
 	if a == nil || a.Session == nil {
 		return nil
 	}
-	branch := a.Session.Branch()
-	result := make([]ForkableUserMessage, 0, len(branch))
-	for _, entry := range branch {
+	entries := a.Session.EntriesSnapshot()
+	result := make([]ForkableUserMessage, 0, len(entries))
+	for _, entry := range entries {
 		if entry.Type != "message" || entry.Message == nil || ai.MessageRole(entry.Message) != "user" || entry.ID == "" {
 			continue
 		}

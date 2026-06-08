@@ -39,7 +39,7 @@ select_list.go      — scrolling list with wrap, fuzzy-prefix filter, two-colum
 settings_list.go    — toggle list with theme/scroll/description column
 loader.go           — goroutine-driven spinner
 cancellable_loader.go — Loader + Esc/Ctrl+C
-image.go            — placeholder image component
+image.go            — inline image component (ported; not yet wired into the coding-agent transcript)
 markdown.go         — goldmark-driven ANSI markdown renderer (GFM: table, strike, autolink, tasklist)
 
 terminal.go         — ProcessTerminal: stateless writer + cursor / progress / title helpers

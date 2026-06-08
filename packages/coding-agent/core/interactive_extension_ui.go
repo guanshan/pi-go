@@ -561,6 +561,72 @@ func (m *interactiveModel) oauthSlashPrompter(ctx context.Context) slashPrompter
 	}
 }
 
+// oauthSlashSelectPrompter routes an OAuth login-method choice through the
+// navigable select overlay (the same overlay /model and extension ctx.ui.select
+// use) instead of a free-text prompt. It returns the chosen option id; ok=false
+// on cancel. Like oauthSlashPrompter it only ever runs from the slash tea.Cmd
+// goroutine, so blocking on the overlay channel never stalls the Update loop.
+func (m *interactiveModel) oauthSlashSelectPrompter(ctx context.Context) slashSelectPrompter {
+	return func(prompt ai.OAuthSelectPrompt) (string, bool, error) {
+		if m == nil || m.post == nil {
+			return "", false, fmt.Errorf("interactive prompt is not available")
+		}
+		if ctx == nil {
+			ctx = context.Background()
+		}
+		if len(prompt.Options) == 0 {
+			return "", false, nil
+		}
+		choices := make([]extensionUIChoice, 0, len(prompt.Options))
+		for _, option := range prompt.Options {
+			raw, err := json.Marshal(option.ID)
+			if err != nil {
+				return "", false, err
+			}
+			label := option.Label
+			if label == "" {
+				label = option.ID
+			}
+			choices = append(choices, extensionUIChoice{Raw: raw, Label: label})
+		}
+		req := &interactiveExtensionUIRequest{
+			Method: "select",
+			Prompt: extensionUIPrompt{
+				Message: firstNonEmpty(prompt.Message, "Select login method"),
+				Choices: choices,
+			},
+			Response: make(chan extensionUIResult, 1),
+		}
+		m.post(interactiveExtensionUIRequestMsg{Request: req})
+		var raw json.RawMessage
+		select {
+		case result := <-req.Response:
+			if result.Err != nil {
+				return "", false, result.Err
+			}
+			raw = result.Result
+		case <-ctx.Done():
+			m.post(interactiveExtensionUICancelMsg{Request: req})
+			return "", false, ctx.Err()
+		case <-m.ctx.Done():
+			m.post(interactiveExtensionUICancelMsg{Request: req})
+			return "", false, m.ctx.Err()
+		}
+		if len(raw) == 0 || string(raw) == "null" {
+			return "", false, nil
+		}
+		var id string
+		if err := json.Unmarshal(raw, &id); err != nil {
+			return "", false, err
+		}
+		id = strings.TrimSpace(id)
+		if id == "" {
+			return "", false, nil
+		}
+		return id, true, nil
+	}
+}
+
 func (r *interactiveExtensionUIRequest) respond(result json.RawMessage, err error) {
 	if r == nil || r.Response == nil {
 		return

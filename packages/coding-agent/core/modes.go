@@ -200,7 +200,7 @@ func runLineInteractiveMode(ctx context.Context, runtime *AgentSessionRuntime, i
 				}
 				return value, nil
 			}
-			if done, err := handleSlashWithPrompt(ctx, runtime, line, prompt, stdout, stderr); err != nil {
+			if done, err := handleSlashWithPrompt(ctx, runtime, line, prompt, nil, stdout, stderr); err != nil {
 				fmt.Fprintln(stderr, "Error:", err)
 			} else if done {
 				return nil
@@ -527,12 +527,17 @@ func interactivePrompt(ctx context.Context, agent *AgentSession, message string,
 }
 
 func handleSlash(ctx context.Context, target any, line string, stdout, stderr io.Writer) (bool, error) {
-	return handleSlashWithPrompt(ctx, target, line, nil, stdout, stderr)
+	return handleSlashWithPrompt(ctx, target, line, nil, nil, stdout, stderr)
 }
 
 type slashPrompter func(ai.OAuthPrompt) (string, error)
 
-func handleSlashWithPrompt(ctx context.Context, target any, line string, prompter slashPrompter, stdout, stderr io.Writer) (bool, error) {
+// slashSelectPrompter resolves an OAuth login-method choice through a navigable
+// overlay (interactive mode). It returns the chosen option id and ok=false on
+// cancel. When nil (line/print/rpc), /login falls back to a text prompt.
+type slashSelectPrompter func(ai.OAuthSelectPrompt) (string, bool, error)
+
+func handleSlashWithPrompt(ctx context.Context, target any, line string, prompter slashPrompter, selectPrompter slashSelectPrompter, stdout, stderr io.Writer) (bool, error) {
 	runtime, agent, err := slashTarget(target)
 	if err != nil {
 		return false, err
@@ -596,6 +601,31 @@ func handleSlashWithPrompt(ctx context.Context, target any, line string, prompte
 			}
 			fmt.Fprintf(stdout, "Thinking: %s\n", agent.CurrentThinkingLevel())
 		}
+	case "theme":
+		// Interactive mode intercepts /theme (bare opens the selector, `/theme
+		// <name>` applies live); this text path serves line/rpc mode and persists
+		// the choice as the global default.
+		name := strings.TrimSpace(arg)
+		if name == "" {
+			fmt.Fprintln(stdout, "Current theme:", agent.Theme.Name)
+			for _, theme := range listResolvedThemes(agent.Resources) {
+				fmt.Fprintln(stdout, "-", theme.Name)
+			}
+			break
+		}
+		theme, found := resolveThemeByName(name, agent.Resources)
+		if !found {
+			return false, fmt.Errorf("theme not found: %s", name)
+		}
+		if agent.Settings != nil {
+			if err := agent.Settings.SetTheme(name); err != nil {
+				return false, err
+			}
+		}
+		agent.mu.Lock()
+		agent.Theme = theme
+		agent.mu.Unlock()
+		fmt.Fprintln(stdout, "Theme set to:", theme.Name)
 	case "scoped-models":
 		for _, model := range agent.Registry.AvailableConfigured() {
 			fmt.Fprintf(stdout, "%s/%s\n", model.Provider, model.ID)
@@ -780,6 +810,11 @@ func handleSlashWithPrompt(ctx context.Context, target any, line string, prompte
 						fmt.Fprintln(stdout, message)
 					},
 					OnSelect: func(prompt ai.OAuthSelectPrompt) (string, bool, error) {
+						// Interactive mode supplies a navigable select overlay; line/
+						// print/rpc fall back to printing the options + reading the id.
+						if selectPrompter != nil {
+							return selectPrompter(prompt)
+						}
 						if prompt.Message != "" {
 							fmt.Fprintln(stdout, prompt.Message)
 						}

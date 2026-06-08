@@ -175,6 +175,8 @@ type interactiveModel struct {
 	sessionUnsubscribe func()
 	commandCancel      context.CancelFunc
 	modelSelector      *modelSelectorOverlay
+	commandSelector    *commandSelectorOverlay
+	settingsEditor     *settingsEditorOverlay
 	extensionUI        *interactiveExtensionUIRequest
 	extensionUIQueue   []*interactiveExtensionUIRequest
 	history            []string
@@ -239,6 +241,7 @@ var interactiveSlashCommands = []string{
 	"logout",
 	"model",
 	"thinking",
+	"theme",
 	"scoped-models",
 	"settings",
 	"resume",
@@ -268,6 +271,7 @@ var interactiveSlashCommandDescriptions = map[string]string{
 	"logout":        "Remove provider authentication",
 	"model":         "Select model (opens selector UI)",
 	"thinking":      "Cycle thinking level",
+	"theme":         "Select theme (opens selector UI)",
 	"scoped-models": "Enable/disable models for Ctrl+P cycling",
 	"settings":      "Open settings menu",
 	"resume":        "Resume a different session",
@@ -425,6 +429,16 @@ func (m *interactiveModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			cmd = m.handleModelSelectorKey(msg.String())
 			m.refreshViewport()
 			return m, cmd
+		}
+		if m.commandSelector != nil {
+			cmd = m.handleCommandSelectorKey(msg.String())
+			m.refreshViewport()
+			return m, cmd
+		}
+		if m.settingsEditor != nil {
+			m.handleSettingsEditorKey(msg.String())
+			m.refreshViewport()
+			return m, nil
 		}
 		if m.extensionUI != nil {
 			cmd = m.handleExtensionUIKey(msg)
@@ -653,6 +667,27 @@ func (m *interactiveModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.refreshViewport()
 		return m, nil
+	case themeApplyMsg:
+		// Applied here (not in the tea.Cmd) because agent.Theme + m.styles are
+		// read during View on this goroutine; the cmd only did the off-goroutine
+		// resolve + persist.
+		if msg.err != nil {
+			m.appendMessage(interactiveRoleError, msg.err.Error())
+		} else {
+			m.applyTheme(msg.theme)
+		}
+		m.refreshViewport()
+		return m, nil
+	case commandActionDoneMsg:
+		// /resume, /tree, /fork results. The session-replaced rebind + session
+		// events drive the transcript refresh; surface status/errors here.
+		if msg.err != nil {
+			m.appendMessage(interactiveRoleError, msg.err.Error())
+		} else if msg.status != "" {
+			m.setStatus(msg.status)
+		}
+		m.refreshViewport()
+		return m, nil
 	case externalEditorDoneMsg:
 		if msg.Err != nil {
 			m.appendMessage(interactiveRoleError, msg.Err.Error())
@@ -750,6 +785,10 @@ func (m *interactiveModel) View() tea.View {
 		// region (and suggestions), mirroring TS showModelSelector swapping the
 		// editor container for the selector component. Header/body/footer stay.
 		parts = append(parts, m.modelSelector.Render(width)...)
+	} else if m.commandSelector != nil {
+		parts = append(parts, m.commandSelector.Render(width)...)
+	} else if m.settingsEditor != nil {
+		parts = append(parts, m.settingsEditor.Render(width)...)
 	} else if m.extensionUI != nil {
 		parts = append(parts, m.renderExtensionUI(width)...)
 	} else {
@@ -842,6 +881,34 @@ func (m *interactiveModel) submitInputWithBehavior(behavior StreamingBehavior) t
 		// argument) still routes to the slash handler -> SetModel below.
 		m.openModelSelector()
 		return nil
+	}
+	if !m.busy && strings.HasPrefix(text, "/theme ") {
+		// `/theme <name>` applies + persists the named theme live (no selector).
+		if name := strings.TrimSpace(strings.TrimPrefix(text, "/theme ")); name != "" {
+			return m.applyThemeSelection(name)
+		}
+	}
+	if !m.busy {
+		// Bare slash commands open their navigable overlay (mirroring TS
+		// interactive selectors); the same command WITH an argument still routes
+		// to the text slash handler below (e.g. `/fork <id>`).
+		switch text {
+		case "/theme":
+			m.openThemeSelector()
+			return nil
+		case "/settings":
+			m.openSettingsEditor()
+			return nil
+		case "/resume":
+			m.openResumeSelector()
+			return nil
+		case "/tree":
+			m.openTreeSelector()
+			return nil
+		case "/fork":
+			m.openForkSelector()
+			return nil
+		}
 	}
 	if m.busy {
 		return m.queueBusyInput(text, displayText, images, behavior)
@@ -954,13 +1021,15 @@ func (m *interactiveModel) runSlashCommand(ctx context.Context, line string) tea
 	// non-blocking. The prompter is only ever invoked from this tea.Cmd
 	// goroutine, so blocking on the overlay channel never stalls the Update loop.
 	var prompter slashPrompter
+	var selectPrompter slashSelectPrompter
 	if isLoginCommand(line) {
 		prompter = m.oauthSlashPrompter(ctx)
+		selectPrompter = m.oauthSlashSelectPrompter(ctx)
 	}
 	return func() tea.Msg {
 		var stdout bytes.Buffer
 		var stderr bytes.Buffer
-		done, err := handleSlashWithPrompt(ctx, m.runtime, line, prompter, &stdout, &stderr)
+		done, err := handleSlashWithPrompt(ctx, m.runtime, line, prompter, selectPrompter, &stdout, &stderr)
 		return interactiveCommandDoneMsg{
 			Stdout: stdout.String(),
 			Stderr: stderr.String(),
@@ -1113,6 +1182,10 @@ func (m *interactiveModel) refreshViewport() {
 	widgetHeight := 0
 	if m.modelSelector != nil {
 		controlHeight = len(m.modelSelector.Render(width))
+	} else if m.commandSelector != nil {
+		controlHeight = len(m.commandSelector.Render(width))
+	} else if m.settingsEditor != nil {
+		controlHeight = len(m.settingsEditor.Render(width))
 	} else if m.extensionUI != nil {
 		controlHeight = len(m.renderExtensionUI(width))
 	} else {
@@ -1239,15 +1312,15 @@ func (m *interactiveModel) handleEscape() tea.Cmd {
 		}
 		switch agent.Settings.DoubleEscapeAction() {
 		case "tree":
-			m.appendMessage(interactiveRoleUser, "/tree")
-			m.busy = true
-			m.busyKind = interactiveBusyCommand
-			return m.runSlashCommand(m.beginCommand(), "/tree")
+			// Open the navigable overlay (same as bare /tree), not the text
+			// slash path — bare "/tree" only prints a read-only tree and bare
+			// "/fork" is a no-op usage line, so the text path made double-escape
+			// fork do nothing.
+			m.openTreeSelector()
+			return nil
 		case "fork":
-			m.appendMessage(interactiveRoleUser, "/fork")
-			m.busy = true
-			m.busyKind = interactiveBusyCommand
-			return m.runSlashCommand(m.beginCommand(), "/fork")
+			m.openForkSelector()
+			return nil
 		}
 		return nil
 	}

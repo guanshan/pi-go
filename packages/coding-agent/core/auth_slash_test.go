@@ -3,12 +3,65 @@ package core
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/guanshan/pi-go/packages/ai"
 )
+
+func TestSlashLoginOAuthSelectUsesSelectPrompter(t *testing.T) {
+	var selectedByProvider string
+	ai.RegisterOAuthProvider(ai.OAuthProvider{
+		ProviderID:   "test-oauth-select",
+		ProviderName: "Test OAuth Select",
+		LoginFunc: func(callbacks ai.OAuthLoginCallbacks) (ai.OAuthCredentials, error) {
+			id, ok, err := callbacks.OnSelect(ai.OAuthSelectPrompt{
+				Message: "Select login method",
+				Options: []ai.OAuthSelectOption{
+					{ID: "max", Label: "Claude Pro/Max"},
+					{ID: "console", Label: "API Console"},
+				},
+			})
+			if err != nil {
+				return ai.OAuthCredentials{}, err
+			}
+			if !ok {
+				return ai.OAuthCredentials{}, fmt.Errorf("cancelled")
+			}
+			selectedByProvider = id
+			return ai.OAuthCredentials{Access: "oauth-" + id, Expires: time.Now().Add(time.Hour).UnixMilli()}, nil
+		},
+	})
+	defer ai.UnregisterOAuthProvider("test-oauth-select")
+
+	agent := newAuthSlashTestAgent(t)
+	var stdout, stderr bytes.Buffer
+	textCalled := false
+	textPrompter := func(ai.OAuthPrompt) (string, error) {
+		textCalled = true
+		return "", nil
+	}
+	selectPrompter := func(prompt ai.OAuthSelectPrompt) (string, bool, error) {
+		if len(prompt.Options) != 2 {
+			t.Fatalf("select prompt options=%d, want 2", len(prompt.Options))
+		}
+		return "console", true, nil
+	}
+	if _, err := handleSlashWithPrompt(context.Background(), agent, "/login test-oauth-select --oauth", textPrompter, selectPrompter, &stdout, &stderr); err != nil {
+		t.Fatal(err)
+	}
+	if selectedByProvider != "console" {
+		t.Fatalf("provider received id=%q, want console", selectedByProvider)
+	}
+	if textCalled {
+		t.Fatal("text prompter must not be used when a select prompter is provided")
+	}
+	if got := agent.Registry.Auth.APIKey(ai.Model{Provider: "test-oauth-select"}); got != "oauth-console" {
+		t.Fatalf("saved access=%q, want oauth-console", got)
+	}
+}
 
 func TestSlashLoginListsProvidersAndSavesAPIKey(t *testing.T) {
 	agent := newAuthSlashTestAgent(t)
@@ -91,7 +144,7 @@ func TestSlashLoginOAuthProviderSavesCredentials(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	if _, err := handleSlashWithPrompt(context.Background(), agent, "/login test-oauth --oauth", func(ai.OAuthPrompt) (string, error) {
 		return "", nil
-	}, &stdout, &stderr); err != nil {
+	}, nil, &stdout, &stderr); err != nil {
 		t.Fatal(err)
 	}
 	if got := agent.Registry.Auth.APIKey(ai.Model{Provider: "test-oauth"}); got != "oauth-access" {

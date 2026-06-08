@@ -59,6 +59,12 @@ type MarkdownTheme struct {
 	Strikethrough   MarkdownStyleFunc
 	Underline       MarkdownStyleFunc
 	CodeBlockIndent string
+	// SyntaxHighlight, when true, tokenizes + colorizes fenced code blocks via
+	// chroma instead of applying the uniform CodeBlock style.
+	SyntaxHighlight bool
+	// SyntaxStyle is the chroma style name (e.g. "github-dark"); empty selects a
+	// sensible default.
+	SyntaxStyle string
 }
 
 // MarkdownOptions tweaks rendering specifics.
@@ -296,7 +302,25 @@ func (r *mdRenderer) renderParagraphFallback(n ast.Node, width int) []string {
 }
 
 func (r *mdRenderer) renderFencedCode(f *ast.FencedCodeBlock) []string {
-	lines := []string{r.theme.CodeBlockBorder("```" + string(f.Language(r.source)))}
+	lang := string(f.Language(r.source))
+	lines := []string{r.theme.CodeBlockBorder("```" + lang)}
+
+	if r.theme.SyntaxHighlight {
+		var body strings.Builder
+		for i := 0; i < f.Lines().Len(); i++ {
+			seg := f.Lines().At(i)
+			body.Write(seg.Value(r.source))
+		}
+		if hl, ok := highlightCodeBlock(body.String(), lang, r.theme.SyntaxStyle); ok {
+			for _, line := range hl {
+				// highlighted lines are already styled — do not re-wrap in CodeBlock.
+				lines = append(lines, r.theme.CodeBlockIndent+line)
+			}
+			lines = append(lines, r.theme.CodeBlockBorder("```"))
+			return lines
+		}
+	}
+
 	for i := 0; i < f.Lines().Len(); i++ {
 		seg := f.Lines().At(i)
 		// strip trailing newline only (preserve interior whitespace)

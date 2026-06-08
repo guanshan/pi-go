@@ -240,8 +240,86 @@ func (a *AgentSession) handleExtensionContextAction(ctx context.Context, action 
 		return a.extensionGetSessionName()
 	case "set_label", "setlabel":
 		return a.extensionSetLabel(action.Params)
+	case "navigate_tree", "navigatetree":
+		return a.extensionNavigateTree(ctx, action.Params)
+	case "reload":
+		if err := a.Reload(ctx); err != nil {
+			return nil, err
+		}
+		return json.RawMessage("null"), nil
+	case "wait_for_idle", "waitforidle":
+		if err := a.extensionWaitForIdle(ctx); err != nil {
+			return nil, err
+		}
+		return json.RawMessage("null"), nil
+	case "get_system_prompt_options", "getsystempromptoptions":
+		// The Go host exposes the resolved system-prompt text via getSystemPrompt(),
+		// but does not model TS BuildSystemPromptOptions (the construction options).
+		return nil, fmt.Errorf("ExtensionContext action %s is not supported by this host; use ctx.getSystemPrompt() for the resolved prompt text", action.Name)
+	case "new_session", "newsession", "fork", "switch_session", "switchsession":
+		// Session replacement (new/fork/switch) is driven by the mode loop's
+		// runtime-swap machinery and is not reachable from an extension action in
+		// this host build. navigateTree moves within the current session tree.
+		return nil, fmt.Errorf("ExtensionContext action %s is not supported by this host (session replacement from an extension is unavailable; use ctx.navigateTree to move within the current session)", action.Name)
 	default:
 		return nil, fmt.Errorf("ExtensionContext action %s is not supported by this host", action.Name)
+	}
+}
+
+// extensionNavigateTree routes the command-context navigateTree(targetId, options)
+// call to AgentSession.NavigateTree and reports the {cancelled} result TS returns.
+func (a *AgentSession) extensionNavigateTree(ctx context.Context, params json.RawMessage) (json.RawMessage, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	var p struct {
+		TargetID            string `json:"targetId"`
+		Summarize           bool   `json:"summarize"`
+		CustomInstructions  string `json:"customInstructions"`
+		ReplaceInstructions bool   `json:"replaceInstructions"`
+		Label               string `json:"label"`
+	}
+	if len(params) > 0 && string(params) != "null" {
+		if err := json.Unmarshal(params, &p); err != nil {
+			return nil, err
+		}
+	}
+	if strings.TrimSpace(p.TargetID) == "" {
+		return nil, fmt.Errorf("navigateTree requires a target entry id")
+	}
+	res, err := a.NavigateTree(ctx, p.TargetID, NavigateTreeOptions{
+		Summarize:           p.Summarize,
+		CustomInstructions:  p.CustomInstructions,
+		ReplaceInstructions: p.ReplaceInstructions,
+		Label:               p.Label,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return json.Marshal(map[string]any{"cancelled": res.Cancelled})
+}
+
+// extensionWaitForIdle blocks until the agent is no longer streaming/compacting,
+// mirroring the TS command-context waitForIdle(). It is ctx-aware so session
+// shutdown or request cancellation unblocks it.
+func (a *AgentSession) extensionWaitForIdle(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	ticker := time.NewTicker(25 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		a.mu.Lock()
+		idle := !a.streaming && a.activeAgent == nil && !a.compacting
+		a.mu.Unlock()
+		if idle {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+		}
 	}
 }
 

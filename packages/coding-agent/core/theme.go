@@ -126,6 +126,12 @@ func interactiveThemeStylesFor(theme ResolvedTheme) interactiveThemeStyles {
 	if border := token("borderMuted", "#4F5B66"); border != "" {
 		input = input.BorderForeground(lipgloss.Color(border))
 	}
+	// Pick a chroma syntax-highlight style matched to the theme's brightness so
+	// fenced code blocks are tokenized + colorized (mirrors TS hljs).
+	syntaxStyle := "github-dark"
+	if strings.Contains(strings.ToLower(theme.Name), "light") {
+		syntaxStyle = "github"
+	}
 	styles := interactiveThemeStyles{
 		Header:           style("dim", "#7C8A99"),
 		User:             style("userMessageText", "#70A5FF").Bold(true),
@@ -155,6 +161,8 @@ func interactiveThemeStylesFor(theme ResolvedTheme) interactiveThemeStyles {
 			QuoteBorder:     styleFn("mdQuoteBorder", "#808080"),
 			HR:              styleFn("mdHr", "#808080"),
 			ListBullet:      styleFn("mdListBullet", "#8abeb7"),
+			SyntaxHighlight: true,
+			SyntaxStyle:     syntaxStyle,
 		},
 	}
 	styles.SelectorTheme = tui.SelectListTheme{

@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/guanshan/pi-go/packages/ai"
@@ -131,11 +132,25 @@ func fdFallbackReason(diagnostic string) string {
 }
 
 func searchFd(ctx context.Context, fdPath, root, pattern string, limit int) ([]string, bool, error) {
-	args := []string{"--hidden", "--glob", "--color=never", "--no-require-git", "--exclude", ".git"}
+	args := []string{"--hidden", "--glob", "--color=never", "--no-require-git", "--exclude", ".git", "--max-results", strconv.Itoa(limit)}
+	// fd --glob matches against the basename unless --full-path is set; in
+	// --full-path mode it matches against the full candidate path, so a
+	// path-containing pattern like "src/**/*.ts" needs a leading "**/" to match
+	// anything (find.ts:236-246).
+	effectivePattern := pattern
 	if fdGlobNeedsFullPath(pattern) {
 		args = append(args, "--full-path")
+		// fd's --full-path globs always match against forward-slash paths
+		// regardless of OS, so normalize separators before prefixing — a Windows
+		// backslash pattern would otherwise become a mixed-separator glob that
+		// matches nothing.
+		slash := filepath.ToSlash(pattern)
+		effectivePattern = slash
+		if !strings.HasPrefix(slash, "/") && !strings.HasPrefix(slash, "**/") && slash != "**" {
+			effectivePattern = "**/" + slash
+		}
 	}
-	args = append(args, "--", pattern, ".")
+	args = append(args, "--", effectivePattern, ".")
 	cmd := exec.CommandContext(ctx, fdPath, args...)
 	cmd.Dir = root
 	var stderr bytes.Buffer
