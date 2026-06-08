@@ -1,0 +1,75 @@
+{
+  "include": [
+    "reasoning.encrypted_content"
+  ],
+  "input": [
+    {
+      "content": "system prompt",
+      "role": "developer"
+    },
+    {
+      "content": [
+        {
+          "text": "please reason",
+          "type": "input_text"
+        }
+      ],
+      "role": "user"
+    },
+    {
+      "encrypted_content": "ENC",
+      "id": "rs_abc",
+      "summary": [],
+      "type": "reasoning"
+    },
+    {
+      "arguments": "{\"query\":\"pi\"}",
+      "call_id": "call_x",
+      "id": "fc_x",
+      "name": "lookup",
+      "type": "function_call"
+    },
+    {
+      "call_id": "call_x",
+      "output": "result text",
+      "type": "function_call_output"
+    },
+    {
+      "content": [
+        {
+          "text": "continue",
+          "type": "input_text"
+        }
+      ],
+      "role": "user"
+    }
+  ],
+  "max_output_tokens": 64,
+  "model": "gpt-reasoning-golden",
+  "reasoning": {
+    "effort": "high",
+    "summary": "auto"
+  },
+  "store": false,
+  "stream": false,
+  "tools": [
+    {
+      "description": "Look up docs",
+      "name": "lookup",
+      "parameters": {
+        "additionalProperties": false,
+        "properties": {
+          "query": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "query"
+        ],
+        "type": "object"
+      },
+      "strict": false,
+      "type": "function"
+    }
+  ]
+}

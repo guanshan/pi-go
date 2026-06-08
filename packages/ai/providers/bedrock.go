@@ -366,8 +366,9 @@ func BedrockMessages(messages []BedrockMessage, modelID, modelName, cacheRetenti
 	result := []bedrocktypes.Message{}
 	for i := 0; i < len(messages); i++ {
 		msg := messages[i]
+		msg.Role = providerMessageRoleAsUser(msg.Role)
 		switch msg.Role {
-		case "user", "compactionSummary", "branchSummary", "custom":
+		case "user":
 			if content := BedrockUserContent(msg); len(content) > 0 {
 				result = append(result, bedrocktypes.Message{Role: bedrocktypes.ConversationRoleUser, Content: content})
 			}

@@ -7,12 +7,16 @@ import (
 )
 
 func (s *SessionManager) ResolveEntryID(query string) (string, error) {
+	return resolveEntryIDFromEntries(s.EntriesSnapshot(), query)
+}
+
+func resolveEntryIDFromEntries(entries []SessionEntry, query string) (string, error) {
 	query = strings.TrimSpace(query)
 	if query == "" {
 		return "", fmt.Errorf("entry id is required")
 	}
 	var matches []string
-	for _, entry := range s.Entries {
+	for _, entry := range entries {
 		if entry.ID == "" {
 			continue
 		}
@@ -34,11 +38,17 @@ func (s *SessionManager) ResolveEntryID(query string) (string, error) {
 }
 
 func (s *SessionManager) SetLeaf(entryID string) error {
+	if s == nil {
+		return fmt.Errorf("session is nil")
+	}
+	entryID = strings.TrimSpace(entryID)
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if entryID == "" {
 		s.CurrentID = nil
 		return nil
 	}
-	resolved, err := s.ResolveEntryID(entryID)
+	resolved, err := resolveEntryIDFromEntries(s.Entries, entryID)
 	if err != nil {
 		return err
 	}
@@ -47,12 +57,24 @@ func (s *SessionManager) SetLeaf(entryID string) error {
 }
 
 func (s *SessionManager) BranchFrom(entryID string) ([]SessionEntry, error) {
-	resolved, err := s.ResolveEntryID(entryID)
+	if s == nil {
+		return nil, fmt.Errorf("session is nil")
+	}
+	entries := s.EntriesSnapshot()
+	return branchFromEntries(entries, entryID)
+}
+
+func branchFromEntries(entries []SessionEntry, entryID string) ([]SessionEntry, error) {
+	resolved, err := resolveEntryIDFromEntries(entries, entryID)
 	if err != nil {
 		return nil, err
 	}
+	return branchFromResolvedEntries(entries, resolved)
+}
+
+func branchFromResolvedEntries(entries []SessionEntry, resolved string) ([]SessionEntry, error) {
 	byID := map[string]SessionEntry{}
-	for _, entry := range s.Entries {
+	for _, entry := range entries {
 		if entry.ID != "" {
 			byID[entry.ID] = entry
 		}
@@ -86,10 +108,10 @@ func CloneSessionBranch(source *SessionManager, leafID string, sessionDir string
 		return nil, fmt.Errorf("session is nil")
 	}
 	if leafID == "" {
-		if source.CurrentID == nil {
+		leafID = source.CurrentLeafID()
+		if leafID == "" {
 			return nil, fmt.Errorf("nothing to clone yet")
 		}
-		leafID = *source.CurrentID
 	}
 	branch, err := source.BranchFrom(leafID)
 	if err != nil {
@@ -114,18 +136,19 @@ func CloneSessionBranch(source *SessionManager, leafID string, sessionDir string
 }
 
 func FormatSessionTree(s *SessionManager) string {
-	if s == nil || len(s.Entries) == 0 {
+	_, entries, leaf := s.Snapshot()
+	if len(entries) == 0 {
 		return "No entries in session\n"
 	}
 	children := map[string][]SessionEntry{}
 	byID := map[string]SessionEntry{}
 	var roots []SessionEntry
-	for _, entry := range s.Entries {
+	for _, entry := range entries {
 		if entry.ID != "" {
 			byID[entry.ID] = entry
 		}
 	}
-	for _, entry := range s.Entries {
+	for _, entry := range entries {
 		if entry.ID == "" {
 			continue
 		}
@@ -149,8 +172,8 @@ func FormatSessionTree(s *SessionManager) string {
 	}
 
 	current := ""
-	if s.CurrentID != nil {
-		current = *s.CurrentID
+	if leaf != nil {
+		current = *leaf
 	}
 	var b strings.Builder
 	b.WriteString("Session tree:\n")

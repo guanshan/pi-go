@@ -1,0 +1,70 @@
+{
+  "max_completion_tokens": 64,
+  "messages": [
+    {
+      "content": "system prompt",
+      "role": "developer"
+    },
+    {
+      "content": "please look up",
+      "role": "user"
+    },
+    {
+      "content": "I will check.",
+      "role": "assistant",
+      "tool_calls": [
+        {
+          "function": {
+            "arguments": "{\"query\":\"pi\"}",
+            "name": "lookup"
+          },
+          "id": "call_1",
+          "type": "function"
+        }
+      ]
+    },
+    {
+      "content": "result text",
+      "role": "tool",
+      "tool_call_id": "call_1"
+    },
+    {
+      "content": "summarize",
+      "role": "user"
+    }
+  ],
+  "model": "gpt-golden",
+  "prompt_cache_key": "golden-session",
+  "prompt_cache_retention": "24h",
+  "reasoning_effort": "high",
+  "store": false,
+  "temperature": 0.2,
+  "tool_choice": {
+    "function": {
+      "name": "lookup"
+    },
+    "type": "function"
+  },
+  "tools": [
+    {
+      "function": {
+        "description": "Look up docs",
+        "name": "lookup",
+        "parameters": {
+          "additionalProperties": false,
+          "properties": {
+            "query": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "query"
+          ],
+          "type": "object"
+        },
+        "strict": false
+      },
+      "type": "function"
+    }
+  ]
+}

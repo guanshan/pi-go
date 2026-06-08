@@ -1,0 +1,26 @@
+{
+  "max_tokens": 64,
+  "messages": [
+    {
+      "content": [
+        {
+          "text": "please reason",
+          "type": "text"
+        }
+      ],
+      "role": "user"
+    }
+  ],
+  "model": "claude-budget-golden",
+  "system": [
+    {
+      "text": "system prompt",
+      "type": "text"
+    }
+  ],
+  "thinking": {
+    "budget_tokens": 12000,
+    "display": "summarized",
+    "type": "enabled"
+  }
+}

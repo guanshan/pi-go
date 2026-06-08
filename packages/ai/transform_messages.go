@@ -1,11 +1,51 @@
 package ai
 
-import "time"
+import (
+	"fmt"
+	"time"
+)
 
 const (
 	nonVisionUserImagePlaceholder = "(image omitted: model does not support images)"
 	nonVisionToolImagePlaceholder = "(tool image omitted: model does not support images)"
+	CompactionSummaryPrefix       = `The conversation history before this point was compacted into the following summary:
+
+<summary>
+`
+	CompactionSummarySuffix = `
+</summary>`
+	BranchSummaryPrefix = `The following is a summary of a branch that this conversation came back from:
+
+<summary>
+`
+	BranchSummarySuffix = `</summary>`
 )
+
+func CompactionSummaryText(summary string) string {
+	return CompactionSummaryPrefix + summary + CompactionSummarySuffix
+}
+
+func BranchSummaryText(summary string) string {
+	return BranchSummaryPrefix + summary + BranchSummarySuffix
+}
+
+func FormatBashExecutionText(command string, output string, exitCode *int, cancelled bool, truncated bool, fullOutputPath string) string {
+	text := fmt.Sprintf("Ran `%s`\n", command)
+	if output != "" {
+		text += "```\n" + output + "\n```"
+	} else {
+		text += "(no output)"
+	}
+	if cancelled {
+		text += "\n\n(command cancelled)"
+	} else if exitCode != nil && *exitCode != 0 {
+		text += fmt.Sprintf("\n\nCommand exited with code %d", *exitCode)
+	}
+	if truncated && fullOutputPath != "" {
+		text += "\n\n[Output truncated. Full output: " + fullOutputPath + "]"
+	}
+	return text
+}
 
 type toolCallIDNormalizer func(id string, model Model, source AssistantMessage) string
 
@@ -16,43 +56,13 @@ func transformMessages(messages []Message, model Model, normalizeToolCallID tool
 	toolCallIDMap := map[string]string{}
 	transformed := make([]Message, 0, len(messages))
 	for _, msg := range messages {
-		switch m := msg.(type) {
-		case UserMessage:
-			m.Content = downgradeUnsupportedImages(m.Content, model, nonVisionUserImagePlaceholder)
-			transformed = append(transformed, m)
-		case *UserMessage:
-			if m == nil {
-				continue
+		if normalized, handled := normalizeProviderCustomMessage(msg); handled {
+			for _, next := range normalized {
+				transformed = appendTransformedMessage(transformed, next, model, normalizeToolCallID, toolCallIDMap)
 			}
-			copy := *m
-			copy.Content = downgradeUnsupportedImages(copy.Content, model, nonVisionUserImagePlaceholder)
-			transformed = append(transformed, copy)
-		case ToolResultMessage:
-			if normalized := toolCallIDMap[m.ToolCallID]; normalized != "" {
-				m.ToolCallID = normalized
-			}
-			m.Content = downgradeUnsupportedImages(m.Content, model, nonVisionToolImagePlaceholder)
-			transformed = append(transformed, m)
-		case *ToolResultMessage:
-			if m == nil {
-				continue
-			}
-			copy := *m
-			if normalized := toolCallIDMap[copy.ToolCallID]; normalized != "" {
-				copy.ToolCallID = normalized
-			}
-			copy.Content = downgradeUnsupportedImages(copy.Content, model, nonVisionToolImagePlaceholder)
-			transformed = append(transformed, copy)
-		case AssistantMessage:
-			transformed = append(transformed, transformAssistantMessage(m, model, normalizeToolCallID, toolCallIDMap))
-		case *AssistantMessage:
-			if m == nil {
-				continue
-			}
-			transformed = append(transformed, transformAssistantMessage(*m, model, normalizeToolCallID, toolCallIDMap))
-		default:
-			transformed = append(transformed, msg)
+			continue
 		}
+		transformed = appendTransformedMessage(transformed, msg, model, normalizeToolCallID, toolCallIDMap)
 	}
 
 	result := make([]Message, 0, len(transformed))
@@ -98,6 +108,123 @@ func transformMessages(messages []Message, model Model, normalizeToolCallID tool
 	}
 	insertSyntheticToolResults()
 	return result
+}
+
+func appendTransformedMessage(transformed []Message, msg Message, model Model, normalizeToolCallID toolCallIDNormalizer, toolCallIDMap map[string]string) []Message {
+	switch m := msg.(type) {
+	case UserMessage:
+		m.Content = downgradeUnsupportedImages(m.Content, model, nonVisionUserImagePlaceholder)
+		return append(transformed, m)
+	case *UserMessage:
+		if m == nil {
+			return transformed
+		}
+		copy := *m
+		copy.Content = downgradeUnsupportedImages(copy.Content, model, nonVisionUserImagePlaceholder)
+		return append(transformed, copy)
+	case ToolResultMessage:
+		if normalized := toolCallIDMap[m.ToolCallID]; normalized != "" {
+			m.ToolCallID = normalized
+		}
+		m.Content = downgradeUnsupportedImages(m.Content, model, nonVisionToolImagePlaceholder)
+		return append(transformed, m)
+	case *ToolResultMessage:
+		if m == nil {
+			return transformed
+		}
+		copy := *m
+		if normalized := toolCallIDMap[copy.ToolCallID]; normalized != "" {
+			copy.ToolCallID = normalized
+		}
+		copy.Content = downgradeUnsupportedImages(copy.Content, model, nonVisionToolImagePlaceholder)
+		return append(transformed, copy)
+	case AssistantMessage:
+		return append(transformed, transformAssistantMessage(m, model, normalizeToolCallID, toolCallIDMap))
+	case *AssistantMessage:
+		if m == nil {
+			return transformed
+		}
+		return append(transformed, transformAssistantMessage(*m, model, normalizeToolCallID, toolCallIDMap))
+	default:
+		return append(transformed, msg)
+	}
+}
+
+// TransformMessagesForProvider normalizes session-only/custom message shapes
+// into provider-ready user/assistant/tool messages for providers that do not have
+// a provider-specific transform hook.
+func TransformMessagesForProvider(messages []Message, model Model) []Message {
+	return transformMessages(messages, model, nil)
+}
+
+func normalizeProviderCustomMessage(msg Message) ([]Message, bool) {
+	custom, ok := AsCustomMessage(msg)
+	if !ok {
+		return normalizeProviderExtendedMessage(msg)
+	}
+	switch custom.MessageRole() {
+	case "bashExecution":
+		if custom.ExcludeFromContext {
+			return nil, true
+		}
+		return []Message{UserMessage{Role: "user", Content: TextBlocks(FormatBashExecutionText(custom.Command, custom.Output, custom.ExitCode, custom.Cancelled, custom.Truncated, custom.FullOutputPath)), TimestampMs: custom.Timestamp()}}, true
+	case "custom":
+		if blocks, ok := CustomContentBlocks(custom.Content); ok && len(blocks) > 0 {
+			return []Message{UserMessage{Role: "user", Content: blocks, TimestampMs: custom.Timestamp()}}, true
+		}
+		return nil, true
+	case "branchSummary":
+		return []Message{UserMessage{Role: "user", Content: TextBlocks(BranchSummaryText(custom.Summary)), TimestampMs: custom.Timestamp()}}, true
+	case "compactionSummary":
+		return []Message{UserMessage{Role: "user", Content: TextBlocks(CompactionSummaryText(custom.Summary)), TimestampMs: custom.Timestamp()}}, true
+	default:
+		if blocks, ok := CustomContentBlocks(custom.Content); ok && len(blocks) > 0 {
+			return []Message{UserMessage{Role: "user", Content: blocks, TimestampMs: custom.Timestamp()}}, true
+		}
+		return nil, true
+	}
+}
+
+// ProviderContentMessage renders non-standard session messages as provider-ready blocks.
+type ProviderContentMessage interface {
+	ProviderContentBlocks() []ContentBlock
+}
+
+// NormalizeProviderContentMessage converts ProviderContentMessage to a user message.
+func NormalizeProviderContentMessage(msg Message) ([]Message, bool) {
+	providerMessage, ok := msg.(ProviderContentMessage)
+	if !ok {
+		return nil, false
+	}
+	switch MessageRole(msg) {
+	case "", "user", "assistant", "toolResult":
+		return nil, false
+	default:
+		blocks := providerMessage.ProviderContentBlocks()
+		if len(blocks) == 0 {
+			return nil, true
+		}
+		return []Message{UserMessage{Role: "user", Content: blocks, TimestampMs: MessageTimestamp(msg)}}, true
+	}
+}
+
+func normalizeProviderExtendedMessage(msg Message) ([]Message, bool) {
+	if converted, ok := NormalizeProviderContentMessage(msg); ok {
+		return converted, true
+	}
+	role := MessageRole(msg)
+	switch role {
+	case "", "user", "assistant", "toolResult":
+		return nil, false
+	}
+	blocks := []ContentBlock(nil)
+	if blockMessage, ok := msg.(interface{ ContentBlocks() []ContentBlock }); ok {
+		blocks = blockMessage.ContentBlocks()
+	}
+	if len(blocks) == 0 {
+		return nil, true
+	}
+	return []Message{UserMessage{Role: "user", Content: blocks, TimestampMs: MessageTimestamp(msg)}}, true
 }
 
 func transformAssistantMessage(message AssistantMessage, model Model, normalizeToolCallID toolCallIDNormalizer, toolCallIDMap map[string]string) AssistantMessage {

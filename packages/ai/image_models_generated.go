@@ -97,6 +97,17 @@ var generatedImageModels = []ImagesModel{
 	},
 	{
 		Provider: "openrouter",
+		ID:       "microsoft/mai-image-2.5",
+		Name:     "Microsoft: MAI-Image-2.5",
+		API:      "openrouter-images",
+		BaseURL:  "https://openrouter.ai/api/v1",
+		EnvKey:   "OPENROUTER_API_KEY",
+		Input:    []string{"text", "image"},
+		Output:   []string{"image"},
+		Cost:     Cost{Input: 5, Output: 0, CacheRead: 0, CacheWrite: 0},
+	},
+	{
+		Provider: "openrouter",
 		ID:       "openai/gpt-5-image",
 		Name:     "OpenAI: GPT-5 Image",
 		API:      "openrouter-images",

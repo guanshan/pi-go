@@ -3,10 +3,14 @@
 Status: **partial — minimal Node JSONL bridge landed.** A minimal script
 runtime (`packages/coding-agent/core/extensions/script_runtime.go`) can load
 `.ts`/`.js`/`.mjs` extensions through a Node bridge and register/execute simple
-custom tools. The full upstream ExtensionAPI (hooks/events, commands/settings,
-`ctx.ui`, message renderers, provider/model registration) is not implemented
-yet. This document compares approaches for completing that runtime and
-recommends a path; see "Current state" for what works today.
+custom tools, commands, flags, hooks, host-backed context/UI requests,
+autocomplete providers, shortcuts, a custom-provider subset, and a text-line
+custom message renderer subset, plus the common session action APIs
+(`sendUserMessage`, `appendEntry`, session name, and labels). The full upstream
+ExtensionAPI (rich component message renderers, rich/custom `ctx.ui`, widgets)
+is not
+implemented yet. This document compares approaches for completing that runtime
+and recommends a path; see "Current state" for what works today.
 
 ## Background
 
@@ -36,11 +40,11 @@ The Go port supports two kinds of extensions today:
   event hooks, and declaring CLI flags (`registerFlag`/`getFlag`, surfaced in
   `--help` and seeded from the command line).
 
-What is still missing is the rest of the *rich* upstream `ExtensionAPI`: command
-dispatch, settings, provider/model registration, message renderers, widgets, and
-a full `ctx.ui`. Go has no built-in equivalent of jiti and cannot `import`
-TypeScript/JavaScript or inject virtual modules in-process, so closing that gap
-requires the transport work discussed below rather than a drop-in loader.
+What is still missing is the rest of the *rich* upstream `ExtensionAPI`: rich
+component message renderer layout, widgets, and a full custom `ctx.ui`. Go has no built-in
+equivalent of jiti and cannot `import` TypeScript/JavaScript or inject virtual
+modules in-process, so closing that gap requires the transport work discussed
+below rather than a drop-in loader.
 
 ## Goals & constraints
 
@@ -110,9 +114,9 @@ process and communicates over stdin/stdout with newline-delimited JSON-RPC
 - **Cons:** IPC and (de)serialization overhead per event — mitigated by batching
   and only forwarding events an extension subscribed to; async request/response
   needs correlation IDs (we already do this for RPC); richer UI/render hooks
-  that assume in-process objects (custom TUI components, message renderers) can't
-  cross the boundary and would be unsupported or degraded (the RPC UI context
-  already documents these limitations).
+  that assume in-process objects (custom TUI components, rich message renderer
+  components) can't cross the boundary and would be unsupported or degraded (the
+  RPC UI context already documents these limitations).
 
 ### D. Native Go plugins (`plugin` package) or pre-registered Go factories
 
@@ -158,18 +162,24 @@ needed.
 Partial. End-user `.ts`/`.js`/`.mjs` extensions run today through the minimal
 Node JSONL bridge (`core/extensions/script_runtime.go`), alongside compile-time
 Go `ExtensionFactory` registration. The supported surface is **custom tools,
-event hooks, CLI flags** (`registerFlag`/`getFlag`), and basic slash command
-dispatch. Still **not** implemented: settings, provider/model registration,
-message renderers, widgets, and a rich `ctx.ui` (the bridge's `ctx.ui` is a
-degraded stub). The recommended out-of-process JSON-RPC transport above is the
-path to closing the remaining gap.
+event hooks, CLI flags** (`registerFlag`/`getFlag`), basic slash command
+dispatch, host-backed `ctx.ui` prompts, common `ExtensionContext` snapshots and
+actions, autocomplete provider suggestions, and interactive shortcut handlers.
+Script `pi.registerProvider` is bridged for text/content provider calls through
+the AI provider registry and for TS-style model catalog registration configs,
+and script message renderers are bridged as a text-line renderer subset for
+custom messages. Top-level script actions now cover custom message injection,
+user-message delivery, custom state entries, session naming, and labels. Still
+**not** implemented: full component message renderer layout, rich/custom
+`ctx.ui`, and widgets. The
+recommended out-of-process JSON-RPC transport above is the path to closing the
+remaining gap.
 
 ## Capability matrix (script bridge)
 
 What an `.ts`/`.js`/`.mjs` extension can rely on through the current Node bridge
-(`core/extensions/script_runtime.go`). "Fail-fast" entries throw a clear
-`... is unsupported in the Go bridge` error at call time rather than silently
-no-op'ing, so an unsupported upstream extension surfaces a precise message.
+(`core/extensions/script_runtime.go`). Unsupported registration APIs warn and
+skip so the rest of the extension can still load.
 
 | Surface | Status | Notes |
 | --- | --- | --- |
@@ -179,14 +189,20 @@ no-op'ing, so an unsupported upstream extension surfaces a precise message.
 | `pi.on(event, …)` / `pi.events.on` | ✅ supported | event hooks (tool call/result, etc.) |
 | `pi.onShutdown` | ✅ supported | |
 | virtual `@earendil-works/pi-ai`, `typebox` | ✅ supported | `Type` / `StringEnum` schema helpers |
-| virtual `@earendil-works/pi-coding-agent` | ✅ supported | `defineTool`, `createEventBus` |
+| virtual `@earendil-works/pi-coding-agent` | ✅ supported | `defineTool`, `createEventBus`, `getSettingsListTheme` |
 | virtual `@earendil-works/pi-tui` | 🟡 subset | `Text`, `Container`, `Box`, `Spacer`, `Input`, `SelectList`, `SettingsList`, `Loader`, `CancellableLoader`, `Markdown`, `matchesKey`, `truncateToWidth`, and `Key` (named keys + modifier helpers, e.g. `Key.ctrlAlt('p')`). Layout/widget classes are inert stubs. |
-| `ctx.ui` | 🟡 degraded stub | `notify` → stderr; `select` → first option; `confirm` → false; `hasUI` is false |
-| `ctx.sessionManager` | 🟡 degraded stub | `getBranch()` returns `[]` |
-| `pi.registerProvider` / `unregisterProvider` | ⛔ fail-fast | custom AI providers not bridged |
-| `pi.registerMessageRenderer` | ⛔ fail-fast | message renderers not bridged |
-| `pi.addAutocompleteProvider` | ⛔ fail-fast | autocomplete providers not bridged |
-| `pi.registerShortcut` / `unregisterShortcut` | ⛔ fail-fast | interactive keybindings not bridged |
+| `ctx.ui` | ✅ host-backed subset | `notify` / `select` / `confirm` / `input` route to the active TUI or RPC host; `setStatus(key, text)` updates the interactive footer or emits the TS RPC `setStatus` request, and `undefined` clears the keyed status. **Lightweight setters** `setWorkingMessage` / `setWorkingVisible` / `setWorkingIndicator` / `setHiddenThinkingLabel` / `setTitle` / `pasteToEditor` / `setEditorText` are bridged: in the interactive TUI they adjust the footer busy indicator, terminal window title, and editor text; in RPC mode `setTitle` / `setEditorText` / `pasteToEditor` forward TS-shaped requests while the working/thinking setters are no-ops (matching TS rpc-mode). `getEditorText()` resolves a `Promise<string>` over the bridge (TS is synchronous — documented divergence) returning the current editor text, `""` headless. `editor(title, prefill)` opens `$VISUAL`/`$EDITOR` and resolves the edited text (or `undefined`). `onTerminalInput()` returns a no-op unsubscribe (raw per-keystroke forwarding is not bridged). **Widgets:** `setWidget(key, string[]\|undefined, {placement})` is bridged — plain-text widgets render above/below the editor in the interactive TUI (keyed, move-on-replacement, undefined removes, capped at 10 lines with a truncation marker) and forward `widgetKey`/`widgetLines`/`widgetPlacement` in RPC mode (matching TS rpc-mode's string-array subset). Component-factory widgets warn-and-skip. Headless calls reject clearly for dialogs and no-op for the lightweight setters/widgets. `setFooter` / `setHeader` / `setEditorComponent` / `custom()` (rich component factories) remain unsupported (warn-and-no-op; `getEditorComponent()` returns `undefined`). |
+| `ctx.cwd` / `ctx.mode` / `ctx.model` | ✅ host-backed | values come from the active `AgentSession` snapshot for every tool/command/event request |
+| `ctx.modelRegistry` | 🟡 host-backed subset | `list`, `getAll`, `getAvailable`, `find`/`get`, `hasConfiguredAuth`, and `getApiKeyAndHeaders` use the session model registry snapshot/action bridge |
+| `ctx.sessionManager` | 🟡 host-backed subset | `getEntries()`, `getBranch(fromId?)`, `getLeafId()`, and `getHeader()` use the current session snapshot |
+| `ctx.abort` / `ctx.compact` / `ctx.shutdown` | 🟡 host-backed subset | `abort()` and `compact()` dispatch to the host; `compact({onComplete,onError})` callbacks are honored. `shutdown()` requires a host shutdown binding. |
+| `pi.addAutocompleteProvider` | 🟡 bridged subset | provider factories can return `getSuggestions(...)` results with `items` and `prefix`; the Bubble TUI merges those values with built-in suggestions, renders item descriptions, and applies custom `applyCompletion` text and cursor results when provided. TS-exact visual-wrap cursor behavior is not fully matched. |
+| `pi.registerShortcut` / `unregisterShortcut` | 🟡 bridged subset | script shortcuts registered during load or later handler execution are exposed to the live Bubble TUI, execute handlers with a host-backed `ExtensionContext`, and appear in `/hotkeys`. Shortcut conflict filtering/diagnostics mirror TS: reserved editor-global built-ins are skipped, non-reserved built-in overlaps warn and use the extension, and duplicate extension shortcuts use the later registration. |
+| `pi.registerProvider` / `unregisterProvider` | 🟡 bridged subset | providers with `complete`, `stream`, `completeSimple`, or `streamSimple` handlers register into the Go AI provider registry; handlers receive a JSON-safe ChatRequest snapshot and a host-backed `ExtensionContext`, and may return strings, content blocks, assistant-like objects, or async iterables. `registerProvider(name, config)` also applies TS-style `baseUrl`/`apiKey`/`headers`/`models`/`modelOverrides` catalog configs to the active model registry during startup and dynamic registration. **Token-level streaming is bridged:** `stream`/`streamSimple` iterables emit out-of-band `provider_chunk` events (synthesized text/tool deltas, or passed-through `AssistantMessageEvent`-shaped chunks) that map onto incremental `ai.AssistantMessageEvent`s; the final integer-id reply remains authoritative for the message/usage/stopReason, and Go-context cancellation aborts the Node provider's signal. |
+| `pi.registerMessageRenderer` / `unregisterMessageRenderer` | 🟡 bridged subset | renderers registered during load or later handler execution are exposed to Go and render `custom_message` payloads into the **live interactive transcript**. Handlers receive `{customType, content, display, details, timestamp}`, `{expanded,width}`, and a theme helper that now emits **real ANSI SGR** (exact bold/dim/italic/underline; a fixed 16-color table for `fg`/`bg`); return values may be strings, string arrays, `{lines}`, `{text}`, or virtual TUI objects with `render()` (the `Box` shim applies its style function). Display messages render once on receipt with shared expand/collapse and a default bold `[customType]`+markdown fallback. Output is flattened to ANSI lines (parity with TS `Component.render` → `string[]`); arbitrary rich component layout and markdown-inside-a-renderer are not re-parsed. |
+| `pi.sendMessage` | 🟡 bridged subset | appends a `custom_message` session entry with `customType`, `content`, `display`, and `details`. `triggerTurn` is bridged to interactive hosts: the Bubble TUI starts an empty follow-on turn when idle or queues one as a follow-up while busy; hosts without a trigger binding report it as requested but unhandled. |
+| `pi.sendUserMessage` | 🟡 bridged subset | sends a user message through the active host. In the Bubble TUI this starts a turn when idle; while busy it requires `deliverAs: "steer"` or `"followUp"` and queues through the existing agent queues. |
+| `pi.appendEntry`, `setSessionName`, `getSessionName`, `setLabel` | ✅ supported | host-backed session persistence actions for custom state, display names, and entry labels. `setLabel` validates the target entry exists, matching TS. |
 | Node `module.registerHooks` | ⚠️ required | the bridge needs a Node runtime that provides `module.registerHooks`; older Node throws at startup |
 
 Closing the 🟡/⛔ rows is the job of the out-of-process JSON-RPC transport

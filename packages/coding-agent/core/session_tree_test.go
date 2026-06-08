@@ -5,6 +5,7 @@ import (
 	"context"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/guanshan/pi-go/packages/ai"
@@ -56,6 +57,32 @@ func TestFormatSessionTreeNavigateAndClone(t *testing.T) {
 	if text := ai.MessageText(ctx.Messages[1]); text != "answer" {
 		t.Fatalf("cloned assistant text = %q", text)
 	}
+}
+
+func TestSessionManagerConcurrentAppendAndBranchFrom(t *testing.T) {
+	session := InMemorySession(t.TempDir())
+	if err := session.AppendMessage(ai.NewUserMessage("seed", nil)); err != nil {
+		t.Fatal(err)
+	}
+	leaf := session.CurrentLeafID()
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 1000; i++ {
+			_ = session.AppendMessage(ai.NewUserMessage("next", nil))
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 1000; i++ {
+			if _, err := session.BranchFrom(leaf); err != nil {
+				t.Errorf("BranchFrom: %v", err)
+				return
+			}
+		}
+	}()
+	wg.Wait()
 }
 
 func TestHandleSlashTreeForkAndClone(t *testing.T) {

@@ -74,16 +74,24 @@ type Factory func(*API) error
 type ErrorListener func(error)
 
 type API struct {
-	mu               sync.RWMutex
-	Tools            []ToolDefinition
-	Commands         []CommandInfo
-	Flags            []FlagDefinition
-	flagValues       map[string]any
-	Events           *EventBus
-	shutdownHandlers []func(context.Context) error
-	eventHandlers    map[string]int
-	uiHandler        UIRequestHandler
-	uiListeners      []func(uint64, bool)
+	mu                         sync.RWMutex
+	Tools                      []ToolDefinition
+	Commands                   []CommandInfo
+	Shortcuts                  []ShortcutDefinition
+	Autocomplete               []AutocompleteProviderDefinition
+	Providers                  []ProviderDefinition
+	MessageRenderers           []MessageRendererDefinition
+	Flags                      []FlagDefinition
+	flagValues                 map[string]any
+	Events                     *EventBus
+	shutdownHandlers           []func(context.Context) error
+	eventHandlers              map[string]int
+	uiHandler                  UIRequestHandler
+	uiListeners                []func(uint64, bool)
+	providerListeners          []func(ProviderDefinition, bool)
+	nextAutocompleteProviderID uint64
+	contextProvider            ExtensionContextProvider
+	contextAction              ExtensionContextActionHandler
 	// uiSeq is a monotonic sequence stamped on each SetUIHandler call (under mu)
 	// so listeners can discard stale notifications and resolve a true/false race
 	// to the latest state regardless of goroutine scheduling order.
@@ -125,6 +133,229 @@ func (api *API) RegisterCommandHandler(name, description string, execute func(co
 	api.mu.Lock()
 	defer api.mu.Unlock()
 	api.Commands = append(api.Commands, CommandInfo{Name: name, Description: description, Source: "extension", Execute: execute})
+}
+
+func (api *API) RegisterShortcut(shortcut ShortcutDefinition) {
+	if api == nil || shortcut.Execute == nil {
+		return
+	}
+	key := strings.TrimSpace(shortcut.Key)
+	if key == "" {
+		return
+	}
+	shortcut.Key = key
+	if shortcut.Source == "" {
+		shortcut.Source = "extension"
+	}
+	api.mu.Lock()
+	defer api.mu.Unlock()
+	insertAt := len(api.Shortcuts)
+	for i, existing := range api.Shortcuts {
+		if strings.TrimSpace(existing.Source) == strings.TrimSpace(shortcut.Source) {
+			if strings.TrimSpace(existing.Key) == key {
+				api.Shortcuts[i] = shortcut
+				return
+			}
+			insertAt = i + 1
+		}
+	}
+	if insertAt == len(api.Shortcuts) {
+		api.Shortcuts = append(api.Shortcuts, shortcut)
+		return
+	}
+	api.Shortcuts = append(api.Shortcuts, ShortcutDefinition{})
+	copy(api.Shortcuts[insertAt+1:], api.Shortcuts[insertAt:])
+	api.Shortcuts[insertAt] = shortcut
+}
+
+func (api *API) UnregisterShortcut(key string) {
+	api.UnregisterShortcutSource(key, "")
+}
+
+func (api *API) UnregisterShortcutSource(key, source string) {
+	if api == nil {
+		return
+	}
+	key = strings.TrimSpace(key)
+	if key == "" {
+		return
+	}
+	api.mu.Lock()
+	defer api.mu.Unlock()
+	out := api.Shortcuts[:0]
+	for _, shortcut := range api.Shortcuts {
+		if strings.TrimSpace(shortcut.Key) != key || (source != "" && strings.TrimSpace(shortcut.Source) != strings.TrimSpace(source)) {
+			out = append(out, shortcut)
+		}
+	}
+	api.Shortcuts = out
+}
+
+func (api *API) RegisterAutocompleteProvider(provider AutocompleteProviderDefinition) {
+	if api == nil || provider.Suggest == nil {
+		return
+	}
+	api.mu.Lock()
+	defer api.mu.Unlock()
+	if provider.ID == 0 {
+		api.nextAutocompleteProviderID++
+		provider.ID = api.nextAutocompleteProviderID
+	} else if provider.ID > api.nextAutocompleteProviderID {
+		api.nextAutocompleteProviderID = provider.ID
+	}
+	api.Autocomplete = append(api.Autocomplete, provider)
+}
+
+func (api *API) RegisterProvider(provider ProviderDefinition) {
+	if api == nil {
+		return
+	}
+	if provider.Provider != nil {
+		provider.API = strings.TrimSpace(firstNonEmpty(provider.API, provider.Provider.API()))
+	} else {
+		provider.API = strings.TrimSpace(provider.API)
+	}
+	provider.ProviderName = strings.TrimSpace(provider.ProviderName)
+	if provider.API == "" && provider.ProviderName == "" {
+		return
+	}
+	if provider.Provider == nil && !hasProviderModelConfig(provider.ModelConfig) {
+		return
+	}
+	if provider.Source == "" {
+		provider.Source = "extension"
+	}
+	api.mu.Lock()
+	for i, existing := range api.Providers {
+		if sameProviderDefinition(existing, provider) {
+			api.Providers[i] = provider
+			listeners := append([]func(ProviderDefinition, bool){}, api.providerListeners...)
+			api.mu.Unlock()
+			for _, listener := range listeners {
+				if listener != nil {
+					listener(provider, true)
+				}
+			}
+			return
+		}
+	}
+	api.Providers = append(api.Providers, provider)
+	listeners := append([]func(ProviderDefinition, bool){}, api.providerListeners...)
+	api.mu.Unlock()
+	for _, listener := range listeners {
+		if listener != nil {
+			listener(provider, true)
+		}
+	}
+}
+
+func (api *API) UnregisterProviderSource(apiID, source string) {
+	if api == nil {
+		return
+	}
+	apiID = strings.TrimSpace(apiID)
+	if apiID == "" {
+		return
+	}
+	api.mu.Lock()
+	out := api.Providers[:0]
+	var removed []ProviderDefinition
+	for _, provider := range api.Providers {
+		if providerMatchesUnregisterKey(provider, apiID) && (source == "" || strings.TrimSpace(provider.Source) == strings.TrimSpace(source)) {
+			removed = append(removed, provider)
+			continue
+		}
+		out = append(out, provider)
+	}
+	api.Providers = out
+	listeners := append([]func(ProviderDefinition, bool){}, api.providerListeners...)
+	api.mu.Unlock()
+	for _, provider := range removed {
+		for _, listener := range listeners {
+			if listener != nil {
+				listener(provider, false)
+			}
+		}
+	}
+}
+
+func (api *API) OnProviderChange(listener func(ProviderDefinition, bool)) func() {
+	if api == nil || listener == nil {
+		return func() {}
+	}
+	api.mu.Lock()
+	api.providerListeners = append(api.providerListeners, listener)
+	index := len(api.providerListeners) - 1
+	api.mu.Unlock()
+	return func() {
+		api.mu.Lock()
+		defer api.mu.Unlock()
+		if index < 0 || index >= len(api.providerListeners) || api.providerListeners[index] == nil {
+			return
+		}
+		api.providerListeners[index] = nil
+	}
+}
+
+func sameProviderDefinition(a, b ProviderDefinition) bool {
+	return strings.TrimSpace(a.Source) == strings.TrimSpace(b.Source) &&
+		strings.TrimSpace(a.API) == strings.TrimSpace(b.API) &&
+		strings.TrimSpace(a.ProviderName) == strings.TrimSpace(b.ProviderName)
+}
+
+func providerMatchesUnregisterKey(provider ProviderDefinition, key string) bool {
+	key = strings.TrimSpace(key)
+	if key == "" {
+		return false
+	}
+	return strings.TrimSpace(provider.API) == key || strings.TrimSpace(provider.ProviderName) == key
+}
+
+func hasProviderModelConfig(raw []byte) bool {
+	trimmed := strings.TrimSpace(string(raw))
+	return trimmed != "" && trimmed != "null" && trimmed != "{}"
+}
+
+func (api *API) RegisterMessageRenderer(renderer MessageRendererDefinition) {
+	if api == nil || renderer.Render == nil {
+		return
+	}
+	renderer.CustomType = strings.TrimSpace(renderer.CustomType)
+	if renderer.CustomType == "" {
+		return
+	}
+	if renderer.Source == "" {
+		renderer.Source = "extension"
+	}
+	api.mu.Lock()
+	defer api.mu.Unlock()
+	for i, existing := range api.MessageRenderers {
+		if strings.TrimSpace(existing.CustomType) == renderer.CustomType && strings.TrimSpace(existing.Source) == strings.TrimSpace(renderer.Source) {
+			api.MessageRenderers[i] = renderer
+			return
+		}
+	}
+	api.MessageRenderers = append(api.MessageRenderers, renderer)
+}
+
+func (api *API) UnregisterMessageRendererSource(customType, source string) {
+	if api == nil {
+		return
+	}
+	customType = strings.TrimSpace(customType)
+	if customType == "" {
+		return
+	}
+	api.mu.Lock()
+	defer api.mu.Unlock()
+	out := api.MessageRenderers[:0]
+	for _, renderer := range api.MessageRenderers {
+		if strings.TrimSpace(renderer.CustomType) == customType && (source == "" || strings.TrimSpace(renderer.Source) == strings.TrimSpace(source)) {
+			continue
+		}
+		out = append(out, renderer)
+	}
+	api.MessageRenderers = out
 }
 
 // RegisterFlag declares a CLI flag. Its default is seeded into the flag values
@@ -192,6 +423,47 @@ func (api *API) SnapshotFlags() []FlagDefinition {
 	return append([]FlagDefinition(nil), api.Flags...)
 }
 
+func (api *API) SetContextProvider(provider ExtensionContextProvider) {
+	if api == nil {
+		return
+	}
+	api.mu.Lock()
+	api.contextProvider = provider
+	api.mu.Unlock()
+}
+
+func (api *API) ContextSnapshot() ExtensionContextSnapshot {
+	if api == nil {
+		return ExtensionContextSnapshot{}
+	}
+	api.mu.RLock()
+	provider := api.contextProvider
+	hasUI := api.uiHandler != nil
+	api.mu.RUnlock()
+	if provider == nil {
+		return ExtensionContextSnapshot{Mode: "print", HasUI: hasUI, IsIdle: true}
+	}
+	return provider()
+}
+
+func (api *API) SetContextActionHandler(handler ExtensionContextActionHandler) {
+	if api == nil {
+		return
+	}
+	api.mu.Lock()
+	api.contextAction = handler
+	api.mu.Unlock()
+}
+
+func (api *API) ContextActionHandler() ExtensionContextActionHandler {
+	if api == nil {
+		return nil
+	}
+	api.mu.RLock()
+	defer api.mu.RUnlock()
+	return api.contextAction
+}
+
 func (api *API) OnShutdown(handler func(context.Context) error) {
 	if api == nil || handler == nil {
 		return
@@ -245,6 +517,42 @@ func (api *API) SnapshotCommands() []CommandInfo {
 	api.mu.RLock()
 	defer api.mu.RUnlock()
 	return append([]CommandInfo(nil), api.Commands...)
+}
+
+func (api *API) SnapshotShortcuts() []ShortcutDefinition {
+	if api == nil {
+		return nil
+	}
+	api.mu.RLock()
+	defer api.mu.RUnlock()
+	return append([]ShortcutDefinition(nil), api.Shortcuts...)
+}
+
+func (api *API) SnapshotAutocompleteProviders() []AutocompleteProviderDefinition {
+	if api == nil {
+		return nil
+	}
+	api.mu.RLock()
+	defer api.mu.RUnlock()
+	return append([]AutocompleteProviderDefinition(nil), api.Autocomplete...)
+}
+
+func (api *API) SnapshotProviders() []ProviderDefinition {
+	if api == nil {
+		return nil
+	}
+	api.mu.RLock()
+	defer api.mu.RUnlock()
+	return append([]ProviderDefinition(nil), api.Providers...)
+}
+
+func (api *API) SnapshotMessageRenderers() []MessageRendererDefinition {
+	if api == nil {
+		return nil
+	}
+	api.mu.RLock()
+	defer api.mu.RUnlock()
+	return append([]MessageRendererDefinition(nil), api.MessageRenderers...)
 }
 
 func (api *API) SnapshotShutdownHandlers() []func(context.Context) error {
@@ -306,6 +614,34 @@ func (r *Runner) RegisteredCommands() []CommandInfo {
 	return r.API.SnapshotCommands()
 }
 
+func (r *Runner) RegisteredShortcuts() []ShortcutDefinition {
+	if r == nil || r.API == nil {
+		return nil
+	}
+	return r.API.SnapshotShortcuts()
+}
+
+func (r *Runner) RegisteredAutocompleteProviders() []AutocompleteProviderDefinition {
+	if r == nil || r.API == nil {
+		return nil
+	}
+	return r.API.SnapshotAutocompleteProviders()
+}
+
+func (r *Runner) RegisteredProviders() []ProviderDefinition {
+	if r == nil || r.API == nil {
+		return nil
+	}
+	return r.API.SnapshotProviders()
+}
+
+func (r *Runner) RegisteredMessageRenderers() []MessageRendererDefinition {
+	if r == nil || r.API == nil {
+		return nil
+	}
+	return r.API.SnapshotMessageRenderers()
+}
+
 func (r *Runner) RegisteredFlags() []FlagDefinition {
 	if r == nil || r.API == nil {
 		return nil
@@ -320,6 +656,20 @@ func (r *Runner) SetFlagValues(values map[string]any) {
 		return
 	}
 	r.API.SetFlagValues(values)
+}
+
+func (r *Runner) SetContextProvider(provider ExtensionContextProvider) {
+	if r == nil || r.API == nil {
+		return
+	}
+	r.API.SetContextProvider(provider)
+}
+
+func (r *Runner) SetContextActionHandler(handler ExtensionContextActionHandler) {
+	if r == nil || r.API == nil {
+		return
+	}
+	r.API.SetContextActionHandler(handler)
 }
 
 func (r *Runner) FlagValue(name string) any {
@@ -347,6 +697,53 @@ func (r *Runner) CommandDefinition(name string) (CommandInfo, bool) {
 	return CommandInfo{}, false
 }
 
+func (r *Runner) ShortcutDefinition(key string) (ShortcutDefinition, bool) {
+	key = strings.TrimSpace(key)
+	if key == "" {
+		return ShortcutDefinition{}, false
+	}
+	for _, shortcut := range r.RegisteredShortcuts() {
+		if strings.TrimSpace(shortcut.Key) == key {
+			return shortcut, true
+		}
+	}
+	return ShortcutDefinition{}, false
+}
+
+func (r *Runner) MessageRendererDefinition(customType string) (MessageRendererDefinition, bool) {
+	customType = strings.TrimSpace(customType)
+	if customType == "" {
+		return MessageRendererDefinition{}, false
+	}
+	renderers := r.RegisteredMessageRenderers()
+	for i := len(renderers) - 1; i >= 0; i-- {
+		if strings.TrimSpace(renderers[i].CustomType) == customType {
+			return renderers[i], true
+		}
+	}
+	return MessageRendererDefinition{}, false
+}
+
+func (r *Runner) RenderMessage(ctx context.Context, request MessageRenderRequest) (MessageRenderResult, bool, error) {
+	renderer, ok := r.MessageRendererDefinition(request.CustomType)
+	if !ok {
+		return MessageRenderResult{}, false, nil
+	}
+	if renderer.Render == nil {
+		err := fmt.Errorf("extension message renderer %s has no handler", request.CustomType)
+		r.EmitError(err)
+		return MessageRenderResult{}, true, err
+	}
+	result, err := renderer.Render(ctx, request)
+	if err != nil {
+		if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+			r.EmitError(err)
+		}
+		return result, true, err
+	}
+	return result, true, nil
+}
+
 func (r *Runner) ExecuteCommand(ctx context.Context, name, args string) (string, bool, error) {
 	command, ok := r.CommandDefinition(name)
 	if !ok {
@@ -363,6 +760,121 @@ func (r *Runner) ExecuteCommand(ctx context.Context, name, args string) (string,
 		return out, true, err
 	}
 	return out, true, nil
+}
+
+func (r *Runner) ExecuteShortcut(ctx context.Context, key string) (bool, error) {
+	shortcut, ok := r.ShortcutDefinition(key)
+	if !ok {
+		return false, nil
+	}
+	if shortcut.Execute == nil {
+		err := fmt.Errorf("extension shortcut %s has no handler", key)
+		r.EmitError(err)
+		return true, err
+	}
+	err := shortcut.Execute(ctx)
+	if err != nil {
+		r.EmitError(err)
+		return true, err
+	}
+	return true, nil
+}
+
+func (r *Runner) Autocomplete(ctx context.Context, request AutocompleteRequest) (AutocompleteSuggestions, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	var merged AutocompleteSuggestions
+	seen := map[string]bool{}
+	var errs []error
+	sourceCounts := map[string]int{}
+	for providerIndex, provider := range r.RegisteredAutocompleteProviders() {
+		if provider.Suggest == nil {
+			continue
+		}
+		sourceIndex := sourceCounts[provider.Source]
+		sourceCounts[provider.Source] = sourceIndex + 1
+		result, err := provider.Suggest(ctx, request)
+		if err != nil {
+			errs = append(errs, err)
+			if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+				r.EmitError(err)
+			}
+			continue
+		}
+		if merged.Prefix == "" {
+			merged.Prefix = result.Prefix
+		}
+		for _, item := range result.Items {
+			if item.Value == "" {
+				item.Value = item.Label
+			}
+			if item.Value == "" {
+				continue
+			}
+			item.Provider = providerIndex
+			item.ProviderID = provider.ID
+			item.Source = provider.Source
+			item.SourceIndex = sourceIndex
+			key := item.Value + "\x00" + item.Label
+			if seen[key] {
+				continue
+			}
+			seen[key] = true
+			merged.Items = append(merged.Items, item)
+		}
+	}
+	return merged, errors.Join(errs...)
+}
+
+func (r *Runner) ApplyAutocomplete(ctx context.Context, request AutocompleteApplyRequest) (AutocompleteApplyResult, bool, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	providers := r.RegisteredAutocompleteProviders()
+	provider, ok := autocompleteProviderForItem(providers, request.Item)
+	if !ok {
+		return AutocompleteApplyResult{}, false, nil
+	}
+	if provider.Apply == nil {
+		return AutocompleteApplyResult{}, false, nil
+	}
+	result, err := provider.Apply(ctx, request)
+	if err != nil {
+		if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+			r.EmitError(err)
+		}
+		return result, true, err
+	}
+	return result, true, nil
+}
+
+func autocompleteProviderForItem(providers []AutocompleteProviderDefinition, item AutocompleteItem) (AutocompleteProviderDefinition, bool) {
+	if item.ProviderID != 0 {
+		for _, provider := range providers {
+			if provider.ID == item.ProviderID {
+				return provider, true
+			}
+		}
+		return AutocompleteProviderDefinition{}, false
+	}
+	if item.Source != "" {
+		sourceIndex := 0
+		for _, provider := range providers {
+			if provider.Source != item.Source {
+				continue
+			}
+			if sourceIndex == item.SourceIndex {
+				return provider, true
+			}
+			sourceIndex++
+		}
+	}
+	providerIndex := item.Provider
+	if providerIndex < 0 || providerIndex >= len(providers) {
+		return AutocompleteProviderDefinition{}, false
+	}
+	return providers[providerIndex], true
 }
 
 func (r *Runner) HasHandlers(eventType string) bool {

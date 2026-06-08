@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -209,6 +210,40 @@ func TestScriptExtensionUISelectAnsweredByHandler(t *testing.T) {
 	}
 }
 
+func TestScriptExtensionUISetStatusSendsRequest(t *testing.T) {
+	api := NewAPI()
+	seen := make(chan json.RawMessage, 1)
+	api.SetUIHandler(func(_ context.Context, method string, params json.RawMessage) (json.RawMessage, error) {
+		if method != "setStatus" {
+			t.Errorf("method=%q want setStatus", method)
+		}
+		seen <- append(json.RawMessage(nil), params...)
+		return json.RawMessage("null"), nil
+	})
+	tool := uiToolExtension(t, api, "status",
+		`ctx.ui.setStatus("build", "Building");
+		await new Promise((resolve) => setTimeout(resolve, 20));
+		return { content: [{ type: "text", text: "ok" }] };`)
+	if _, err := tool.Execute(context.Background(), []byte("{}")); err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	select {
+	case raw := <-seen:
+		var got struct {
+			Key  string `json:"key"`
+			Text string `json:"text"`
+		}
+		if err := json.Unmarshal(raw, &got); err != nil {
+			t.Fatal(err)
+		}
+		if got.Key != "build" || got.Text != "Building" {
+			t.Fatalf("status payload=%#v", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for setStatus request")
+	}
+}
+
 // TestScriptExtensionHasUIReflectsBoundHandler verifies ctx.hasUI tracks whether
 // a UI handler is bound (TS model): true when bound before load.
 func TestScriptExtensionHasUIReflectsBoundHandler(t *testing.T) {
@@ -315,4 +350,253 @@ func TestSetUIHandlerDoesNotBlockOnSlowListener(t *testing.T) {
 		t.Fatal("listener was not invoked")
 	}
 	close(release)
+}
+
+// TestScriptExtensionUILightweightSettersSendRequests verifies the fire-and-forget
+// lightweight ctx.ui.* setters (Item 1) each emit a ui_request to the bound host
+// handler with the expected params. One extension calls all seven; the requests
+// and the tool result share the node->host stream in order, so by the time
+// Execute returns the handler has seen all of them.
+func TestScriptExtensionUILightweightSettersSendRequests(t *testing.T) {
+	api := NewAPI()
+	var mu sync.Mutex
+	got := map[string]json.RawMessage{}
+	api.SetUIHandler(func(_ context.Context, method string, params json.RawMessage) (json.RawMessage, error) {
+		mu.Lock()
+		got[method] = append(json.RawMessage(nil), params...)
+		mu.Unlock()
+		return json.RawMessage("null"), nil
+	})
+	tool := uiToolExtension(t, api, "setters",
+		`ctx.ui.setWorkingMessage("Crunching");
+		ctx.ui.setWorkingVisible(false);
+		ctx.ui.setWorkingIndicator({ frames: ["A", "B"], intervalMs: 120 });
+		ctx.ui.setHiddenThinkingLabel("hidden");
+		ctx.ui.setTitle("My Title");
+		ctx.ui.pasteToEditor("pasted text");
+		ctx.ui.setEditorText("replaced text");
+		await new Promise((r) => setTimeout(r, 60));
+		return { content: [{ type: "text", text: "ok" }] };`)
+	if _, err := tool.Execute(context.Background(), []byte("{}")); err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+
+	// Poll briefly in case the last request is still in flight after Execute.
+	deadline := time.Now().Add(time.Second)
+	for {
+		mu.Lock()
+		n := len(got)
+		mu.Unlock()
+		if n >= 7 || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	field := func(method, key string) any {
+		raw, ok := got[method]
+		if !ok {
+			t.Fatalf("no %s request captured; got=%v", method, keys(got))
+		}
+		var m map[string]any
+		if err := json.Unmarshal(raw, &m); err != nil {
+			t.Fatalf("unmarshal %s params: %v", method, err)
+		}
+		return m[key]
+	}
+	if v := field("setWorkingMessage", "message"); v != "Crunching" {
+		t.Errorf("setWorkingMessage message=%v", v)
+	}
+	if v := field("setWorkingVisible", "visible"); v != false {
+		t.Errorf("setWorkingVisible visible=%v", v)
+	}
+	if v := field("setWorkingIndicator", "intervalMs"); v != float64(120) {
+		t.Errorf("setWorkingIndicator intervalMs=%v", v)
+	}
+	if frames, ok := field("setWorkingIndicator", "frames").([]any); !ok || len(frames) != 2 || frames[0] != "A" {
+		t.Errorf("setWorkingIndicator frames=%v", field("setWorkingIndicator", "frames"))
+	}
+	if v := field("setHiddenThinkingLabel", "label"); v != "hidden" {
+		t.Errorf("setHiddenThinkingLabel label=%v", v)
+	}
+	if v := field("setTitle", "title"); v != "My Title" {
+		t.Errorf("setTitle title=%v", v)
+	}
+	if v := field("pasteToEditor", "text"); v != "pasted text" {
+		t.Errorf("pasteToEditor text=%v", v)
+	}
+	if v := field("setEditorText", "text"); v != "replaced text" {
+		t.Errorf("setEditorText text=%v", v)
+	}
+}
+
+func keys(m map[string]json.RawMessage) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	return out
+}
+
+// TestScriptExtensionUISetWidget verifies ctx.ui.setWidget forwards string-array
+// (and undefined-to-remove) widgets to the host, while the unsupported component
+// setters (setFooter/setHeader/setEditorComponent) warn-and-no-op (no host
+// request) and getEditorComponent resolves undefined.
+func TestScriptExtensionUISetWidget(t *testing.T) {
+	api := NewAPI()
+	var mu sync.Mutex
+	var reqs []struct {
+		method string
+		params json.RawMessage
+	}
+	api.SetUIHandler(func(_ context.Context, method string, params json.RawMessage) (json.RawMessage, error) {
+		mu.Lock()
+		reqs = append(reqs, struct {
+			method string
+			params json.RawMessage
+		}{method, append(json.RawMessage(nil), params...)})
+		mu.Unlock()
+		return json.RawMessage("null"), nil
+	})
+	tool := uiToolExtension(t, api, "widget",
+		`ctx.ui.setWidget("status", ["line A", "line B"], { placement: "belowEditor" });
+		ctx.ui.setWidget("gone", undefined);
+		ctx.ui.setFooter(() => ({}));
+		ctx.ui.setHeader(() => ({}));
+		ctx.ui.setEditorComponent(() => ({}));
+		const ec = ctx.ui.getEditorComponent();
+		await new Promise((r) => setTimeout(r, 60));
+		return { content: [{ type: "text", text: "ec=" + String(ec) }] };`)
+	res, err := tool.Execute(context.Background(), []byte("{}"))
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	if got := toolResultText(res); got != "ec=undefined" {
+		t.Fatalf("getEditorComponent result=%q want ec=undefined", got)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	// Only the two setWidget calls reach the host; setFooter/setHeader/
+	// setEditorComponent are client-side no-ops.
+	var widgets []json.RawMessage
+	for _, r := range reqs {
+		if r.method != "setWidget" {
+			t.Fatalf("unexpected host request method %q (component setters must no-op)", r.method)
+		}
+		widgets = append(widgets, r.params)
+	}
+	if len(widgets) != 2 {
+		t.Fatalf("got %d setWidget requests, want 2", len(widgets))
+	}
+	// The host dispatches ui_request handlers concurrently, so the two setWidget
+	// calls may be captured in either order; index by key.
+	byKey := map[string]struct {
+		Key       string    `json:"key"`
+		Lines     *[]string `json:"lines"`
+		Placement string    `json:"placement"`
+	}{}
+	for _, raw := range widgets {
+		var w struct {
+			Key       string    `json:"key"`
+			Lines     *[]string `json:"lines"`
+			Placement string    `json:"placement"`
+		}
+		if err := json.Unmarshal(raw, &w); err != nil {
+			t.Fatal(err)
+		}
+		byKey[w.Key] = w
+	}
+	status, ok := byKey["status"]
+	if !ok || status.Lines == nil || len(*status.Lines) != 2 || (*status.Lines)[0] != "line A" || status.Placement != "belowEditor" {
+		t.Fatalf("status setWidget payload=%#v", status)
+	}
+	gone, ok := byKey["gone"]
+	if !ok || gone.Lines != nil {
+		t.Fatalf("remove setWidget payload=%#v (lines should be null)", gone)
+	}
+}
+
+// TestScriptExtensionUIGetEditorTextReturnsHostValue verifies ctx.ui.getEditorText
+// resolves the string the host returns (async Promise in the Go bridge).
+func TestScriptExtensionUIGetEditorTextReturnsHostValue(t *testing.T) {
+	api := NewAPI()
+	api.SetUIHandler(func(_ context.Context, method string, _ json.RawMessage) (json.RawMessage, error) {
+		if method == "getEditorText" {
+			return json.RawMessage(`"current draft"`), nil
+		}
+		return json.RawMessage("null"), nil
+	})
+	tool := uiToolExtension(t, api, "geteditor",
+		`const text = await ctx.ui.getEditorText();
+		return { content: [{ type: "text", text: "editor=" + text }] };`)
+	res, err := tool.Execute(context.Background(), []byte("{}"))
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	if got := toolResultText(res); got != "editor=current draft" {
+		t.Fatalf("result=%q want editor=current draft", got)
+	}
+}
+
+// TestScriptExtensionUIEditorReturnsHostValue verifies ctx.ui.editor forwards the
+// title/prefill and resolves the host's edited text.
+func TestScriptExtensionUIEditorReturnsHostValue(t *testing.T) {
+	api := NewAPI()
+	var capturedTitle, capturedPrefill string
+	api.SetUIHandler(func(_ context.Context, method string, params json.RawMessage) (json.RawMessage, error) {
+		if method == "editor" {
+			var p struct {
+				Title   string `json:"title"`
+				Prefill string `json:"prefill"`
+			}
+			_ = json.Unmarshal(params, &p)
+			capturedTitle, capturedPrefill = p.Title, p.Prefill
+			return json.RawMessage(`"edited body"`), nil
+		}
+		return json.RawMessage("null"), nil
+	})
+	tool := uiToolExtension(t, api, "editor",
+		`const text = await ctx.ui.editor("Compose", "start here");
+		return { content: [{ type: "text", text: "editor=" + String(text) }] };`)
+	res, err := tool.Execute(context.Background(), []byte("{}"))
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	if got := toolResultText(res); got != "editor=edited body" {
+		t.Fatalf("result=%q want editor=edited body", got)
+	}
+	if capturedTitle != "Compose" || capturedPrefill != "start here" {
+		t.Fatalf("editor params title=%q prefill=%q", capturedTitle, capturedPrefill)
+	}
+}
+
+// TestScriptExtensionUILightweightHeadlessNoOp verifies that with no host UI the
+// lightweight APIs are callable without "undefined is not a function": the
+// fire-and-forget setters no-op, getEditorText resolves "", editor resolves
+// undefined, and onTerminalInput returns a no-op unsubscribe function.
+func TestScriptExtensionUILightweightHeadlessNoOp(t *testing.T) {
+	api := NewAPI() // no UI handler bound -> headless
+	tool := uiToolExtension(t, api, "headless",
+		`ctx.ui.setWorkingMessage("x");
+		ctx.ui.setWorkingVisible(true);
+		ctx.ui.setWorkingIndicator({ frames: [] });
+		ctx.ui.setHiddenThinkingLabel("y");
+		ctx.ui.setTitle("z");
+		ctx.ui.pasteToEditor("p");
+		ctx.ui.setEditorText("e");
+		const text = await ctx.ui.getEditorText();
+		const edited = await ctx.ui.editor("t", "p");
+		const unsub = ctx.ui.onTerminalInput(() => ({ consume: true }));
+		const unsubType = typeof unsub;
+		unsub();
+		return { content: [{ type: "text", text: "text=[" + text + "],edited=" + String(edited) + ",unsub=" + unsubType }] };`)
+	res, err := tool.Execute(context.Background(), []byte("{}"))
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	if got := toolResultText(res); got != "text=[],edited=undefined,unsub=function" {
+		t.Fatalf("result=%q want text=[],edited=undefined,unsub=function", got)
+	}
 }

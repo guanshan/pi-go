@@ -1,0 +1,29 @@
+{
+  "max_tokens": 64,
+  "messages": [
+    {
+      "content": [
+        {
+          "text": "describe this",
+          "type": "text"
+        },
+        {
+          "source": {
+            "data": "aGVsbG8=",
+            "media_type": "image/png",
+            "type": "base64"
+          },
+          "type": "image"
+        }
+      ],
+      "role": "user"
+    }
+  ],
+  "model": "claude-image-golden",
+  "system": [
+    {
+      "text": "system prompt",
+      "type": "text"
+    }
+  ]
+}

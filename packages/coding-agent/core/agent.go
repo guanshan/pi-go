@@ -24,6 +24,8 @@ type AgentSession struct {
 	ThinkingLevel         ai.ThinkingLevel
 	Tools                 ToolSet
 	SystemPrompt          string
+	Theme                 ResolvedTheme
+	Keybindings           *KeybindingsManager
 
 	mu                             sync.Mutex
 	streaming                      bool
@@ -48,10 +50,15 @@ type AgentSession struct {
 	sessionListeners               map[uint64]SessionEventListener
 	extensionUIContext             any
 	extensionCommandContextActions any
+	extensionMode                  string
+	extensionTriggerTurnHandler    func(context.Context) error
+	extensionUserMessageHandler    func(context.Context, SendUserMessageOptions) error
+	extensionCustomMessageHandler  func(customType string, content any, details any)
 	extensionAbortHandler          func()
 	extensionShutdownHandler       ShutdownHandler
 	extensionErrorListener         ExtensionErrorListener
 	extensionErrorStop             func()
+	extensionProviderStop          func()
 }
 
 type queuedPrompt struct {
@@ -72,6 +79,8 @@ func NewAgentSession(session *SessionManager, settings *SettingsManager, registr
 		ThinkingLevel:         thinking,
 		Tools:                 tools,
 		SystemPrompt:          systemPrompt,
+		Theme:                 DefaultResolvedTheme(),
+		Keybindings:           NewKeybindingsManager(settings.AgentDir),
 		autoCompactionEnabled: settings.AutoCompactionEnabled(),
 		autoRetryEnabled:      settings.AutoRetryEnabled(),
 		steeringMode:          settings.SteeringMode(),
@@ -206,6 +215,11 @@ func (a *AgentSession) newLoopAgent(sink ai.EventSink, maxLoopHit *bool, persist
 			Tools:         agentTools(a, a.Tools),
 			Messages:      sessionCtx.Messages,
 		},
+		// Without this, the agent loop falls back to defaultConvertToLLM, which
+		// keeps only user/assistant/toolResult and silently drops the typed
+		// compaction/branch/custom/bash messages BuildContext produces — so a
+		// /compact'd session would send the model none of its summarized history.
+		ConvertToLLM:  convertSessionMessagesToLLM,
 		Registry:      a.Registry,
 		SteeringMode:  queueMode(snapshot.SteeringMode),
 		FollowUpMode:  queueMode(snapshot.FollowUpMode),

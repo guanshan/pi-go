@@ -1032,8 +1032,8 @@ func TestAgentHarnessCompactWritesCompactionEntry(t *testing.T) {
 	if len(built.Messages) != 15 || ai.MessageRole(built.Messages[0]) != "compactionSummary" || ai.MessageText(built.Messages[1]) != "msg a" {
 		t.Fatalf("messages=%#v", built.Messages)
 	}
-	custom, ok := ai.AsCustomMessage(built.Messages[0])
-	if !ok || custom.Summary != result.Summary || custom.TokensBefore != 7 {
+	summary, ok := built.Messages[0].(session.CompactionSummaryMessage)
+	if !ok || summary.Summary != result.Summary || summary.TokensBefore != 7 {
 		t.Fatalf("summary=%#v ok=%v", built.Messages[0], ok)
 	}
 }

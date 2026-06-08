@@ -358,6 +358,199 @@ func TestRunRPCNotifyDoesNotRequireUIResponse(t *testing.T) {
 	}
 }
 
+func TestRunRPCSetStatusDoesNotRequireUIResponse(t *testing.T) {
+	runtime := testInteractiveRuntime(t)
+	api := coreext.NewAPI()
+	runtime.Session().extensionRuntime = coreext.NewRunnerWithAPI(api)
+
+	pr, pw := io.Pipe()
+	out := &syncBuffer{}
+	rpcDone := make(chan error, 1)
+	go func() {
+		rpcDone <- RunRPC(context.Background(), runtime, pr, out)
+	}()
+	t.Cleanup(func() {
+		_ = pw.Close()
+		_ = pr.Close()
+	})
+
+	handler := waitForExtensionUIHandler(t, api)
+	result, err := handler(context.Background(), "setStatus", json.RawMessage(`{"key":"build","text":"Building"}`))
+	if err != nil {
+		t.Fatalf("setStatus: %v", err)
+	}
+	if string(result) != "null" {
+		t.Fatalf("setStatus result=%s want null", result)
+	}
+	line := findRPCUIRequestLine(t, out, "setStatus")
+	var req struct {
+		Type       string `json:"type"`
+		Method     string `json:"method"`
+		StatusKey  string `json:"statusKey"`
+		StatusText string `json:"statusText"`
+	}
+	if err := json.Unmarshal([]byte(line), &req); err != nil {
+		t.Fatalf("unmarshal setStatus request: %v", err)
+	}
+	if req.Type != "extension_ui_request" || req.Method != "setStatus" || req.StatusKey != "build" || req.StatusText != "Building" {
+		t.Fatalf("setStatus request not flattened to TS shape: %s", line)
+	}
+	_ = pw.Close()
+	select {
+	case err := <-rpcDone:
+		if err != nil {
+			t.Fatalf("RunRPC returned error: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("RunRPC did not return")
+	}
+}
+
+// TestRPCUIBrokerLightweightMethods verifies the RPC classification of the
+// lightweight ctx.ui.* methods (mirroring TS rpc-mode.ts): getEditorText returns
+// "" synchronously, the working/thinking setters are no-ops that forward nothing,
+// and setTitle / setEditorText / pasteToEditor are fire-and-forget that forward an
+// extension_ui_request and return null.
+func TestRPCUIBrokerLightweightMethods(t *testing.T) {
+	out := &syncBuffer{}
+	b := newRPCUIBroker(&rpcWriter{out: out})
+	ctx := context.Background()
+
+	// getEditorText cannot round-trip synchronously in RPC mode -> "".
+	if res, err := b.handle(ctx, "getEditorText", json.RawMessage(`{}`)); err != nil || string(res) != `""` {
+		t.Fatalf("getEditorText=%s err=%v want \"\"", res, err)
+	}
+
+	// Working/thinking/terminal setters are no-ops in RPC mode.
+	for _, method := range []string{"setWorkingMessage", "setWorkingVisible", "setWorkingIndicator", "setHiddenThinkingLabel", "onTerminalInput"} {
+		res, err := b.handle(ctx, method, json.RawMessage(`{}`))
+		if err != nil || string(res) != "null" {
+			t.Fatalf("%s=%s err=%v want null", method, res, err)
+		}
+	}
+	if got := strings.TrimSpace(out.String()); got != "" {
+		t.Fatalf("no-op methods forwarded host requests: %s", got)
+	}
+
+	// setTitle forwards { method: "setTitle", title } and returns null.
+	if res, err := b.handle(ctx, "setTitle", json.RawMessage(`{"title":"Pi"}`)); err != nil || string(res) != "null" {
+		t.Fatalf("setTitle=%s err=%v want null", res, err)
+	}
+	var title struct {
+		Title string `json:"title"`
+	}
+	if err := json.Unmarshal([]byte(findRPCUIRequestLine(t, out, "setTitle")), &title); err != nil {
+		t.Fatalf("unmarshal setTitle: %v", err)
+	}
+	if title.Title != "Pi" {
+		t.Fatalf("setTitle title=%q want Pi", title.Title)
+	}
+
+	// setEditorText forwards { method: "set_editor_text", text }.
+	if res, err := b.handle(ctx, "setEditorText", json.RawMessage(`{"text":"hello"}`)); err != nil || string(res) != "null" {
+		t.Fatalf("setEditorText=%s err=%v want null", res, err)
+	}
+	var editorText struct {
+		Text string `json:"text"`
+	}
+	if err := json.Unmarshal([]byte(findRPCUIRequestLine(t, out, "set_editor_text")), &editorText); err != nil {
+		t.Fatalf("unmarshal set_editor_text: %v", err)
+	}
+	if editorText.Text != "hello" {
+		t.Fatalf("set_editor_text text=%q want hello", editorText.Text)
+	}
+
+	// pasteToEditor also forwards as set_editor_text (RPC has no paste handling).
+	if res, err := b.handle(ctx, "pasteToEditor", json.RawMessage(`{"text":"world"}`)); err != nil || string(res) != "null" {
+		t.Fatalf("pasteToEditor=%s err=%v want null", res, err)
+	}
+	if c := strings.Count(out.String(), `"set_editor_text"`); c != 2 {
+		t.Fatalf("set_editor_text request count=%d want 2 (setEditorText + pasteToEditor)", c)
+	}
+}
+
+// TestRPCUIBrokerSetWidget verifies ctx.ui.setWidget forwards the TS
+// widgetKey/widgetLines/widgetPlacement shape fire-and-forget (null, no wait),
+// and that an omitted lines array forwards widgetLines:null (remove).
+func TestRPCUIBrokerSetWidget(t *testing.T) {
+	out := &syncBuffer{}
+	b := newRPCUIBroker(&rpcWriter{out: out})
+	ctx := context.Background()
+
+	if res, err := b.handle(ctx, "setWidget", json.RawMessage(`{"key":"k","lines":["a","b"],"placement":"belowEditor"}`)); err != nil || string(res) != "null" {
+		t.Fatalf("setWidget=%s err=%v want null", res, err)
+	}
+	var req struct {
+		WidgetKey       string   `json:"widgetKey"`
+		WidgetLines     []string `json:"widgetLines"`
+		WidgetPlacement string   `json:"widgetPlacement"`
+	}
+	if err := json.Unmarshal([]byte(findRPCUIRequestLine(t, out, "setWidget")), &req); err != nil {
+		t.Fatalf("unmarshal setWidget: %v", err)
+	}
+	if req.WidgetKey != "k" || len(req.WidgetLines) != 2 || req.WidgetLines[0] != "a" || req.WidgetPlacement != "belowEditor" {
+		t.Fatalf("setWidget request=%#v", req)
+	}
+
+	// Remove (no lines) forwards widgetLines:null.
+	out2 := &syncBuffer{}
+	b2 := newRPCUIBroker(&rpcWriter{out: out2})
+	if res, err := b2.handle(ctx, "setWidget", json.RawMessage(`{"key":"k"}`)); err != nil || string(res) != "null" {
+		t.Fatalf("setWidget remove=%s err=%v want null", res, err)
+	}
+	line := findRPCUIRequestLine(t, out2, "setWidget")
+	if !strings.Contains(line, `"widgetLines":null`) {
+		t.Fatalf("remove setWidget should forward widgetLines:null, got %s", line)
+	}
+}
+
+// TestRPCUIBrokerEditorRoundTrip verifies ctx.ui.editor blocks for an
+// extension_ui_response and resolves the edited value.
+func TestRPCUIBrokerEditorRoundTrip(t *testing.T) {
+	out := &syncBuffer{}
+	b := newRPCUIBroker(&rpcWriter{out: out})
+
+	type result struct {
+		raw json.RawMessage
+		err error
+	}
+	done := make(chan result, 1)
+	go func() {
+		raw, err := b.handle(context.Background(), "editor", json.RawMessage(`{"title":"Compose","prefill":"start"}`))
+		done <- result{raw: raw, err: err}
+	}()
+
+	uiID := waitForRPCUIRequest(t, out, "editor")
+
+	// The emitted request carries the TS editor shape.
+	var req struct {
+		Title   string `json:"title"`
+		Prefill string `json:"prefill"`
+	}
+	if err := json.Unmarshal([]byte(findRPCUIRequestLine(t, out, "editor")), &req); err != nil {
+		t.Fatalf("unmarshal editor request: %v", err)
+	}
+	if req.Title != "Compose" || req.Prefill != "start" {
+		t.Fatalf("editor request title=%q prefill=%q", req.Title, req.Prefill)
+	}
+
+	if !b.resolveExtensionUIResponse(uiID, rpcCommand{Value: "edited body"}) {
+		t.Fatalf("resolveExtensionUIResponse(%s) returned false", uiID)
+	}
+
+	select {
+	case got := <-done:
+		if got.err != nil {
+			t.Fatalf("editor handler error: %v", got.err)
+		}
+		if string(got.raw) != `"edited body"` {
+			t.Fatalf("editor result=%s want %q", got.raw, `"edited body"`)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("editor handler did not resolve")
+	}
+}
+
 func waitForExtensionUIHandler(t *testing.T, api *coreext.API) coreext.UIRequestHandler {
 	t.Helper()
 	deadline := time.After(time.Second)

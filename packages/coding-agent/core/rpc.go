@@ -117,11 +117,26 @@ func (b *rpcUIBroker) handle(ctx context.Context, method string, params json.Raw
 	if ctx == nil {
 		ctx = context.Background()
 	}
+
+	// Lightweight ctx.ui.* methods that RPC mode cannot honor, mirroring TS
+	// rpc-mode.ts: getEditorText cannot round-trip synchronously (returns ""),
+	// and the working/thinking setters require TUI loader/render access (no-op).
+	// These never reach the host, so they neither forward nor register a pending
+	// response.
+	switch method {
+	case "getEditorText":
+		return json.RawMessage(`""`), nil
+	case "setWorkingMessage", "setWorkingVisible", "setWorkingIndicator",
+		"setHiddenThinkingLabel", "onTerminalInput":
+		return json.RawMessage("null"), nil
+	}
+
 	b.mu.Lock()
 	b.nextID++
 	uiID := fmt.Sprintf("ui-%d", b.nextID)
+	needsResponse := rpcUINeedsResponse(method)
 	var ch chan extensionUIResult
-	if method != "notify" {
+	if needsResponse {
 		ch = make(chan extensionUIResult, 1)
 		b.pending[uiID] = rpcPendingUI{method: method, ch: ch}
 	}
@@ -134,7 +149,9 @@ func (b *rpcUIBroker) handle(ctx context.Context, method string, params json.Raw
 	// notifyType) so the host sees the same protocol as TS.
 	payload := flattenExtensionUIRequest(uiID, method, params)
 	b.writer.writeLine(payload)
-	if method == "notify" {
+	if !needsResponse {
+		// Fire-and-forget (notify/setStatus/setTitle/setEditorText/pasteToEditor):
+		// the host acts on the request but sends no response.
 		return json.RawMessage("null"), nil
 	}
 
@@ -146,6 +163,18 @@ func (b *rpcUIBroker) handle(ctx context.Context, method string, params json.Raw
 		delete(b.pending, uiID)
 		b.mu.Unlock()
 		return nil, ctx.Err()
+	}
+}
+
+// rpcUINeedsResponse reports which ctx.ui.* methods block on a host
+// extension_ui_response. Everything else is fire-and-forget (TS rpc-mode.ts emits
+// the request and moves on) or handled inline in handle().
+func rpcUINeedsResponse(method string) bool {
+	switch method {
+	case "select", "confirm", "input", "editor":
+		return true
+	default:
+		return false
 	}
 }
 
@@ -195,12 +224,18 @@ func (b *rpcUIBroker) respond(uiID string, result json.RawMessage, err error) bo
 // the TS wire fields (rpc-types.ts RpcExtensionUIRequest).
 func flattenExtensionUIRequest(id, method string, params json.RawMessage) map[string]any {
 	var p struct {
-		Message string          `json:"message"`
-		Choices []string        `json:"choices"`
-		Detail  string          `json:"detail"`
-		Level   string          `json:"level"`
-		Options json.RawMessage `json:"options"`
-		Timeout *int            `json:"timeout"`
+		Message   string          `json:"message"`
+		Choices   []string        `json:"choices"`
+		Detail    string          `json:"detail"`
+		Level     string          `json:"level"`
+		Key       string          `json:"key"`
+		Text      *string         `json:"text"`
+		Title     string          `json:"title"`
+		Prefill   *string         `json:"prefill"`
+		Lines     *[]string       `json:"lines"`
+		Placement string          `json:"placement"`
+		Options   json.RawMessage `json:"options"`
+		Timeout   *int            `json:"timeout"`
 	}
 	if len(params) > 0 {
 		_ = json.Unmarshal(params, &p)
@@ -231,6 +266,41 @@ func flattenExtensionUIRequest(id, method string, params json.RawMessage) map[st
 		out["message"] = p.Message
 		if p.Level != "" {
 			out["notifyType"] = p.Level
+		}
+	case "setStatus":
+		out["statusKey"] = p.Key
+		if p.Text != nil {
+			out["statusText"] = *p.Text
+		} else {
+			out["statusText"] = nil
+		}
+	case "setTitle":
+		out["title"] = p.Title
+	case "setEditorText", "pasteToEditor":
+		// TS rpc-mode emits set_editor_text for both (pasteToEditor falls back to
+		// setEditorText in RPC mode, which has no bracketed-paste handling).
+		out["method"] = "set_editor_text"
+		if p.Text != nil {
+			out["text"] = *p.Text
+		} else {
+			out["text"] = ""
+		}
+	case "editor":
+		out["title"] = p.Title
+		if p.Prefill != nil {
+			out["prefill"] = *p.Prefill
+		}
+	case "setWidget":
+		// TS rpc-mode forwards string[] widgets as widgetKey/widgetLines/
+		// widgetPlacement (nil lines -> null, meaning remove).
+		out["widgetKey"] = p.Key
+		if p.Lines != nil {
+			out["widgetLines"] = *p.Lines
+		} else {
+			out["widgetLines"] = nil
+		}
+		if p.Placement != "" {
+			out["widgetPlacement"] = p.Placement
 		}
 	default:
 		// Unknown methods forward their params verbatim so future host-facing
@@ -292,9 +362,10 @@ func RunRPC(ctx context.Context, runtime *AgentSessionRuntime, in io.Reader, out
 	if err != nil {
 		return err
 	}
+	current.SetExtensionMode("rpc")
 	w := &rpcWriter{out: out}
 	uiBroker := newRPCUIBroker(w)
-	bindRuntimeExtensionUI(runtime, uiBroker.handle)
+	bindRuntimeExtensionUI(runtime, uiBroker.handle, "rpc")
 	defer clearRuntimeExtensionUI(runtime)
 	w.writeLine(current.Session.Header)
 	var wg sync.WaitGroup

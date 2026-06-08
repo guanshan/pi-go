@@ -112,6 +112,17 @@ type customModelsConfig struct {
 	Providers map[string]providerConfig `json:"providers"`
 }
 
+// ProviderModelConfig is the in-memory form of a models.json provider config.
+// It is exported so extension hosts can reuse the same catalog parser when a
+// script calls pi.registerProvider(name, config).
+type ProviderModelConfig = providerConfig
+
+type ProviderModelDefinition = customModelDefinition
+
+type ProviderModelOverride = modelOverride
+
+type PartialModelCost = partialModelCost
+
 type providerConfig struct {
 	Name           string                   `json:"name"`
 	BaseURL        string                   `json:"baseUrl"`
@@ -159,6 +170,16 @@ type partialModelCost struct {
 	Output     *float64 `json:"output"`
 	CacheRead  *float64 `json:"cacheRead"`
 	CacheWrite *float64 `json:"cacheWrite"`
+}
+
+func ModelsFromProviderConfig(provider string, config ProviderModelConfig, builtins []Model) []Model {
+	if strings.TrimSpace(provider) == "" {
+		return nil
+	}
+	if len(builtins) == 0 {
+		builtins = AllKnownModels()
+	}
+	return parseProviderConfigModels(customModelsConfig{Providers: map[string]providerConfig{provider: config}}, builtins)
 }
 
 func parseProviderConfigModels(config customModelsConfig, builtins []Model) []Model {

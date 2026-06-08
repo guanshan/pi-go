@@ -11,7 +11,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
-	"runtime"
 	"strings"
 
 	"github.com/guanshan/pi-go/packages/agent/gitignore"
@@ -73,17 +72,21 @@ func (t GrepTool) Execute(ctx context.Context, raw json.RawMessage, _ ToolUpdate
 		results        []string
 		matchLimit     bool
 		linesTruncated bool
+		fallbackReason string
 	)
 	// Prefer ripgrep (the engine the TypeScript grep tool shells out to) so
 	// look-around/backreference patterns behave identically. Fall back to Go's
 	// RE2 engine only when no rg binary is found.
-	if rgPath, ok := ripgrepFinder(t.BinDir); ok {
-		res, ml, lt, rerr := searchRipgrep(ctx, rgPath, root, info.IsDir(), query)
+	if rg := ripgrepFinder(ctx, t.BinDir); rg.Path != "" {
+		res, ml, lt, rerr := searchRipgrep(ctx, rg.Path, root, info.IsDir(), query)
 		if rerr != nil {
 			return toolError(rerr.Error())
 		}
 		results, matchLimit, linesTruncated = res, ml, lt
 	} else {
+		if t.BinDir != "" {
+			fallbackReason = rgFallbackReason(rg.Diagnostic)
+		}
 		pattern := args.Pattern
 		if args.Literal {
 			pattern = regexp.QuoteMeta(pattern)
@@ -94,22 +97,35 @@ func (t GrepTool) Execute(ctx context.Context, raw json.RawMessage, _ ToolUpdate
 		// Without ripgrep we use Go's regexp package (RE2). RE2 and ripgrep's
 		// default Rust regex engine have the same feature set here (neither supports
 		// look-around or backreferences), but their accept/reject edges and ignore
-		// semantics differ subtly. Surface the engine in compile errors so a pattern
-		// that behaves differently than the TypeScript CLI is explainable.
+		// semantics differ subtly. When rg was expected from a managed bin dir,
+		// surface the fallback in compile errors so behavior is explainable.
 		re, cerr := regexp.Compile(pattern)
 		if cerr != nil {
-			return toolError(fmt.Sprintf("%s\n(ripgrep was not found, so the built-in RE2 engine was used; install ripgrep to match the TypeScript CLI's regex engine)", cerr.Error()))
+			if fallbackReason != "" {
+				return toolError(fmt.Sprintf("%s\n(%s)", cerr.Error(), fallbackReason))
+			}
+			return toolError(cerr.Error())
 		}
 		results, matchLimit, linesTruncated = searchRE2(re, root, info.IsDir(), query)
 	}
 	if len(results) == 0 {
-		return ai.ToolResult{Content: ai.TextBlocks("No matches found")}
+		text := "No matches found"
+		details := map[string]any{}
+		if fallbackReason != "" {
+			text += "\n\n[" + fallbackReason + "]"
+			details["engineFallback"] = fallbackReason
+		}
+		return ai.ToolResult{Content: ai.TextBlocks(text), Details: detailsOrNil(details)}
 	}
 	rawOutput := strings.Join(results, "\n")
 	trunc := TruncateHead(rawOutput, 1<<30, DefaultMaxBytes)
 	text := trunc.Content
 	details := map[string]any{}
 	notices := []string{}
+	if fallbackReason != "" {
+		details["engineFallback"] = fallbackReason
+		notices = append(notices, fallbackReason)
+	}
 	if matchLimit {
 		details["matchLimitReached"] = limit
 		notices = append(notices, fmt.Sprintf("%d matches limit reached. Use limit=%d for more, or refine pattern", limit, limit*2))
@@ -141,26 +157,15 @@ type grepQuery struct {
 
 // ripgrepFinder resolves the rg binary; it is a package var so tests can force
 // the RE2 fallback path.
-var ripgrepFinder = findRipgrep
+var ripgrepFinder = func(ctx context.Context, binDir string) managedToolResult {
+	return resolveManagedTool(ctx, managedToolRG, binDir)
+}
 
-// findRipgrep locates the rg binary, preferring the agent bin dir (where it may
-// be vendored) and falling back to PATH. It returns ("", false) when rg is
-// unavailable, which routes the grep tool to its RE2 fallback.
-func findRipgrep(binDir string) (string, bool) {
-	name := "rg"
-	if runtime.GOOS == "windows" {
-		name = "rg.exe"
+func rgFallbackReason(diagnostic string) string {
+	if strings.TrimSpace(diagnostic) != "" {
+		return diagnostic + "; the built-in RE2 engine was used"
 	}
-	if binDir != "" {
-		candidate := filepath.Join(binDir, name)
-		if info, err := os.Stat(candidate); err == nil && !info.IsDir() {
-			return candidate, true
-		}
-	}
-	if path, err := exec.LookPath(name); err == nil && path != "" {
-		return path, true
-	}
-	return "", false
+	return "ripgrep was not found, so the built-in RE2 engine was used; install ripgrep to match the TypeScript CLI's regex engine"
 }
 
 // rgEvent is the subset of ripgrep's --json event stream we consume.

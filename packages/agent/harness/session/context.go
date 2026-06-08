@@ -95,7 +95,7 @@ func appendContextMessage(out *Context, entry Entry) {
 }
 
 func createBranchSummaryMessage(summary, fromID, timestamp string) agent.AgentMessage {
-	return ai.CustomMessage{
+	return BranchSummaryMessage{
 		Role:        "branchSummary",
 		Summary:     summary,
 		FromID:      fromID,
@@ -104,7 +104,7 @@ func createBranchSummaryMessage(summary, fromID, timestamp string) agent.AgentMe
 }
 
 func createCompactionSummaryMessage(summary string, tokensBefore int, timestamp string) agent.AgentMessage {
-	return ai.CustomMessage{
+	return CompactionSummaryMessage{
 		Role:         "compactionSummary",
 		Summary:      summary,
 		TokensBefore: tokensBefore,
@@ -113,7 +113,7 @@ func createCompactionSummaryMessage(summary string, tokensBefore int, timestamp 
 }
 
 func createCustomMessage(customType string, content any, display bool, details any, timestamp string) agent.AgentMessage {
-	return ai.CustomMessage{
+	return CustomSessionMessage{
 		Role:        "custom",
 		CustomType:  customType,
 		Content:     content,
@@ -121,6 +121,57 @@ func createCustomMessage(customType string, content any, display bool, details a
 		Details:     details,
 		TimestampMs: parseMessageTimestamp(timestamp),
 	}
+}
+
+type BranchSummaryMessage struct {
+	Role        string `json:"role,omitempty"`
+	Summary     string `json:"summary,omitempty"`
+	FromID      string `json:"fromId,omitempty"`
+	TimestampMs int64  `json:"timestamp,omitempty"`
+}
+
+func (m BranchSummaryMessage) MessageRole() string { return "branchSummary" }
+func (m BranchSummaryMessage) Timestamp() int64    { return m.TimestampMs }
+func (m BranchSummaryMessage) ContentBlocks() []ai.ContentBlock {
+	return ai.TextBlocks(m.Summary)
+}
+func (m BranchSummaryMessage) ProviderContentBlocks() []ai.ContentBlock {
+	return ai.TextBlocks(ai.BranchSummaryText(m.Summary))
+}
+
+type CompactionSummaryMessage struct {
+	Role         string `json:"role,omitempty"`
+	Summary      string `json:"summary,omitempty"`
+	TokensBefore int    `json:"tokensBefore,omitempty"`
+	TimestampMs  int64  `json:"timestamp,omitempty"`
+}
+
+func (m CompactionSummaryMessage) MessageRole() string { return "compactionSummary" }
+func (m CompactionSummaryMessage) Timestamp() int64    { return m.TimestampMs }
+func (m CompactionSummaryMessage) ContentBlocks() []ai.ContentBlock {
+	return ai.TextBlocks(m.Summary)
+}
+func (m CompactionSummaryMessage) ProviderContentBlocks() []ai.ContentBlock {
+	return ai.TextBlocks(ai.CompactionSummaryText(m.Summary))
+}
+
+type CustomSessionMessage struct {
+	Role        string `json:"role,omitempty"`
+	CustomType  string `json:"customType,omitempty"`
+	Content     any    `json:"content,omitempty"`
+	Display     bool   `json:"display,omitempty"`
+	Details     any    `json:"details,omitempty"`
+	TimestampMs int64  `json:"timestamp,omitempty"`
+}
+
+func (m CustomSessionMessage) MessageRole() string { return "custom" }
+func (m CustomSessionMessage) Timestamp() int64    { return m.TimestampMs }
+func (m CustomSessionMessage) ContentBlocks() []ai.ContentBlock {
+	blocks, _ := ai.CustomContentBlocks(m.Content)
+	return blocks
+}
+func (m CustomSessionMessage) ProviderContentBlocks() []ai.ContentBlock {
+	return m.ContentBlocks()
 }
 
 func parseMessageTimestamp(timestamp string) int64 {

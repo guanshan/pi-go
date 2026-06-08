@@ -214,8 +214,12 @@ type ExtensionErrorListener func(error)
 type ShutdownHandler func(context.Context) error
 
 type ExtensionBindings struct {
+	Mode                  string
 	UIContext             any
 	CommandContextActions any
+	TriggerTurnHandler    func(context.Context) error
+	UserMessageHandler    func(context.Context, SendUserMessageOptions) error
+	CustomMessageHandler  func(customType string, content any, details any)
 	AbortHandler          func()
 	ShutdownHandler       ShutdownHandler
 	OnError               ExtensionErrorListener
@@ -372,10 +376,10 @@ func (a *AgentSession) promptOnce(ctx context.Context, text string, images []ai.
 
 // currentLeaf returns the current branch leaf id ("" for an empty session).
 func (a *AgentSession) currentLeaf() string {
-	if a.Session == nil || a.Session.CurrentID == nil {
+	if a.Session == nil {
 		return ""
 	}
-	return *a.Session.CurrentID
+	return a.Session.CurrentLeafID()
 }
 
 func (a *AgentSession) retryablePromptError(messages []agentcore.AgentMessage, maxLoopHit bool) string {
@@ -923,7 +927,7 @@ func (a *AgentSession) ExecuteBash(ctx context.Context, command string, opts Bas
 	}
 	// Prepend the agent bin directory to PATH so migrated/installed tools (fd,
 	// rg, package CLIs) resolve, mirroring the bash tool and getShellEnv() in TS.
-	cmd.Env = catools.ShellEnv(BinDir())
+	cmd.Env = catools.ShellEnv(agentSessionBinDir(a))
 	// Run in a dedicated process group and kill the whole tree on cancel, so
 	// AbortBash / signal shutdown terminates detached children too, not just the
 	// shell. Mirrors the bash tool's wiring (see ConfigureTreeKill).

@@ -34,6 +34,11 @@ func RunPrintMode(ctx context.Context, runtime *AgentSessionRuntime, mode cli.Mo
 	if err != nil {
 		return 1, err
 	}
+	extensionMode := "print"
+	if mode == cli.ModeJSON {
+		extensionMode = "json"
+	}
+	agent.SetExtensionMode(extensionMode)
 	turns := promptTurns(message, images, remainingMessages...)
 	if len(turns) == 0 {
 		return 0, nil
@@ -93,6 +98,9 @@ func printFinalAssistantText(agent *AgentSession, stdout, stderr io.Writer) int 
 
 func RunInteractiveMode(ctx context.Context, runtime *AgentSessionRuntime, initial string, images []ai.ContentBlock, stdin io.Reader, stdout, stderr io.Writer, remainingMessages ...[]string) error {
 	remaining := flattenPromptMessages(remainingMessages...)
+	if agent, err := runtimeAgent(runtime); err == nil {
+		agent.SetExtensionMode("tui")
+	}
 	showStartupChangelog(runtime, stdout)
 	if shouldRunBubbleInteractive(stdin, stdout) {
 		return runBubbleInteractiveMode(ctx, runtime, initial, images, stdin, stdout, stderr, remaining...)
@@ -134,7 +142,7 @@ func runLineInteractiveMode(ctx context.Context, runtime *AgentSessionRuntime, i
 	}
 	scanner := bufio.NewScanner(stdin)
 	uiHandler := newLineExtensionUIHandler(scanner, stdout)
-	bindRuntimeExtensionUI(runtime, uiHandler)
+	bindRuntimeExtensionUI(runtime, uiHandler, "tui")
 	defer clearRuntimeExtensionUI(runtime)
 	currentModel := agent.CurrentModel()
 	fmt.Fprintln(stdout, tui.TruncateToWidth(fmt.Sprintf("pi-go %s  cwd=%s  model=%s/%s", Version, agent.Session.CWD(), currentModel.Provider, currentModel.ID), 120, "..."))
@@ -202,14 +210,14 @@ func runLineInteractiveMode(ctx context.Context, runtime *AgentSessionRuntime, i
 		if strings.HasPrefix(line, "!") {
 			exclude := strings.HasPrefix(line, "!!")
 			command := strings.TrimSpace(strings.TrimPrefix(strings.TrimPrefix(line, "!"), "!"))
-			result := (catools.BashTool{CWD: agent.Session.CWD(), BinDir: BinDir()}).Execute(ctx, mustJSON(map[string]any{"command": command}), nil)
+			result := (catools.BashTool{CWD: agent.Session.CWD(), BinDir: agentSessionBinDir(agent)}).Execute(ctx, mustJSON(map[string]any{"command": command}), nil)
 			text := ai.MessageText(ai.ToolResultMessage{Content: result.Content})
 			fmt.Fprintln(stdout, text)
 			exit := 0
 			if result.IsError {
 				exit = 1
 			}
-			_ = agent.Session.Append(SessionEntry{Type: "message", Message: ai.CustomMessage{Role: "bashExecution", Command: command, Output: text, ExitCode: &exit, ExcludeFromContext: exclude}})
+			_ = agent.Session.Append(SessionEntry{Type: "message", Message: BashExecutionMessage{Role: "bashExecution", Command: command, Output: text, ExitCode: &exit, ExcludeFromContext: exclude}})
 			continue
 		}
 		if err := interactivePrompt(ctx, agent, line, nil, stdout, stderr); err != nil {
@@ -253,7 +261,7 @@ func runtimeAgent(runtime *AgentSessionRuntime) (*AgentSession, error) {
 	return runtime.Session(), nil
 }
 
-func bindRuntimeExtensionUI(runtime *AgentSessionRuntime, handler coreext.UIRequestHandler) {
+func bindRuntimeExtensionUI(runtime *AgentSessionRuntime, handler coreext.UIRequestHandler, mode string) {
 	if runtime == nil {
 		return
 	}
@@ -264,11 +272,13 @@ func bindRuntimeExtensionUI(runtime *AgentSessionRuntime, handler coreext.UIRequ
 	})
 	runtime.SetRebindSession(func(agent *AgentSession) error {
 		if agent != nil {
+			agent.SetExtensionMode(mode)
 			agent.SetExtensionUIHandler(handler)
 		}
 		return nil
 	})
 	if agent := runtime.Session(); agent != nil {
+		agent.SetExtensionMode(mode)
 		agent.SetExtensionUIHandler(handler)
 	}
 }
@@ -346,6 +356,22 @@ func parseExtensionUIPrompt(method string, params json.RawMessage) extensionUIPr
 	return prompt
 }
 
+func parseExtensionUIStatus(params json.RawMessage) (string, *string) {
+	var payload struct {
+		Key  string  `json:"key"`
+		Text *string `json:"text"`
+	}
+	if len(params) > 0 {
+		_ = json.Unmarshal(params, &payload)
+	}
+	key := strings.TrimSpace(payload.Key)
+	if payload.Text == nil {
+		return key, nil
+	}
+	text := strings.TrimSpace(*payload.Text)
+	return key, &text
+}
+
 func extensionUIChoiceLabel(raw json.RawMessage) string {
 	var text string
 	if json.Unmarshal(raw, &text) == nil {
@@ -383,6 +409,8 @@ func newLineExtensionUIHandler(scanner *bufio.Scanner, stdout io.Writer) coreext
 		}
 		prompt := parseExtensionUIPrompt(method, params)
 		switch method {
+		case "setStatus":
+			return json.RawMessage("null"), nil
 		case "notify":
 			if stdout != nil {
 				level := firstNonEmpty(prompt.Level, "info")
@@ -516,7 +544,7 @@ func handleSlashWithPrompt(ctx context.Context, target any, line string, prompte
 	case "quit", "exit", "q":
 		return true, nil
 	case "help", "hotkeys":
-		fmt.Fprintln(stdout, slashHelp())
+		fmt.Fprintln(stdout, slashHelp(agent))
 	case "session":
 		raw, _ := json.MarshalIndent(agent.Session.Stats(), "", "  ")
 		fmt.Fprintln(stdout, string(raw))
@@ -907,8 +935,8 @@ func slashTarget(target any) (*AgentSessionRuntime, *AgentSession, error) {
 	}
 }
 
-func slashHelp() string {
-	return `/login [provider key]  List auth status or save an API key
+func slashHelp(agent *AgentSession) string {
+	base := `/login [provider key]  List auth status or save an API key
 /logout <provider>    Remove stored provider credentials
 /model [provider/id]  List or switch models
 /scoped-models        List configured models
@@ -929,6 +957,83 @@ func slashHelp() string {
 /reload               Reload session resources
 /hotkeys, /help       Show commands
 /quit                 Quit`
+	if shortcuts := extensionShortcutHelp(agent); shortcuts != "" {
+		base += "\n\nExtension shortcuts:\n" + shortcuts
+	}
+	return base
+}
+
+func extensionShortcutHelp(agent *AgentSession) string {
+	if agent == nil || agent.extensionRuntime == nil {
+		return ""
+	}
+	shortcuts, _ := resolveExtensionShortcuts(agent.extensionRuntime, agent.Keybindings)
+	var lines []string
+	for _, shortcut := range shortcuts {
+		description := strings.TrimSpace(firstNonEmpty(shortcut.shortcut.Description, shortcut.shortcut.Source, "extension shortcut"))
+		lines = append(lines, fmt.Sprintf("%-18s %s", formatHotkeyDisplay(shortcut.key), description))
+	}
+	return strings.Join(lines, "\n")
+}
+
+func formatHotkeyDisplay(key string) string {
+	normalized, ok := normalizeKeyID(key)
+	if ok {
+		key = normalized
+	}
+	parts := strings.Split(key, "+")
+	for i, part := range parts {
+		parts[i] = formatHotkeyPart(part)
+	}
+	return strings.Join(parts, "+")
+}
+
+func formatHotkeyPart(part string) string {
+	switch part {
+	case "ctrl":
+		return "Ctrl"
+	case "alt":
+		return "Alt"
+	case "shift":
+		return "Shift"
+	case "super":
+		return "Super"
+	case "escape":
+		return "Esc"
+	case "pageup":
+		return "PageUp"
+	case "pagedown":
+		return "PageDown"
+	case "backspace":
+		return "Backspace"
+	case "delete":
+		return "Delete"
+	case "insert":
+		return "Insert"
+	case "enter":
+		return "Enter"
+	case "tab":
+		return "Tab"
+	case "space":
+		return "Space"
+	case "home":
+		return "Home"
+	case "end":
+		return "End"
+	case "up":
+		return "Up"
+	case "down":
+		return "Down"
+	case "left":
+		return "Left"
+	case "right":
+		return "Right"
+	default:
+		if len(part) == 1 {
+			return strings.ToUpper(part)
+		}
+		return part
+	}
 }
 
 func parseLoginArgs(arg string) (provider string, key string, err error) {

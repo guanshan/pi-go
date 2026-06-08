@@ -13,6 +13,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/guanshan/pi-go/packages/ai"
@@ -169,6 +170,7 @@ type SessionInfo struct {
 }
 
 type SessionManager struct {
+	mu        sync.RWMutex
 	Header    SessionHeader
 	Path      string
 	InMemory  bool
@@ -354,6 +356,9 @@ func openSessionNoRewrite(path, fallbackCWD string) (*SessionManager, error) {
 // recomputeCurrentID sets CurrentID to the last tree entry that carries an id,
 // reflecting the leaf of the active branch after a (possibly migrating) load.
 func (s *SessionManager) recomputeCurrentID() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	s.CurrentID = nil
 	for i := range s.Entries {
 		if s.Entries[i].ID != "" && treeEntry(s.Entries[i].Type) {
@@ -414,6 +419,9 @@ func ForkSessionWithID(sourcePath, cwd, sessionDir, id string) (*SessionManager,
 }
 
 func (s *SessionManager) CWD() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
 	if s.cwdOverride != "" {
 		return s.cwdOverride
 	}
@@ -423,14 +431,23 @@ func (s *SessionManager) CWD() string {
 // OverrideCWD makes CWD() report cwd at runtime without persisting it to the
 // session file. Used to continue a session whose recorded cwd no longer exists.
 func (s *SessionManager) OverrideCWD(cwd string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	s.cwdOverride = cwd
 }
 
 func (s *SessionManager) SessionID() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
 	return s.Header.ID
 }
 
 func (s *SessionManager) File() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
 	if s.InMemory {
 		return ""
 	}
@@ -438,36 +455,49 @@ func (s *SessionManager) File() string {
 }
 
 func (s *SessionManager) writeHeader() error {
-	if s.InMemory {
+	s.mu.RLock()
+	inMemory := s.InMemory
+	path := s.Path
+	header := s.Header
+	s.mu.RUnlock()
+
+	if inMemory {
 		return nil
 	}
-	if err := os.MkdirAll(filepath.Dir(s.Path), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}
-	file, err := os.OpenFile(s.Path, os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0o600)
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0o600)
 	if err != nil {
 		return err
 	}
 	defer file.Close()
-	return writeJSONLine(file, s.Header)
+	return writeJSONLine(file, header)
 }
 
 func (s *SessionManager) rewrite() (*SessionManager, error) {
-	if s.InMemory {
+	s.mu.RLock()
+	inMemory := s.InMemory
+	path := s.Path
+	header := s.Header
+	entries := append([]SessionEntry(nil), s.Entries...)
+	s.mu.RUnlock()
+
+	if inMemory {
 		return s, nil
 	}
-	if err := os.MkdirAll(filepath.Dir(s.Path), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return nil, err
 	}
-	file, err := os.OpenFile(s.Path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
 	if err != nil {
 		return nil, err
 	}
 	defer file.Close()
-	if err := writeJSONLine(file, s.Header); err != nil {
+	if err := writeJSONLine(file, header); err != nil {
 		return nil, err
 	}
-	for _, entry := range s.Entries {
+	for _, entry := range entries {
 		if err := writeJSONLine(file, entry); err != nil {
 			return nil, err
 		}
@@ -482,8 +512,15 @@ func (s *SessionManager) Append(entry SessionEntry) error {
 	if entry.Timestamp == "" {
 		entry.Timestamp = time.Now().UTC().Format(time.RFC3339Nano)
 	}
+
+	s.mu.Lock()
 	if treeEntry(entry.Type) {
-		entry.ParentID = s.CurrentID
+		if s.CurrentID != nil {
+			parent := *s.CurrentID
+			entry.ParentID = &parent
+		} else {
+			entry.ParentID = nil
+		}
 		id := entry.ID
 		s.CurrentID = &id
 	}
@@ -491,10 +528,14 @@ func (s *SessionManager) Append(entry SessionEntry) error {
 		entry.FromHookSet = true
 	}
 	s.Entries = append(s.Entries, entry)
-	if s.InMemory {
+	inMemory := s.InMemory
+	path := s.Path
+	s.mu.Unlock()
+
+	if inMemory {
 		return nil
 	}
-	file, err := os.OpenFile(s.Path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
 	if err != nil {
 		return err
 	}
@@ -518,18 +559,81 @@ func (s *SessionManager) AppendSessionName(name string) error {
 	return s.Append(SessionEntry{Type: "session_info", Name: name})
 }
 
-func (s *SessionManager) Branch() []SessionEntry {
-	if s.CurrentID == nil {
+// EntriesSnapshot returns a copy of the session entries taken under the read
+// lock, so callers can read the tree without racing a concurrent Append.
+func (s *SessionManager) EntriesSnapshot() []SessionEntry {
+	if s == nil {
 		return nil
 	}
-	byID := map[string]SessionEntry{}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return append([]SessionEntry(nil), s.Entries...)
+}
+
+// CurrentLeafID returns the id of the active branch leaf ("" when the session
+// is empty) under the read lock.
+func (s *SessionManager) CurrentLeafID() string {
+	if s == nil {
+		return ""
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.CurrentID == nil {
+		return ""
+	}
+	return *s.CurrentID
+}
+
+// Snapshot returns a consistent copy of the session header, entries, and current
+// leaf pointer under the read lock.
+func (s *SessionManager) Snapshot() (SessionHeader, []SessionEntry, *string) {
+	if s == nil {
+		return SessionHeader{}, nil, nil
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	header := s.Header
+	entries := append([]SessionEntry(nil), s.Entries...)
+	var leaf *string
+	if s.CurrentID != nil {
+		id := *s.CurrentID
+		leaf = &id
+	}
+	return header, entries, leaf
+}
+
+func (s *SessionManager) HasEntry(id string) bool {
+	if s == nil || id == "" {
+		return false
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	for _, entry := range s.Entries {
+		if entry.ID == id {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *SessionManager) Branch() []SessionEntry {
+	s.mu.RLock()
+	if s.CurrentID == nil {
+		s.mu.RUnlock()
+		return nil
+	}
+	currentID := *s.CurrentID
+	entries := append([]SessionEntry(nil), s.Entries...)
+	s.mu.RUnlock()
+
+	byID := map[string]SessionEntry{}
+	for _, entry := range entries {
 		if entry.ID != "" {
 			byID[entry.ID] = entry
 		}
 	}
 	var branch []SessionEntry
-	id := *s.CurrentID
+	id := currentID
 	for id != "" {
 		entry, ok := byID[id]
 		if !ok {
@@ -618,7 +722,7 @@ func appendContextEntryMessage(ctx *SessionContext, entry SessionEntry) {
 		}
 	case "branch_summary":
 		if entry.Summary != "" {
-			ctx.Messages = append(ctx.Messages, ai.CustomMessage{
+			ctx.Messages = append(ctx.Messages, BranchSummaryMessage{
 				Role:        "branchSummary",
 				Summary:     entry.Summary,
 				FromID:      entry.FromID,
@@ -626,7 +730,7 @@ func appendContextEntryMessage(ctx *SessionContext, entry SessionEntry) {
 			})
 		}
 	case "custom_message":
-		ctx.Messages = append(ctx.Messages, ai.CustomMessage{
+		ctx.Messages = append(ctx.Messages, CustomSessionMessage{
 			Role:        "custom",
 			CustomType:  entry.CustomType,
 			Content:     entry.Content,
@@ -638,7 +742,7 @@ func appendContextEntryMessage(ctx *SessionContext, entry SessionEntry) {
 }
 
 func compactionSummaryMessage(entry SessionEntry) ai.Message {
-	return ai.CustomMessage{
+	return CompactionSummaryMessage{
 		Role:         "compactionSummary",
 		Summary:      entry.Summary,
 		TokensBefore: entry.TokensBefore,

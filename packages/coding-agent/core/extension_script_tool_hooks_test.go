@@ -199,14 +199,10 @@ func TestScriptExtensionOverridesToolResult(t *testing.T) {
 	}
 }
 
-// TestScriptExtensionUnsupportedAPIsFailFast verifies that calling an
-// unsupported bridge API (registerProvider / registerMessageRenderer /
-// addAutocompleteProvider) fails loading with a clear error instead of silently
-// being undefined.
-// TestScriptExtensionUnsupportedAPIsDegradeGracefully verifies that the
-// unsupported registration APIs warn and skip instead of failing the whole
-// extension load (4.md): the extension still loads and any tools it registers
-// after the unsupported call survive.
+// TestScriptExtensionUnsupportedAPIsDegradeGracefully verifies that unsupported
+// registration APIs and malformed provider/autocomplete definitions warn and
+// skip instead of failing the whole extension load (4.md): the extension still
+// loads and any tools it registers after the skipped call survive.
 func TestScriptExtensionUnsupportedAPIsDegradeGracefully(t *testing.T) {
 	if _, err := exec.LookPath("node"); err != nil {
 		t.Skip("node not available")
@@ -215,9 +211,9 @@ func TestScriptExtensionUnsupportedAPIsDegradeGracefully(t *testing.T) {
 		name string
 		call string
 	}{
-		{"registerProvider", `pi.registerProvider("x", {});`},
-		{"registerMessageRenderer", `pi.registerMessageRenderer("x", {});`},
-		{"addAutocompleteProvider", `pi.addAutocompleteProvider(() => {});`},
+		{"malformedRegisterProvider", `pi.registerProvider("x", {});`},
+		{"malformedRegisterMessageRenderer", `pi.registerMessageRenderer("x", {});`},
+		{"invalidAutocompleteProvider", `pi.addAutocompleteProvider(() => []);`},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -230,6 +226,16 @@ func TestScriptExtensionUnsupportedAPIsDegradeGracefully(t *testing.T) {
 			t.Cleanup(func() { _ = runtime.Shutdown(context.Background()) })
 			if len(errs) != 0 {
 				t.Fatalf("expected graceful load (no errors) for %s, got: %v", tc.name, errs)
+			}
+			if tc.name == "malformedRegisterProvider" {
+				if providers := runtime.RegisteredProviders(); len(providers) != 0 {
+					t.Fatalf("malformed provider should not register: %#v", providers)
+				}
+			}
+			if tc.name == "malformedRegisterMessageRenderer" {
+				if renderers := runtime.RegisteredMessageRenderers(); len(renderers) != 0 {
+					t.Fatalf("malformed message renderer should not register: %#v", renderers)
+				}
 			}
 			found := false
 			for _, tool := range runtime.API.SnapshotTools() {

@@ -20,10 +20,7 @@ func (a *AgentSession) NavigateTree(ctx context.Context, targetID string, opts N
 	if a == nil || a.Session == nil {
 		return NavigateTreeResult{}, fmt.Errorf("session is nil")
 	}
-	oldLeaf := ""
-	if a.Session.CurrentID != nil {
-		oldLeaf = *a.Session.CurrentID
-	}
+	oldLeaf := a.Session.CurrentLeafID()
 	resolvedTargetID := targetID
 	if targetID != "" {
 		var err error
@@ -77,10 +74,7 @@ func (a *AgentSession) NavigateTree(ctx context.Context, targetID string, opts N
 	if err := a.Session.SetLeaf(resolvedTargetID); err != nil {
 		return NavigateTreeResult{}, err
 	}
-	result := NavigateTreeResult{OldLeafID: oldLeaf}
-	if a.Session.CurrentID != nil {
-		result.NewLeafID = *a.Session.CurrentID
-	}
+	result := NavigateTreeResult{OldLeafID: oldLeaf, NewLeafID: a.Session.CurrentLeafID()}
 	if opts.Label != "" && result.NewLeafID != "" {
 		if err := a.Session.Append(SessionEntry{Type: "label", TargetID: result.NewLeafID, Label: opts.Label}); err != nil {
 			return NavigateTreeResult{}, err
@@ -258,10 +252,11 @@ func (a *AgentSession) ExportToJsonl(outputPath string) (string, error) {
 		return "", err
 	}
 	defer file.Close()
-	if err := writeJSONLine(file, a.Session.Header); err != nil {
+	header, entries, _ := a.Session.Snapshot()
+	if err := writeJSONLine(file, header); err != nil {
 		return "", err
 	}
-	for _, entry := range a.Session.Entries {
+	for _, entry := range entries {
 		if err := writeJSONLine(file, entry); err != nil {
 			return "", err
 		}

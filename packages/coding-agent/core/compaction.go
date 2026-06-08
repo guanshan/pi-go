@@ -459,21 +459,19 @@ func compactionMessageFromEntry(entry SessionEntry, includeCompaction bool) (ai.
 		if entry.Message == nil {
 			return nil, false
 		}
-		if !includeCompaction {
-			if custom, ok := ai.AsCustomMessage(entry.Message); ok && custom.Role == "compactionSummary" {
-				return nil, false
-			}
+		if !includeCompaction && ai.MessageRole(entry.Message) == "compactionSummary" {
+			return nil, false
 		}
 		return entry.Message, true
 	case "custom_message":
-		return ai.CustomMessage{Role: "custom", CustomType: entry.CustomType, Content: entry.Content, Display: entry.Display, Details: entry.Details, TimestampMs: sessionEntryTimestamp(entry.Timestamp)}, true
+		return CustomSessionMessage{Role: "custom", CustomType: entry.CustomType, Content: entry.Content, Display: entry.Display, Details: entry.Details, TimestampMs: sessionEntryTimestamp(entry.Timestamp)}, true
 	case "branch_summary":
-		return ai.CustomMessage{Role: "branchSummary", Summary: entry.Summary, FromID: entry.FromID, TimestampMs: sessionEntryTimestamp(entry.Timestamp)}, true
+		return BranchSummaryMessage{Role: "branchSummary", Summary: entry.Summary, FromID: entry.FromID, TimestampMs: sessionEntryTimestamp(entry.Timestamp)}, true
 	case "compaction":
 		if !includeCompaction {
 			return nil, false
 		}
-		return ai.CustomMessage{Role: "compactionSummary", Summary: entry.Summary, TokensBefore: entry.TokensBefore, TimestampMs: sessionEntryTimestamp(entry.Timestamp)}, true
+		return CompactionSummaryMessage{Role: "compactionSummary", Summary: entry.Summary, TokensBefore: entry.TokensBefore, TimestampMs: sessionEntryTimestamp(entry.Timestamp)}, true
 	default:
 		return nil, false
 	}
@@ -511,8 +509,8 @@ func estimateCompactionMessageTokens(message ai.Message) int {
 	case "toolResult", "custom":
 		return int(math.Ceil(float64(estimateTextAndImageChars(ai.MessageBlocks(message))) / 4.0))
 	case "branchSummary", "compactionSummary":
-		if custom, ok := ai.AsCustomMessage(message); ok {
-			return int(math.Ceil(float64(len(custom.Summary)) / 4.0))
+		if summary, ok := sessionSummaryText(message); ok {
+			return int(math.Ceil(float64(len(summary)) / 4.0))
 		}
 	}
 	return 0
@@ -639,12 +637,12 @@ func serializeConversation(messages []ai.Message) string {
 				parts = append(parts, "[Tool result]: "+truncateCompactionText(text, toolResultSummaryMaxChars))
 			}
 		case "branchSummary", "compactionSummary":
-			if custom, ok := ai.AsCustomMessage(msg); ok && strings.TrimSpace(custom.Summary) != "" {
+			if summary, ok := sessionSummaryText(msg); ok && strings.TrimSpace(summary) != "" {
 				label := "[Context summary]: "
-				if custom.Role == "branchSummary" {
+				if ai.MessageRole(msg) == "branchSummary" {
 					label = "[Branch summary]: "
 				}
-				parts = append(parts, label+custom.Summary)
+				parts = append(parts, label+summary)
 			}
 		case "custom":
 			if text := strings.TrimSpace(ai.MessageText(msg)); text != "" {
@@ -653,6 +651,31 @@ func serializeConversation(messages []ai.Message) string {
 		}
 	}
 	return strings.Join(parts, "\n\n")
+}
+
+func sessionSummaryText(message ai.Message) (string, bool) {
+	switch m := message.(type) {
+	case BranchSummaryMessage:
+		return m.Summary, true
+	case *BranchSummaryMessage:
+		if m == nil {
+			return "", false
+		}
+		return m.Summary, true
+	case CompactionSummaryMessage:
+		return m.Summary, true
+	case *CompactionSummaryMessage:
+		if m == nil {
+			return "", false
+		}
+		return m.Summary, true
+	default:
+		custom, ok := ai.AsCustomMessage(message)
+		if !ok {
+			return "", false
+		}
+		return custom.Summary, true
+	}
 }
 
 func truncateCompactionText(text string, maxChars int) string {

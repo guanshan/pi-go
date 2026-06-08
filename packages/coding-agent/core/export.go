@@ -71,11 +71,13 @@ func defaultExportPath(inputPath string) string {
 }
 
 func generateSessionHTML(sm *SessionManager) (string, error) {
+	header, entries, leaf := sm.Snapshot()
+	snapshot := &SessionManager{Header: header, Entries: entries, CurrentID: leaf}
 	data := exportSessionData{
-		Header:  sm.Header,
-		Entries: sm.Entries,
-		LeafID:  sm.CurrentID,
-		Stats:   computeExportStats(sm.Entries),
+		Header:  header,
+		Entries: entries,
+		LeafID:  leaf,
+		Stats:   computeExportStats(entries),
 		Version: Version,
 	}
 	raw, err := json.Marshal(data)
@@ -84,12 +86,16 @@ func generateSessionHTML(sm *SessionManager) (string, error) {
 	}
 	encoded := base64.StdEncoding.EncodeToString(raw)
 
-	labelByTarget := collectExportLabels(sm.Entries)
-	toolResults := collectExportToolResults(sm.Entries)
+	labelByTarget := collectExportLabels(entries)
+	toolResults := collectExportToolResults(entries)
 	branchIDs := map[string]bool{}
-	for _, entry := range sm.Branch() {
-		if entry.ID != "" {
-			branchIDs[entry.ID] = true
+	if leaf != nil {
+		if branch, err := branchFromResolvedEntries(entries, *leaf); err == nil {
+			for _, entry := range branch {
+				if entry.ID != "" {
+					branchIDs[entry.ID] = true
+				}
+			}
 		}
 	}
 
@@ -97,20 +103,20 @@ func generateSessionHTML(sm *SessionManager) (string, error) {
 	b.WriteString("<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n")
 	b.WriteString("  <meta charset=\"UTF-8\">\n")
 	b.WriteString("  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">\n")
-	fmt.Fprintf(&b, "  <meta name=\"pi-session-id\" content=\"%s\">\n", html.EscapeString(sm.Header.ID))
+	fmt.Fprintf(&b, "  <meta name=\"pi-session-id\" content=\"%s\">\n", html.EscapeString(header.ID))
 	b.WriteString("  <meta name=\"pi-share-base-url\" content=\"\">\n")
-	fmt.Fprintf(&b, "  <title>Pi Session %s</title>\n", html.EscapeString(shortExportID(sm.Header.ID)))
+	fmt.Fprintf(&b, "  <title>Pi Session %s</title>\n", html.EscapeString(shortExportID(header.ID)))
 	b.WriteString("  <style>\n")
 	b.WriteString(exportHTMLCSS())
 	b.WriteString("  </style>\n</head>\n<body>\n")
 	b.WriteString("  <div id=\"app\">\n")
-	renderExportSidebar(&b, sm, labelByTarget, branchIDs)
+	renderExportSidebar(&b, snapshot, labelByTarget, branchIDs)
 	b.WriteString("    <main id=\"content\">\n")
 	b.WriteString("      <div id=\"header-container\">")
-	renderExportHeader(&b, sm, data.Stats)
+	renderExportHeader(&b, snapshot, data.Stats)
 	b.WriteString("</div>\n")
 	b.WriteString("      <div id=\"messages\">\n")
-	for i, entry := range sm.Entries {
+	for i, entry := range entries {
 		renderExportEntry(&b, entry, i, labelByTarget, toolResults)
 	}
 	b.WriteString("      </div>\n")

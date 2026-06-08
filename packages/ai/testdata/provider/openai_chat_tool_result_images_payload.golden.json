@@ -1,0 +1,69 @@
+{
+  "max_completion_tokens": 64,
+  "messages": [
+    {
+      "content": "system prompt",
+      "role": "system"
+    },
+    {
+      "content": "Read the images",
+      "role": "user"
+    },
+    {
+      "content": null,
+      "role": "assistant",
+      "tool_calls": [
+        {
+          "function": {
+            "arguments": "{\"path\":\"img-1.png\"}",
+            "name": "read"
+          },
+          "id": "tool-1",
+          "type": "function"
+        },
+        {
+          "function": {
+            "arguments": "{\"path\":\"img-2.png\"}",
+            "name": "read"
+          },
+          "id": "tool-2",
+          "type": "function"
+        }
+      ]
+    },
+    {
+      "content": "Read image file [image/png]",
+      "role": "tool",
+      "tool_call_id": "tool-1"
+    },
+    {
+      "content": "Read image file [image/png]",
+      "role": "tool",
+      "tool_call_id": "tool-2"
+    },
+    {
+      "content": [
+        {
+          "text": "Attached image(s) from tool result:",
+          "type": "text"
+        },
+        {
+          "image_url": {
+            "url": "data:image/png;base64,ZmFrZQ=="
+          },
+          "type": "image_url"
+        },
+        {
+          "image_url": {
+            "url": "data:image/png;base64,ZmFrZQ=="
+          },
+          "type": "image_url"
+        }
+      ],
+      "role": "user"
+    }
+  ],
+  "model": "gpt-image-golden",
+  "store": false,
+  "tools": []
+}

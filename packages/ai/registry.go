@@ -85,6 +85,26 @@ func UnregisterProviders(sourceID string) {
 	}
 }
 
+func UnregisterProvider(api string, sourceID ...string) {
+	if api == "" {
+		return
+	}
+	source := ""
+	if len(sourceID) > 0 {
+		source = sourceID[0]
+	}
+	providerMu.Lock()
+	defer providerMu.Unlock()
+	entry, ok := providers[api]
+	if !ok {
+		return
+	}
+	if source != "" && entry.sourceID != source {
+		return
+	}
+	delete(providers, api)
+}
+
 func ClearAPIProviders() {
 	providerMu.Lock()
 	defer providerMu.Unlock()

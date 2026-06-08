@@ -33,6 +33,24 @@ tool_choice, and cache_control. The Codex transport contract is covered by
 diagnostic tests. Regenerate the payload goldens with `UPDATE_GOLDEN=1 go test
 ./packages/ai/...`.
 
+Those Go regression goldens are now paired with a separate cross-language
+fixture directory, `packages/ai/testdata/provider/ts/`. The TS fixtures are
+compared semantically (parsed JSON, not field-order text) by
+`assertTSProviderFixture` and are deliberately **not** rewritten by
+`UPDATE_GOLDEN`; they should only be replaced from upstream TypeScript request
+builders or a capture script. Current TS fixture coverage includes OpenAI Chat,
+OpenAI Responses reasoning, Anthropic Messages, and Anthropic adaptive thinking
+payloads.
+
+Provider request transforms now normalize persisted coding-agent session-only
+messages (`bashExecution`, `custom`, `branchSummary`, `compactionSummary`) into
+ordinary user messages before provider payload builders run. This keeps provider
+builders scoped to provider roles while preserving TS-style summary wrappers and
+reloaded custom array content. New coding-agent/core context entries now use
+core-owned session message types with provider-facing content blocks, and
+agent/harness session readers use harness/session-owned equivalents. Old
+sessions that deserialize to `ai.CustomMessage` remain supported.
+
 Several formerly-remaining areas now have upstream TypeScript fixtures converted
 into Go tests:
 

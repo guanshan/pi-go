@@ -1,6 +1,7 @@
 package extensions
 
 import (
+	"context"
 	"strings"
 	"sync"
 	"testing"
@@ -64,5 +65,51 @@ func TestEventBusConcurrentRegisterUnsubscribe(t *testing.T) {
 	bus.mu.RUnlock()
 	if remaining != 0 {
 		t.Fatalf("expected all listeners removed, got %d", remaining)
+	}
+}
+
+func TestAutocompleteApplyUsesStableProviderIDAfterProviderListChanges(t *testing.T) {
+	api := NewAPI()
+	runner := NewRunnerWithAPI(api)
+	ctx := context.Background()
+
+	api.RegisterAutocompleteProvider(AutocompleteProviderDefinition{
+		Source: "first",
+		Suggest: func(context.Context, AutocompleteRequest) (AutocompleteSuggestions, error) {
+			return AutocompleteSuggestions{Items: []AutocompleteItem{{Value: "first"}}}, nil
+		},
+		Apply: func(context.Context, AutocompleteApplyRequest) (AutocompleteApplyResult, error) {
+			return AutocompleteApplyResult{Input: "applied-first"}, nil
+		},
+	})
+	suggestions, err := runner.Autocomplete(ctx, AutocompleteRequest{Input: "f"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(suggestions.Items) != 1 {
+		t.Fatalf("suggestions=%#v", suggestions)
+	}
+	if suggestions.Items[0].ProviderID == 0 {
+		t.Fatalf("suggestion missing stable provider id: %#v", suggestions.Items[0])
+	}
+
+	api.mu.Lock()
+	api.Autocomplete = append([]AutocompleteProviderDefinition{{
+		Source: "first",
+		Suggest: func(context.Context, AutocompleteRequest) (AutocompleteSuggestions, error) {
+			return AutocompleteSuggestions{Items: []AutocompleteItem{{Value: "inserted"}}}, nil
+		},
+		Apply: func(context.Context, AutocompleteApplyRequest) (AutocompleteApplyResult, error) {
+			return AutocompleteApplyResult{Input: "wrong-provider"}, nil
+		},
+	}}, api.Autocomplete...)
+	api.mu.Unlock()
+
+	applied, ok, err := runner.ApplyAutocomplete(ctx, AutocompleteApplyRequest{Item: suggestions.Items[0]})
+	if err != nil || !ok {
+		t.Fatalf("apply ok=%v err=%v", ok, err)
+	}
+	if applied.Input != "applied-first" {
+		t.Fatalf("applied input=%q, want original provider", applied.Input)
 	}
 }

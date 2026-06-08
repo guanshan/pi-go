@@ -117,4 +117,5 @@ func assertGolden(t *testing.T, captured map[string]any, name string) {
 	if !bytes.Equal(got, want) {
 		t.Fatalf("%s golden mismatch\n--- got ---\n%s\n--- want ---\n%s", name, got, want)
 	}
+	assertTSProviderFixture(t, got, name)
 }

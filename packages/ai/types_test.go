@@ -96,6 +96,23 @@ func TestMessageHelpers(t *testing.T) {
 	}
 }
 
+func TestCustomContentBlocksFallsBackToJSONForInvalidBlockArrays(t *testing.T) {
+	blocks, ok := CustomContentBlocks([]any{
+		map[string]any{"foo": "bar"},
+	})
+	if !ok {
+		t.Fatal("custom content should be representable")
+	}
+	if len(blocks) != 1 || blocks[0].Type != "text" || !strings.Contains(blocks[0].Text, `"foo":"bar"`) {
+		t.Fatalf("blocks=%#v", blocks)
+	}
+	for _, block := range blocks {
+		if block.Type == "" {
+			t.Fatalf("empty content block leaked: %#v", blocks)
+		}
+	}
+}
+
 func TestMessageDiscriminatedUnionHelpers(t *testing.T) {
 	user := Message(NewUserMessage("hello", nil))
 	assistant := Message(NewAssistantMessage("openai-completions", "openai", "gpt-test", []ContentBlock{

@@ -79,7 +79,7 @@ func TestGeneratedImageModelRegistry(t *testing.T) {
 		t.Fatalf("providers=%#v", providers)
 	}
 	models := GetImageModels("openrouter")
-	if len(models) != 29 {
+	if len(models) != 30 {
 		t.Fatalf("openrouter image model count=%d", len(models))
 	}
 	model, ok := GetImageModel("openrouter", "google/gemini-2.5-flash-image")

@@ -170,7 +170,7 @@ func BuildSessionContext(entries []core.SessionEntry, leafID ...*string) core.Se
 				ctx.Messages = append(ctx.Messages, entry.Message)
 			}
 		case "custom_message":
-			ctx.Messages = append(ctx.Messages, ai.CustomMessage{
+			ctx.Messages = append(ctx.Messages, core.CustomSessionMessage{
 				Role:       "custom",
 				CustomType: entry.CustomType,
 				Content:    entry.Content,
@@ -179,12 +179,12 @@ func BuildSessionContext(entries []core.SessionEntry, leafID ...*string) core.Se
 			})
 		case "branch_summary":
 			if entry.Summary != "" {
-				ctx.Messages = append(ctx.Messages, ai.CustomMessage{Role: "branchSummary", Summary: entry.Summary, FromID: entry.FromID})
+				ctx.Messages = append(ctx.Messages, core.BranchSummaryMessage{Role: "branchSummary", Summary: entry.Summary, FromID: entry.FromID})
 			}
 		}
 	}
 	if compaction != nil {
-		ctx.Messages = append(ctx.Messages, ai.CustomMessage{
+		ctx.Messages = append(ctx.Messages, core.CompactionSummaryMessage{
 			Role:         "compactionSummary",
 			Summary:      compaction.Summary,
 			TokensBefore: compaction.TokensBefore,

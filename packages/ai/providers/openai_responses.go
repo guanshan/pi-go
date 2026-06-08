@@ -319,8 +319,9 @@ func ResponsesMessages(options OpenAIResponsesRequestOptions, includeSystem bool
 	}
 	messageIndex := 0
 	for _, msg := range options.Messages {
+		msg.Role = providerMessageRoleAsUser(msg.Role)
 		switch msg.Role {
-		case "user", "compactionSummary", "branchSummary", "custom":
+		case "user":
 			if mapped, ok := ResponsesUserMessage(msg); ok {
 				out = append(out, mapped)
 			}

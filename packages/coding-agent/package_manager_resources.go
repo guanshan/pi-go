@@ -345,6 +345,13 @@ func (m *DefaultPackageManager) resolvePackageEntries(entries []configuredPackag
 			case MissingSourceError:
 				return fmt.Errorf("missing source: %s", record.Source)
 			case MissingSourceInstall:
+				// Offline mode never reaches out to install a missing managed
+				// source; skip it instead, mirroring resolvePackageSources'
+				// installMissing() guard (`if (isOfflineModeEnabled()) return false`)
+				// in package-manager.ts (~1225).
+				if offlineModeEnabled() {
+					continue
+				}
 				installed, err := m.Install(record.Source, scope == "project", nil)
 				if err != nil {
 					return err

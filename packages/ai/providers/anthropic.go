@@ -398,9 +398,10 @@ func AnthropicMessages(messages []AnthropicMessage, cacheControl anthropic.Cache
 	out := []anthropic.MessageParam{}
 	for i := 0; i < len(messages); i++ {
 		msg := messages[i]
+		msg.Role = providerMessageRoleAsUser(msg.Role)
 		switch msg.Role {
 		case "user":
-			out = append(out, anthropic.NewUserMessage(AnthropicContentBlocks(msg.Blocks)...))
+			out = append(out, anthropic.NewUserMessage(AnthropicUserContentBlocks(msg)...))
 		case "assistant":
 			blocks := []anthropic.ContentBlockParamUnion{}
 			text := ""
@@ -456,8 +457,6 @@ func AnthropicMessages(messages []AnthropicMessage, cacheControl anthropic.Cache
 				blocks = append(blocks, AnthropicToolResultBlock(messages[i]))
 			}
 			out = append(out, anthropic.NewUserMessage(blocks...))
-		case "compactionSummary", "branchSummary", "custom":
-			out = append(out, anthropic.NewUserMessage(anthropic.NewTextBlock(msg.Text)))
 		}
 	}
 	if useCacheControl {
@@ -493,6 +492,13 @@ func AnthropicToolResultBlock(msg AnthropicMessage) anthropic.ContentBlockParamU
 		IsError:   anthropic.Bool(msg.IsError),
 	}
 	return anthropic.ContentBlockParamUnion{OfToolResult: &block}
+}
+
+func AnthropicUserContentBlocks(msg AnthropicMessage) []anthropic.ContentBlockParamUnion {
+	if len(msg.Blocks) == 0 && msg.Text != "" {
+		return []anthropic.ContentBlockParamUnion{anthropic.NewTextBlock(msg.Text)}
+	}
+	return AnthropicContentBlocks(msg.Blocks)
 }
 
 func AnthropicContentBlocks(blocks []AnthropicBlock) []anthropic.ContentBlockParamUnion {

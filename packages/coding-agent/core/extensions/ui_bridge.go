@@ -126,6 +126,21 @@ type uiResponseMessage struct {
 	Error  string          `json:"error,omitempty"`
 }
 
+type contextActionRequestMessage struct {
+	Type     string          `json:"type"` // always "context_action_request"
+	ActionID string          `json:"actionId"`
+	Action   string          `json:"action"`
+	Params   json.RawMessage `json:"params"`
+}
+
+type contextActionResponseMessage struct {
+	Type     string          `json:"type"` // always "context_action_response"
+	ActionID string          `json:"actionId"`
+	OK       bool            `json:"ok"`
+	Result   json.RawMessage `json:"result,omitempty"`
+	Error    string          `json:"error,omitempty"`
+}
+
 // handleUIRequest answers one ui_request by invoking the bound host handler and
 // writing a ui_response. It runs on its own goroutine (spawned by readLoop) so a
 // handler that blocks on interactive input never stalls the stdout reader.
@@ -151,6 +166,31 @@ func (r *scriptRuntime) handleUIRequest(req uiRequestMessage) {
 }
 
 func (r *scriptRuntime) writeUIResponse(resp uiResponseMessage) {
+	r.writeStdinLine(resp)
+}
+
+func (r *scriptRuntime) handleContextActionRequest(req contextActionRequestMessage) {
+	resp := contextActionResponseMessage{Type: "context_action_response", ActionID: req.ActionID}
+	var handler ExtensionContextActionHandler
+	if r.actionHandler != nil {
+		handler = r.actionHandler()
+	}
+	if handler == nil {
+		resp.Error = "ExtensionContext action " + req.Action + " is not supported by this host"
+		r.writeContextActionResponse(resp)
+		return
+	}
+	result, err := handler(r.ctx, ExtensionContextAction{Name: req.Action, Params: req.Params})
+	if err != nil {
+		resp.Error = err.Error()
+	} else {
+		resp.OK = true
+		resp.Result = result
+	}
+	r.writeContextActionResponse(resp)
+}
+
+func (r *scriptRuntime) writeContextActionResponse(resp contextActionResponseMessage) {
 	r.writeStdinLine(resp)
 }
 

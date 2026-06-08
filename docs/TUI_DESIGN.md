@@ -52,23 +52,29 @@ and [`ARCHITECTURE.md`](./ARCHITECTURE.md) for the overall package layout.
 
 ## Current interactive parity status
 
-The Bubble Tea shell works, but several interactions are still text fallbacks
-rather than the navigable overlays/dropdowns of the TypeScript TUI. This is the
-honest current state (parity review P1-3), pending the generic
-selector/dialog/overlay state machine the section above calls for:
+The Bubble Tea shell now wires several formerly reference-only primitives from
+`packages/tui` into production: Markdown rendering, visible-width/truncation
+helpers, fuzzy matching, SelectList for the model picker, and the keybinding
+manager. `scripts/check_arch.go` enforces the exact exported-symbol allowlist
+(`wiredTUIComponents`), so wiring another `packages/tui` surface requires a
+deliberate code and documentation update.
+
+Several flows still use product-local Bubble Tea views rather than the upstream
+`TUI` overlay stack. This is the honest current state:
 
 | Interaction | Current Go behavior | TS target |
 | --- | --- | --- |
-| `/model`, `/scoped-models` | prints a list | navigable selector |
+| `/model` | SelectList-backed navigable overlay (Ctrl+L / bare `/model`) | navigable selector |
+| `/scoped-models` | prints scoped model summary | navigable selector |
 | `/settings` | dumps JSON | editable settings list |
 | `/resume` | numbered list prompt | navigable session picker |
 | `/tree`, `/fork` | text tree / argument flow | interactive tree navigation |
 | `/login` | OAuth prompts routed through the input/select overlay | OAuth selector overlay |
 | `pi config` | numeric line selection | navigable settings list |
-| autocomplete | slash / model / prompt / skill prefix match | + path, `@`-refs, extension providers, navigable dropdown |
-| keybindings | a few hardcoded keys (Esc/Ctrl+C, double-Esc) | `KeybindingsManager` + user `keybindings.json` |
-| extension `ctx.ui` | degraded stub (see [EXTENSIONS_DESIGN.md](EXTENSIONS_DESIGN.md)) | full overlay-backed UI |
+| autocomplete | slash / model / prompt / skill / path / `@` refs / extension-provider suggestions in a navigable dropdown | TS visual-wrap cursor parity and exact provider ordering |
+| keybindings | app command table plus user `keybindings.json`; extension shortcuts are resolved and listed in `/hotkeys` | remaining platform-specific edge cases |
+| extension `ctx.ui` | host-backed input/select/confirm/notify overlay bridge (see [EXTENSIONS_DESIGN.md](EXTENSIONS_DESIGN.md)) | full overlay-backed UI and custom renderers |
 
 Escape now cancels a running slash/bash command (not just an agent turn) — see
-`interactiveModel.handleEscape` — but the rest of the overlay/selector work
-remains a dedicated effort.
+`interactiveModel.handleEscape` — but session/tree/settings overlays and exact
+visual cursor behavior remain dedicated efforts.

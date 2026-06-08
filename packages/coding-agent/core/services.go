@@ -48,6 +48,8 @@ type AgentSessionServices struct {
 	SettingsManager       *SettingsManager
 	ModelRegistry         *ai.ModelRegistry
 	ResourceLoader        ResourceLoader
+	Theme                 ResolvedTheme
+	Keybindings           *KeybindingsManager
 	ExtensionRuntime      *coreext.Runner
 	ResourceLoaderOptions DefaultResourceLoaderOptions
 	Diagnostics           []Diagnostic
@@ -99,8 +101,19 @@ func CreateAgentSessionServices(ctx context.Context, options CreateAgentSessionS
 	resources := LoadResources(cwd, agentDir, resourceLoaderArgs(options.ResourceLoaderOptions), settings)
 	applyResourceLoaderOverrides(&resources, cwd, options.ResourceLoaderOptions)
 	diagnostics := append(settingsDiagnostics(settings), resourceDiagnostics(resources)...)
+	theme, themeDiagnostics := ResolveTheme(settings, resources)
+	diagnostics = append(diagnostics, themeDiagnostics...)
+	keybindings := NewKeybindingsManager(agentDir)
+	diagnostics = append(diagnostics, keybindings.Diagnostics()...)
 	extensionRuntime, extensionDiagnostics := loadExtensionRuntime(ctx, resources.Extensions, options.ResourceLoaderOptions.ExtensionFactories, options.ExtensionFlagValues)
 	diagnostics = append(diagnostics, extensionDiagnostics...)
+	for _, provider := range extensionRuntime.RegisteredProviders() {
+		if _, err := applyProviderModelConfigToRegistry(registry, provider, true); err != nil {
+			diagnostics = append(diagnostics, Diagnostic{Type: DiagError, Message: err.Error()})
+		}
+	}
+	_, shortcutDiagnostics := resolveExtensionShortcuts(extensionRuntime, keybindings)
+	diagnostics = append(diagnostics, shortcutDiagnostics...)
 	return &AgentSessionServices{
 		Cwd:                   cwd,
 		AgentDir:              agentDir,
@@ -108,6 +121,8 @@ func CreateAgentSessionServices(ctx context.Context, options CreateAgentSessionS
 		SettingsManager:       settings,
 		ModelRegistry:         registry,
 		ResourceLoader:        resources,
+		Theme:                 theme,
+		Keybindings:           keybindings,
 		ExtensionRuntime:      extensionRuntime,
 		ResourceLoaderOptions: options.ResourceLoaderOptions,
 		Diagnostics:           diagnostics,
@@ -154,8 +169,15 @@ func CreateAgentSessionFromServices(ctx context.Context, options CreateAgentSess
 	tools := toolSetFromServiceOptions(services.Cwd, services.SettingsManager, options.NoTools, options.Tools, options.ExcludeTools, services.ExtensionRuntime, options.CustomTools, model)
 	systemPrompt := services.ResourceLoader.BuildSystemPrompt(cli.Args{}, ToolPromptInfoFor(tools))
 	agentSession := NewAgentSession(session, services.SettingsManager, services.ModelRegistry, services.ResourceLoader, model, thinking, tools, systemPrompt)
+	if services.Theme.Name != "" {
+		agentSession.Theme = services.Theme
+	}
+	if services.Keybindings != nil {
+		agentSession.Keybindings = services.Keybindings
+	}
 	agentSession.extensionRuntime = services.ExtensionRuntime
 	agentSession.ResourceLoaderOptions = services.ResourceLoaderOptions
+	agentSession.installExtensionContextBridge()
 	return CreateAgentSessionResult{
 		Session:              agentSession,
 		ModelFallbackMessage: modelFallbackMessage,

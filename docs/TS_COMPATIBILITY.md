@@ -23,6 +23,12 @@ Implemented in Go:
   per-million-token cost calculation is defined directly in `packages/ai`
 - provider-facing runtime tool interface, tool set, and deterministic tool
   schema definition builder are defined directly in `packages/ai`
+- provider request transforms normalize persisted coding-agent custom/session
+  roles (`bashExecution`, `custom`, `branchSummary`, `compactionSummary`) into
+  ordinary user messages before provider payload builders run; `ai.CustomMessage`
+  remains as a legacy session compatibility shape, while coding-agent/core now
+  constructs core-owned session message types for new context entries and
+  agent/harness session readers construct harness/session-owned equivalents
 - public `packages/ai` model registry/runtime, built-in defaults, and generated
   text-model catalog coverage from TS `models.generated.ts` with provider/model lookup,
   reasoning-level metadata, context window, max-token, and cost fields
@@ -162,21 +168,28 @@ production path. To keep this distinction honest:
   `TruncateToWidth`, `VisibleWidth`, `NewMarkdown`, `MarkdownTheme`,
   `FuzzyMatchString`, and — added by interactive-TUI slice 2 — the SelectList
   surface (`NewSelectList`, `SelectList`, `SelectItem`, `SelectListTheme`,
-  `SelectListLayoutOptions`). These are the allowlist enforced by
+  `SelectListLayoutOptions`), plus the app keybindings surface
+  (`KeybindingsManager`, `NewKeybindingsManager`, `Keybinding`,
+  `KeybindingDefinitions`, `KeybindingDefinition`, `KeybindingsConfig`,
+  `TUIKeybindings`, `KeyID`, `SetKeybindings`). These are the allowlist enforced by
   `scripts/check_arch.go` (`wiredTUIComponents`): wiring an additional component
   requires adding it there and here, so dead code cannot silently become "live".
   The non-test importers are `core/interactive_tui.go`,
-  `core/interactive_model_selector.go`, `core/modes.go`, and
+  `core/interactive_model_selector.go`, `core/theme.go`, `core/modes.go`, and
   `cli/list_models.go`.
 - **Ported but not wired**: everything else listed under "Implemented in Go"
   below — Input, SettingsList, EditorComponent, Loader/
-  CancellableLoader, Image, ProcessTerminal, keybindings/keys, autocomplete,
-  stdin paste buffer, undo stack, kill ring, terminal image encoders/capability
-  detection, native-modifier helpers, etc. They exist and are tested but have no
-  production consumer yet; remaining interactive autocomplete/inline images and
-  the settings selector stay TODO (parity review topic 5: P1-3 markdown caching,
-  P1-5 autocomplete). The SelectList-backed `/model` picker (P1-4 selectors) is
-  now wired via the interactive overlay (Ctrl+L / bare `/model`).
+  CancellableLoader, Image, ProcessTerminal, the reference autocomplete
+  providers, stdin paste buffer, undo stack, kill ring, terminal image
+  encoders/capability detection, native-modifier helpers, etc. They exist and
+  are tested but have no production consumer yet. Note that the live
+  coding-agent autocomplete is no longer a text-only fallback: slash/model/
+  prompt/skill/path/`@`-ref and extension-provider suggestions are wired in
+  `core/interactive_tui.go`, but that product path uses core-specific merging and
+  rendering rather than `packages/tui`'s reference autocomplete provider. The
+  SelectList-backed `/model` picker (P1-4 selectors) is wired via the interactive
+  overlay (Ctrl+L / bare `/model`). Inline image rendering and the settings
+  selector remain TODO.
 - **Intentionally not ported (route A)**: the upstream `TUI` event loop and
   overlay machinery (see the dedicated subsection below).
 
@@ -376,8 +389,22 @@ Partial versus TS:
   registers/executes simple custom tools, declares CLI flags, dispatches basic
 	  slash commands, subscribes to events/hooks, returns mutation/cancel results
 	  from before-hooks, and forwards basic `ctx.ui` notify/select/confirm/input
-	  prompts to line/Bubble/RPC hosts; settings, custom/rich `ctx.ui`, message
-	  renderers, and provider/model registration are not yet implemented
+	  prompts to line/Bubble/RPC hosts. Script `pi.registerProvider` is now
+	  bridged for text/content provider calls through the Go AI registry and for
+	  TS-style model catalog configs (`baseUrl`, `apiKey`, `headers`, `models`,
+	  `modelOverrides`) applied to the active model registry at startup and during
+	  dynamic registration. `pi.registerMessageRenderer` / `pi.sendMessage` now
+	  support custom-message text-line rendering. Script action APIs now cover
+	  `pi.sendUserMessage`, `pi.appendEntry`, `pi.setSessionName`,
+	  `pi.getSessionName`, and `pi.setLabel`; the virtual coding-agent module also
+	  exports a lightweight `getSettingsListTheme` helper. `ctx.ui.setStatus`
+	  now updates the live Bubble TUI footer and emits TS-shaped RPC
+	  `extension_ui_request` lines, and the lightweight `ctx.ui` setters
+	  (`setWorkingMessage`/`setWorkingVisible`/`setWorkingIndicator`/
+	  `setHiddenThinkingLabel`/`setTitle`/`pasteToEditor`/`setEditorText`),
+	  `getEditorText`, and `editor` are bridged to the interactive TUI and RPC
+	  hosts. Rich `ctx.ui` components (`setWidget`/`setFooter`/`setHeader`/
+	  `custom`) and full component message renderer layout are not yet implemented
 
 Now wired (previously ported-but-dead helpers):
 
@@ -398,13 +425,167 @@ Now wired (previously ported-but-dead helpers):
   (`package_manager.go`), mirroring `ensureNpmProject ->
   markPathIgnoredByCloudSync` in `package-manager.ts` so large package directories
   are not disrupted by Dropbox/iCloud sync.
+- Package-manager edge cases (`package_manager.go`,
+  `package_manager_resources.go`): the npm install/update branches now route
+  through `ensureNpmProject`, fully mirroring `ensureNpmProject` in
+  `package-manager.ts`: create the root, `markPathIgnoredByCloudSync`, seed
+  `.gitignore` (`"*\n!.gitignore\n"`), and write
+  `{"name":"pi-extensions","private":true}` (2-space indent) when no
+  `package.json` exists. The git install branch seeds the git root with the same
+  `.gitignore` (`installGit -> ensureGitIgnore(gitRoot)`). A pinned npm source
+  whose installed `package.json` version already matches the pin is treated as a
+  cache hit and is not reinstalled, mirroring `resolvePackageSources`'
+  `parsed.pinned && installedNpmMatchesPinnedVersion(...)` gate. The git update
+  branch, for a ref-bearing record, replaces `git pull --ff-only` with
+  `git fetch origin <ref>` then compares `git rev-parse HEAD` against
+  `git rev-parse FETCH_HEAD^{commit}` and, on divergence, `git reset --hard
+  FETCH_HEAD^{commit}` + `git clean -fdx` before reinstalling deps, mirroring
+  `updateGit -> ensureGitRef`. `offlineModeEnabled()` (`PI_OFFLINE` =
+  `1`/`true`/`yes`, case-insensitive; via `core.EnvOffline`) now short-circuits
+  the resolve missing-source `install` action so `PI_OFFLINE` never installs a
+  missing managed source, mirroring `resolvePackageSources`' `installMissing()`
+  offline guard.
+- Theme subsystem: `core/theme.go` now parses the TS theme JSON shape (all
+  required color tokens, vars, integer/hex/default colors), resolves
+  `settings.theme` against built-in and discovered/package/CLI theme paths with
+  first-resource-wins duplicate handling, falls back to `dark` on invalid or
+  missing selections, and applies the resolved theme to the live Bubble TUI
+  transcript, footer/header/input, extension UI prompts, autocomplete selection,
+  model selector, and markdown theme tokens.
+- Keybindings slice: `core/keybindings.go` now mirrors the TS app-level command
+  table, reads `<agentDir>/keybindings.json`, migrates legacy binding names,
+  reports unknown/invalid bindings as startup diagnostics, and wires effective
+  bindings into the real Bubble TUI for interrupt/clear/exit/suspend,
+  model/thinking cycling, model select, follow-up, dequeue, thinking visibility,
+  external editor, and placeholder status paths for tool expansion and clipboard
+  image paste.
+- Rich transcript slice: the live Bubble TUI now tracks tool execution metadata
+  (tool name, call id, args, partial/error state) and bash command metadata, then
+  renders tool/bash output with TS-style 20-line collapsed previews, `ctrl+o`
+  expansion/collapse hints, bash command/status headers, and themed diff-line
+  coloring for added/removed/context lines.
+- Paste/image/autocomplete input slice: bracketed paste in the live Bubble TUI
+  now mirrors the TS editor's large-paste behavior (`>10` lines or `>1000`
+  chars) by storing paste content behind `[paste #N ...]` markers, expanding
+  markers before submit/external-editor use, and preserving expanded history.
+  Clipboard image paste now reads Linux Wayland/X11/WSL-style clipboard images
+  through `wl-paste`, `xclip`, or PowerShell, writes a temp image path into the
+  editor, and sends the corresponding `ai.ContentBlock{Type:"image"}` with the
+  next prompt. Script and Go extensions can now register autocomplete providers;
+  provider suggestions (`items` plus `prefix`) are merged into the live Bubble
+  TUI dropdown and applied by replacing the typed prefix. The dropdown now
+  renders completion descriptions for built-in slash commands, prompt templates
+  (first content line fallback), skills, extension commands, model providers, and
+  extension provider items while keeping accepted values separate from labels.
+  Prompt/skill/extension command descriptions now include TS-style source tags
+  such as `[p]`, `[u]`, and `[u:npm:...]` when resource source metadata is
+  available.
+  Timed-out/cancelled script autocomplete requests now send a bridge
+  `cancel_request` frame so provider `options.signal` is aborted in Node instead
+  of continuing silently in the background.
+  Extension provider `applyCompletion` callbacks are bridged for text
+  replacement results; the live Bubble TUI applies the returned text and logical
+  `cursorLine`/`cursorCol` when provided.
+- Extension shortcut slice: script and Go extensions can register shortcuts;
+  the live Bubble TUI executes non-conflicting chords asynchronously and passes a
+  host-backed `ExtensionContext` to script handlers. Conflict filtering and
+  diagnostics mirror TS: reserved editor-global built-ins are skipped,
+  non-reserved built-in overlaps warn and use the extension, duplicate extension
+  shortcuts use the later registration, dynamic register/unregister calls after
+  load update the host shortcut table, and `/hotkeys` lists only the shortcuts
+  that remain usable after conflict filtering.
+- Extension UI status slice: script `ctx.ui.setStatus(key, text)` now follows
+  TS semantics for the common footer-status path. Interactive mode stores keyed
+  status text, sanitizes newlines, sorts by key for rendering in the live footer,
+  and clears on `undefined`; RPC mode emits `extension_ui_request` with
+  `method:"setStatus"`, `statusKey`, and `statusText`, without waiting for a UI
+  response.
+- Extension UI lightweight slice: the string/boolean/editor-text setters
+  `setWorkingMessage`, `setWorkingVisible`, `setWorkingIndicator`,
+  `setHiddenThinkingLabel`, `setTitle`, `pasteToEditor`, `setEditorText`, plus
+  `getEditorText` and `editor(title, prefill)`, are bridged. Interactive mode
+  reflects them in the footer busy indicator (working message / visibility /
+  first indicator frame), the terminal window title (`tea.View.WindowTitle`), and
+  the input editor (`setEditorText` replaces, `pasteToEditor` re-uses paste
+  folding, `getEditorText` returns the paste-expanded text); `editor` suspends the
+  TUI for `$VISUAL`/`$EDITOR`. RPC mode mirrors `rpc-mode.ts`: `setTitle` /
+  `set_editor_text` (from `setEditorText` and `pasteToEditor`) forward host
+  requests, `editor` round-trips, `getEditorText` returns `""`, and the
+  working/thinking setters are no-ops. **Divergences:** `getEditorText()` is
+  synchronous in TS but resolves a `Promise<string>` across the out-of-process Go
+  bridge (it cannot block on the host); `onTerminalInput()` returns a no-op
+  unsubscribe because per-keystroke raw input is not forwarded to the extension
+  subprocess. Rich component setters (`setWidget`, `setFooter`, `setHeader`,
+  `setEditorComponent`, `custom()`) remain unsupported.
+- Extension UI widget slice: `ctx.ui.setWidget(key, string[]|undefined, {placement})`
+  is bridged for the plain-text subset TS rpc-mode forwards. Interactive mode
+  renders keyed widgets above/below the editor (`renderExtensionWidgets`), with
+  TS parity for move-on-replacement (re-setting a key with a new placement moves
+  it), `undefined` removal, and a 10-line cap with a `... (widget truncated)`
+  marker. RPC mode forwards `widgetKey`/`widgetLines`/`widgetPlacement`
+  (`widgetLines:null` to remove). Component-factory widgets and the rich
+  component setters (`setFooter`/`setHeader`/`setEditorComponent`/`custom`) warn
+  and no-op; `getEditorComponent()` returns `undefined`. **Divergence:** widgets
+  render in deterministic key-sorted order (Go maps are unordered) vs TS
+  insertion order — unobservable cross-process.
+- Extension provider slice: script `pi.registerProvider` / `unregisterProvider`
+  now registers provider adapters into `packages/ai` and removes them on runtime
+  shutdown. The bridge supports `complete`, `stream`, `completeSimple`, and
+  `streamSimple` handlers that receive a JSON-safe ChatRequest snapshot plus
+  host-backed `ExtensionContext`; string/content/assistant-like results and async
+  iterables are collected into an assistant message. `registerProvider(name,
+  config)` also reuses the `models.json` provider-config parser to add or
+  override model catalog entries on the session registry, including dynamic
+  registration and explicit model removal on unregister.
+- Extension provider streaming slice: `stream`/`streamSimple` providers now emit
+  token-level incremental events. The Node bridge writes out-of-band
+  `provider_chunk` messages as it drains the handler's async iterable — passing
+  through `AssistantMessageEvent`-shaped chunks (minus the terminal
+  start/done/error) and synthesizing `text_start`/`text_delta`/`text_end` plus
+  `toolcall_start`/`toolcall_end` from raw string/object chunks. The Go
+  `ProviderStream` routes those to a per-call channel (non-blocking sends drop
+  under backpressure since the final reply is authoritative) and maps them onto
+  `ai.AssistantMessageEvent`s (`start` once → incremental deltas → terminal
+  `done`/`error`) with a running `Partial`. The integer-id reply still drives the
+  authoritative final message/usage/stopReason (identical to the prior
+  collect-to-final behavior), and cancelling the Go context aborts the Node
+  provider's `AbortSignal`.
+- Extension custom-message slice: script `pi.registerMessageRenderer` /
+  `unregisterMessageRenderer` registers renderers into the Go extension runner,
+  and `pi.sendMessage` appends `custom_message` session entries. Renderer
+  handlers receive custom message content/details plus `{expanded,width}` and can
+  return strings, line arrays, `{lines}`, or virtual TUI objects with `render()`;
+  the Bubble TUI now handles `triggerTurn` by starting an empty follow-on turn
+  when idle or queuing one while busy. Display custom messages now render into the
+  live interactive transcript (`renderCustomMessageLines`, via an
+  `extensionCustomMessageHandler` that the Bubble TUI registers): the registered
+  renderer's lines with **ANSI styling preserved** — `messageRendererTheme` emits
+  real SGR codes (bold/dim/italic/underline exact; a fixed 16-color table
+  approximates semantic `fg`/`bg`, degrading to no-op on unknown names) and the
+  `Box` shim applies its style function per line — rendered once on receipt and
+  honoring the shared expand/collapse, or a default bold `[customType]` + markdown
+  fallback when no renderer is registered or it returns empty/errors. Renderer
+  output is still flattened to ANSI lines (parity with TS `Component.render` →
+  `string[]`); the theme color table approximates the live theme and
+  markdown-inside-a-renderer is not re-parsed. Hosts without a trigger binding
+  still report `triggerTurn` as unhandled.
 
 Still incomplete versus TS:
 
 - full interactive TUI mode parity
-- remaining package manager edge cases around npm project layout, network
-  refresh, lockfile policy, package-manager selection, lifecycle scripts, and
-  advanced manifest glob/filter parity
+- exact autocomplete behavior parity for visual-wrap cursor edge cases
+- complete TS transcript renderer parity beyond the first live tool/bash slice:
+  built-in/custom tool renderers, inline images, code syntax highlighting,
+  richer diff intraline highlighting, and component-level output framing
+- remaining package manager edge cases around lockfile policy and advanced
+  manifest glob/filter parity. The npm project layout (`ensureNpmProject` /
+  `ensureGitIgnore`), the `PI_OFFLINE` skip on missing-source install, the
+  ref-bearing git update (`fetch` + `reset --hard FETCH_HEAD^{commit}` +
+  `clean -fdx`), and the pinned-npm cache-hit gate are now implemented. Still
+  deferred: the temporary-extension-source hashing layout and its network
+  refresh (TS `getTemporaryDir` / `refreshTemporaryGitSource`), which Go lacks an
+  equivalent for; and the no-ref git update path still uses `git pull --ff-only`
+  rather than deriving the origin-HEAD/upstream target (`getLocalGitUpdateTarget`).
 - install/update telemetry beyond version checking
 - full OAuth login UI wiring in interactive mode beyond the core `packages/ai`
   provider flows
@@ -471,23 +652,43 @@ Intentional behavioral divergences (safer or platform-specific; documented rathe
 - **`grep` engine**: the grep tool now prefers a local `rg` binary (agent bin dir
   then PATH), shelling out with the same flags as the TypeScript tool
   (`--json --line-number --color=never --hidden`) so traversal/ignore semantics
-  and the Rust regex engine match exactly. When `rg` is absent it falls back to a
-  Go RE2 walk that produces byte-identical output for supported patterns; the
-  compile-error message names the engine so a pattern that behaves differently
-  than the TS CLI is explainable. Neither engine supports look-around or
-  backreferences (ripgrep would need `--pcre2`, which the TS CLI does not pass),
-  so that earlier "advanced regex works in TS" note was inaccurate. The Go path
-  also always excludes `.git` via `--glob '!.git'` (ripgrep 14 does not skip it
-  under `--hidden`), matching the RE2 fallback and never surfacing git internals.
+  and the Rust regex engine match exactly. When `rg` is absent and an agent bin
+  dir is available, the managed tool resolver mirrors TS `ensureTool("rg")`:
+  it downloads the latest supported GitHub release into `<agentDir>/bin` with a
+  lockfile and atomic install. `PI_OFFLINE=1|true|yes`, unsupported platforms,
+  or download failures fall back to a Go RE2 walk with an `engineFallback`
+  detail and visible notice. The compile-error message names the active engine
+  so a pattern that behaves differently than the TS CLI is explainable. Neither
+  engine supports look-around or backreferences (ripgrep would need `--pcre2`,
+  which the TS CLI does not pass), so that earlier "advanced regex works in TS"
+  note was inaccurate. The Go path also always excludes `.git` via `--glob
+  '!.git'` (ripgrep 14 does not skip it under `--hidden`), matching the RE2
+  fallback and never surfacing git internals.
 - **`find` engine**: the find tool now prefers a local `fd` binary (agent bin dir,
-  PATH `fd`, then PATH `fdfind`) with TS-style hidden/glob output and a Go
-  `walkFiltered` fallback when `fd` is unavailable or errors. Covered by
-  `TestFindUsesFdWhenAvailable`.
+  PATH `fd`, then PATH `fdfind`) with TS-style hidden/glob output. Missing `fd`
+  is resolved through the same managed GitHub-release download path as TS
+  `ensureTool("fd")` (including the macOS x64 `10.3.0` pin); download/offline
+  failures keep the Go `walkFiltered` fallback but include an `engineFallback`
+  detail and visible notice. Covered by `TestFindToolUsesFdWhenAvailable` and
+  `TestManagedToolDownloadsIntoCache`.
 
 ## Accepted Intentional Divergences
 
 These are deliberate, tested differences from the TypeScript source. They are not
 bugs and should not be "fixed" toward TS without a corresponding decision.
+
+- **`packages/coding-agent/core` god-package split is DEFERRED**: the upstream TS
+  `coding-agent` is many small modules; the Go port concentrates session/runtime/
+  modes/export/compaction/config into one large `core` package held at an explicit
+  `scripts/check_arch.go` line/file budget (ratcheted with a rationale per slice).
+  Splitting it into subpackages (export / compaction / share / config / session /
+  modes) is intentionally postponed until behavioral parity stabilizes: doing it
+  concurrently with parity feature work would mix large mechanical moves with
+  behavior changes, and `packages/coding-agent` forbids the type aliases (P6) a
+  staged split would lean on. The budget is the holding mechanism; the split is a
+  dedicated, behavior-preserving effort to be scheduled once the extension-UI /
+  renderer / provider-streaming surfaces settle. Tracked here so future agents do
+  not repeatedly re-litigate the same decision.
 
 - **`SanitizeBinaryOutput` preserves a real U+FFFD**: a legitimate U+FFFD
   (REPLACEMENT CHARACTER, valid `EF BF BD`) in tool output is preserved; only

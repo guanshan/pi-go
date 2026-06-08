@@ -64,11 +64,12 @@ func collectEntriesForBranchSummary(session *SessionManager, oldLeafID, targetID
 	if session == nil || oldLeafID == "" {
 		return nil, "", nil
 	}
-	oldPath, err := session.BranchFrom(oldLeafID)
+	_, entriesSnapshot, _ := session.Snapshot()
+	oldPath, err := branchFromEntries(entriesSnapshot, oldLeafID)
 	if err != nil {
 		return nil, "", err
 	}
-	targetPath, err := session.BranchFrom(targetID)
+	targetPath, err := branchFromEntries(entriesSnapshot, targetID)
 	if err != nil {
 		return nil, "", err
 	}
@@ -85,8 +86,8 @@ func collectEntriesForBranchSummary(session *SessionManager, oldLeafID, targetID
 			break
 		}
 	}
-	byID := make(map[string]SessionEntry, len(session.Entries))
-	for _, entry := range session.Entries {
+	byID := make(map[string]SessionEntry, len(entriesSnapshot))
+	for _, entry := range entriesSnapshot {
 		if entry.ID != "" {
 			byID[entry.ID] = entry
 		}

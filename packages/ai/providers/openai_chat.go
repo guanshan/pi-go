@@ -197,6 +197,7 @@ func OpenAIChatMessages(options OpenAIChatRequestOptions) []map[string]any {
 	lastRole := ""
 	for i := 0; i < len(options.Messages); i++ {
 		msg := options.Messages[i]
+		msg.Role = providerMessageRoleAsUser(msg.Role)
 		if options.RequiresAssistantAfterToolResult && lastRole == "toolResult" && msg.Role == "user" {
 			out = append(out, map[string]any{"role": "assistant", "content": "I have processed the tool results."})
 		}
@@ -322,8 +323,6 @@ func OpenAIChatMessages(options OpenAIChatRequestOptions) []map[string]any {
 			}
 			lastRole = "toolResult"
 			continue
-		case "compactionSummary", "branchSummary", "custom":
-			out = append(out, map[string]any{"role": "user", "content": msg.Text})
 		}
 		lastRole = msg.Role
 	}

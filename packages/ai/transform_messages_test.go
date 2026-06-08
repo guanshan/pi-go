@@ -3,6 +3,7 @@ package ai
 import (
 	"encoding/json"
 	"regexp"
+	"strings"
 	"testing"
 
 	aiproviders "github.com/guanshan/pi-go/packages/ai/providers"
@@ -49,6 +50,127 @@ func TestOpenAIResponsesThinkingUsesRawItem(t *testing.T) {
 	block := openAIResponseBlock(aiproviders.OpenAIResponsesBlock{Type: "thinking", Thinking: "summary", RawItem: raw})
 	if string(block.RawItem) != string(raw) || block.Signature != "" {
 		t.Fatalf("block=%#v", block)
+	}
+}
+
+func TestTransformMessagesNormalizesCustomSessionMessages(t *testing.T) {
+	model := Model{Provider: "openai", ID: "gpt-vision", API: "openai-completions", Input: []string{"text", "image"}}
+	exitCode := 7
+	messages := []Message{
+		CustomMessage{Role: "branchSummary", Summary: "branch work", TimestampMs: 1},
+		CustomMessage{Role: "compactionSummary", Summary: "old work", TimestampMs: 2},
+		CustomMessage{Role: "bashExecution", Command: "make test", Output: "fail", ExitCode: &exitCode, TimestampMs: 3},
+		CustomMessage{Role: "bashExecution", Command: "pwd", Output: "/tmp", ExcludeFromContext: true, TimestampMs: 4},
+		CustomMessage{
+			Role:       "custom",
+			CustomType: "note",
+			Content: []interface{}{
+				map[string]interface{}{"type": "text", "text": "look at this screenshot"},
+				map[string]interface{}{"type": "image", "data": "aGVsbG8=", "mimeType": "image/png"},
+			},
+			TimestampMs: 5,
+		},
+	}
+
+	got := transformMessages(messages, model, nil)
+	if len(got) != 4 {
+		t.Fatalf("transformed len=%d, want 4: %#v", len(got), got)
+	}
+	for i, msg := range got {
+		if role := MessageRole(msg); role != "user" {
+			t.Fatalf("message %d role=%q, want user (%#v)", i, role, msg)
+		}
+	}
+	if got := MessageText(got[0]); got != BranchSummaryText("branch work") {
+		t.Fatalf("branch summary text=%q", got)
+	}
+	if got := MessageText(got[1]); got != CompactionSummaryText("old work") {
+		t.Fatalf("compaction summary text=%q", got)
+	}
+	if got := MessageText(got[2]); !strings.Contains(got, "Ran `make test`") || !strings.Contains(got, "Command exited with code 7") {
+		t.Fatalf("bash execution text=%q", got)
+	}
+	blocks := MessageBlocks(got[3])
+	if len(blocks) != 2 || blocks[0].Text != "look at this screenshot" || blocks[1].Type != "image" || blocks[1].Data != "aGVsbG8=" {
+		t.Fatalf("custom content blocks not preserved: %#v", blocks)
+	}
+}
+
+func TestTransformMessagesConvertsScalarCustomContentToText(t *testing.T) {
+	model := Model{Provider: "openai", ID: "gpt-text", API: "openai-completions", Input: []string{"text"}}
+	got := transformMessages([]Message{
+		CustomMessage{Role: "custom", CustomType: "number", Content: float64(7), TimestampMs: 1},
+		CustomMessage{Role: "custom", CustomType: "bool", Content: true, TimestampMs: 2},
+	}, model, nil)
+	if len(got) != 2 {
+		t.Fatalf("transformed len=%d, want 2: %#v", len(got), got)
+	}
+	if text := MessageText(got[0]); text != "7" {
+		t.Fatalf("number custom text=%q", text)
+	}
+	if text := MessageText(got[1]); text != "true" {
+		t.Fatalf("bool custom text=%q", text)
+	}
+}
+
+func TestTransformMessagesPreservesUnstructuredCustomContentAsText(t *testing.T) {
+	model := Model{Provider: "openai", ID: "gpt-text", API: "openai-completions", Input: []string{"text"}}
+	got := transformMessages([]Message{
+		CustomMessage{Role: "custom", CustomType: "object-array", Content: []any{map[string]any{"foo": "bar"}}, TimestampMs: 1},
+	}, model, nil)
+	if len(got) != 1 {
+		t.Fatalf("transformed len=%d, want 1: %#v", len(got), got)
+	}
+	if role := MessageRole(got[0]); role != "user" {
+		t.Fatalf("role=%q", role)
+	}
+	if text := MessageText(got[0]); !strings.Contains(text, `"foo":"bar"`) {
+		t.Fatalf("custom content text=%q", text)
+	}
+	for _, block := range MessageBlocks(got[0]) {
+		if block.Type == "" {
+			t.Fatalf("empty block leaked: %#v", MessageBlocks(got[0]))
+		}
+	}
+}
+
+func TestProviderAdaptersNormalizeCustomSessionRoles(t *testing.T) {
+	model := Model{Provider: "openai", ID: "gpt-text", API: "openai-completions", Input: []string{"text"}}
+	messages := []Message{CustomMessage{Role: "branchSummary", Summary: "branch work", TimestampMs: 1}}
+
+	chat := openAIChatMessages(messages, model)
+	if len(chat) != 1 || chat[0].Role != "user" || chat[0].Text != BranchSummaryText("branch work") {
+		t.Fatalf("openai chat messages=%#v", chat)
+	}
+	responses := openAIResponsesMessages(messages, model)
+	if len(responses) != 1 || responses[0].Role != "user" || responses[0].Text != BranchSummaryText("branch work") {
+		t.Fatalf("openai responses messages=%#v", responses)
+	}
+}
+
+type providerContentTestMessage struct {
+	role      string
+	timestamp int64
+	blocks    []ContentBlock
+}
+
+func (m providerContentTestMessage) MessageRole() string { return m.role }
+func (m providerContentTestMessage) Timestamp() int64    { return m.timestamp }
+func (m providerContentTestMessage) ProviderContentBlocks() []ContentBlock {
+	return m.blocks
+}
+
+func TestTransformMessagesNormalizesProviderContentMessages(t *testing.T) {
+	model := Model{Provider: "openai", ID: "gpt-text", API: "openai-completions", Input: []string{"text"}}
+	messages := []Message{providerContentTestMessage{
+		role:      "branchSummary",
+		timestamp: 11,
+		blocks:    TextBlocks("provider-facing context"),
+	}}
+
+	got := transformMessages(messages, model, nil)
+	if len(got) != 1 || MessageRole(got[0]) != "user" || MessageText(got[0]) != "provider-facing context" || MessageTimestamp(got[0]) != 11 {
+		t.Fatalf("normalized provider content message=%#v", got)
 	}
 }
 

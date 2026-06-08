@@ -196,23 +196,23 @@ func renderAssistantMessage(b *strings.Builder, id string, entry SessionEntry, m
 }
 
 func renderBashExecution(b *strings.Builder, id string, entry SessionEntry, msg ai.Message, label string) {
-	custom, _ := ai.AsCustomMessage(msg)
+	bash, _ := asBashExecutionMessage(msg)
 	status := "success"
-	if custom.Cancelled || (custom.ExitCode != nil && *custom.ExitCode != 0) {
+	if bash.Cancelled || (bash.ExitCode != nil && *bash.ExitCode != 0) {
 		status = "error"
 	}
 	fmt.Fprintf(b, "        <div class=\"tool-execution %s\" id=\"%s\">", status, html.EscapeString(id))
 	renderEntryChrome(b, entry, label)
-	fmt.Fprintf(b, "<div class=\"tool-command\">$ %s</div>", html.EscapeString(custom.Command))
-	if custom.Output != "" {
-		fmt.Fprintf(b, "<pre class=\"tool-output\">%s</pre>", html.EscapeString(custom.Output))
+	fmt.Fprintf(b, "<div class=\"tool-command\">$ %s</div>", html.EscapeString(bash.Command))
+	if bash.Output != "" {
+		fmt.Fprintf(b, "<pre class=\"tool-output\">%s</pre>", html.EscapeString(bash.Output))
 	}
-	if custom.Cancelled {
+	if bash.Cancelled {
 		b.WriteString("<div class=\"error-text\">cancelled</div>")
-	} else if custom.ExitCode != nil && *custom.ExitCode != 0 {
-		fmt.Fprintf(b, "<div class=\"error-text\">exit %d</div>", *custom.ExitCode)
+	} else if bash.ExitCode != nil && *bash.ExitCode != 0 {
+		fmt.Fprintf(b, "<div class=\"error-text\">exit %d</div>", *bash.ExitCode)
 	}
-	if custom.Truncated {
+	if bash.Truncated {
 		b.WriteString("<div class=\"message-footnote\">output truncated</div>")
 	}
 	b.WriteString("</div>\n")
@@ -469,8 +469,8 @@ func exportEntryPreview(entry SessionEntry) string {
 		case "toolResult":
 			return firstNonEmpty(ai.MessageToolName(msg), ai.MessageToolCallID(msg), "tool result")
 		case "bashExecution":
-			custom, _ := ai.AsCustomMessage(msg)
-			return oneLine(firstNonEmpty(custom.Command, custom.Output, "bash"))
+			bash, _ := asBashExecutionMessage(msg)
+			return oneLine(firstNonEmpty(bash.Command, bash.Output, "bash"))
 		case "assistant":
 			text := ai.MessageText(msg)
 			if strings.TrimSpace(text) != "" {

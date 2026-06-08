@@ -3,6 +3,7 @@ package core
 import (
 	"strings"
 
+	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
 	"github.com/guanshan/pi-go/packages/ai"
 	"github.com/guanshan/pi-go/packages/tui"
@@ -24,36 +25,24 @@ import (
 // blocks on the unbuffered msg channel; calling it inline would deadlock — the
 // same hazard slice 1's cycleModel guards against).
 type modelSelectorOverlay struct {
-	list    *tui.SelectList
-	all     []tui.SelectItem
-	filter  string
-	current string // provider/id of the active model, for the highlight marker.
+	list       *tui.SelectList
+	all        []tui.SelectItem
+	filter     string
+	current    string // provider/id of the active model, for the highlight marker.
+	titleStyle lipgloss.Style
+	hintStyle  lipgloss.Style
 }
-
-// interactiveSelectorTheme styles the overlay. defaultSelectTheme() in
-// packages/tui is unexported, so production code supplies its own theme
-// literal (all SelectListTheme fields are exported func(string)string).
-var interactiveSelectorTheme = tui.SelectListTheme{
-	SelectedPrefix: func(s string) string { return s },
-	SelectedText:   func(s string) string { return interactiveSelectorSelectedStyle.Render(s) },
-	Description:    func(s string) string { return interactiveSelectorDescStyle.Render(s) },
-	ScrollInfo:     func(s string) string { return interactiveSelectorDescStyle.Render(s) },
-	NoMatch:        func(s string) string { return interactiveSelectorDescStyle.Render(s) },
-}
-
-var (
-	interactiveSelectorTitleStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("#70A5FF")).Bold(true)
-	interactiveSelectorSelectedStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#70A5FF")).Bold(true)
-	interactiveSelectorDescStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("#7C8A99"))
-	interactiveSelectorHintStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("#7C8A99"))
-)
 
 const interactiveSelectorMaxVisible = 8
 
 // newModelSelectorOverlay builds an overlay from the available models, marking
 // the current model (provider/id) so it can be highlighted. Returns nil when
 // there are no models to choose from.
-func newModelSelectorOverlay(models []ai.Model, current ai.Model) *modelSelectorOverlay {
+func newModelSelectorOverlay(models []ai.Model, current ai.Model, styleSets ...interactiveThemeStyles) *modelSelectorOverlay {
+	styles := defaultInteractiveThemeStyles()
+	if len(styleSets) > 0 {
+		styles = styleSets[0]
+	}
 	items := make([]tui.SelectItem, 0, len(models))
 	currentValue := current.Provider + "/" + current.ID
 	currentSeen := false
@@ -75,10 +64,12 @@ func newModelSelectorOverlay(models []ai.Model, current ai.Model) *modelSelector
 		return nil
 	}
 	overlay := &modelSelectorOverlay{
-		all:     items,
-		current: currentValue,
+		all:        items,
+		current:    currentValue,
+		titleStyle: styles.SelectorTitle,
+		hintStyle:  styles.SelectorHint,
 	}
-	overlay.list = tui.NewSelectList(items, interactiveSelectorMaxVisible, interactiveSelectorTheme, tui.SelectListLayoutOptions{})
+	overlay.list = tui.NewSelectList(items, interactiveSelectorMaxVisible, styles.SelectorTheme, tui.SelectListLayoutOptions{})
 	if currentSeen {
 		overlay.selectValue(currentValue)
 	}
@@ -207,10 +198,10 @@ func (o *modelSelectorOverlay) Render(width int) []string {
 	if o.filter != "" {
 		title += "  filter: " + o.filter
 	}
-	lines := []string{interactiveSelectorTitleStyle.Render(tui.TruncateToWidth(title, width, "..."))}
+	lines := []string{o.titleStyle.Render(tui.TruncateToWidth(title, width, "..."))}
 	lines = append(lines, o.list.Render(width)...)
 	hint := "↑/↓ move · enter select · esc cancel · type to filter"
-	lines = append(lines, interactiveSelectorHintStyle.Render(tui.TruncateToWidth(hint, width, "...")))
+	lines = append(lines, o.hintStyle.Render(tui.TruncateToWidth(hint, width, "...")))
 	return lines
 }
 
@@ -227,4 +218,90 @@ func isPrintableKeyString(key string) bool {
 		return false
 	}
 	return runes[0] >= 0x20 && runes[0] != 0x7f
+}
+
+// openModelSelector opens the navigable /model overlay. Entry points are Ctrl+L
+// and a bare `/model` submission. It is suppressed mid-turn (m.busy) so the
+// switch can't race a streaming response, and reports when no models or only
+// one model are available rather than opening an empty/pointless picker.
+func (m *interactiveModel) openModelSelector() {
+	if m.modelSelector != nil {
+		return
+	}
+	if m.busy {
+		m.setStatus("Can't switch model while a response is streaming")
+		return
+	}
+	agent, err := runtimeAgent(m.runtime)
+	if err != nil {
+		m.setStatus(err.Error())
+		return
+	}
+	models := agent.availableModels()
+	overlay := newModelSelectorOverlay(models, agent.CurrentModel(), m.styles)
+	if overlay == nil {
+		m.setStatus("No models available")
+		return
+	}
+	if len(models) == 1 {
+		m.setStatus("Only one model available")
+		return
+	}
+	m.modelSelector = overlay
+}
+
+// handleModelSelectorKey routes a key to the open overlay and acts on the
+// result. Selecting closes the overlay and returns a tea.Cmd that performs the
+// model switch off the Update goroutine: SetModel emits ModelChangedEvent ->
+// m.post -> program.Send, which blocks on Bubble Tea's unbuffered msg channel
+// whose only reader is the Update goroutine, so a synchronous SetModel here
+// would deadlock (the same hazard slice 1's cycleModel guards against).
+// Success feedback rides the emitted ModelChangedEvent status line.
+func (m *interactiveModel) handleModelSelectorKey(key string) tea.Cmd {
+	if m.modelSelector == nil {
+		return nil
+	}
+	switch m.modelSelector.HandleKey(key) {
+	case modelSelectorSelect:
+		value, ok := m.modelSelector.SelectedValue()
+		m.modelSelector = nil
+		if !ok {
+			return nil
+		}
+		if m.busy {
+			m.setStatus("Can't switch model while a response is streaming")
+			return nil
+		}
+		return m.applyModelSelection(value)
+	case modelSelectorCancel:
+		m.modelSelector = nil
+		m.setStatus("Model selection cancelled.")
+		return nil
+	default:
+		return nil
+	}
+}
+
+// applyModelSelection switches to the provider/id value chosen in the overlay.
+// It runs in the returned tea.Cmd goroutine (never inline on Update) for the
+// deadlock reason documented on handleModelSelectorKey. A no-op (already the
+// active model) skips SetModel to avoid an unnecessary session model-change
+// entry and event.
+func (m *interactiveModel) applyModelSelection(value string) tea.Cmd {
+	provider, id, ok := strings.Cut(value, "/")
+	if !ok {
+		return nil
+	}
+	return func() tea.Msg {
+		agent, err := runtimeAgent(m.runtime)
+		if err != nil {
+			return modelSelectDoneMsg{Err: err}
+		}
+		currentModel := agent.CurrentModel()
+		if currentModel.Provider == provider && currentModel.ID == id {
+			return modelSelectDoneMsg{}
+		}
+		_, err = agent.SetModel(provider, id)
+		return modelSelectDoneMsg{Err: err}
+	}
 }

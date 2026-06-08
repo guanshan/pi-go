@@ -57,3 +57,28 @@ func TestReadWriteEditLsFindGrepTools(t *testing.T) {
 		t.Fatalf("grep failed: %#v", result)
 	}
 }
+
+func TestBuiltinToolsUseSettingsAgentBinDir(t *testing.T) {
+	cwd := t.TempDir()
+	agentDir := t.TempDir()
+	settings := NewSettingsManager(cwd, agentDir)
+	tools := BuiltinToolsForModel(cwd, settings, true)
+	want := filepath.Join(agentDir, "bin")
+
+	for name, tool := range tools {
+		switch typed := tool.(type) {
+		case catools.BashTool:
+			if typed.BinDir != want {
+				t.Fatalf("%s BinDir=%q, want %q", name, typed.BinDir, want)
+			}
+		case catools.GrepTool:
+			if typed.BinDir != want {
+				t.Fatalf("%s BinDir=%q, want %q", name, typed.BinDir, want)
+			}
+		case catools.FindTool:
+			if typed.BinDir != want {
+				t.Fatalf("%s BinDir=%q, want %q", name, typed.BinDir, want)
+			}
+		}
+	}
+}

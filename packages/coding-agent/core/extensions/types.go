@@ -2,6 +2,7 @@ package extensions
 
 import (
 	"context"
+	"encoding/json"
 
 	agentcore "github.com/guanshan/pi-go/packages/agent"
 	"github.com/guanshan/pi-go/packages/ai"
@@ -14,6 +15,90 @@ type CommandInfo struct {
 	Execute     func(context.Context, string) (string, error) `json:"-"`
 }
 
+type ShortcutDefinition struct {
+	Key         string
+	Description string
+	Source      string
+	Execute     func(context.Context) error `json:"-"`
+}
+
+type AutocompleteItem struct {
+	Value       string `json:"value"`
+	Label       string `json:"label,omitempty"`
+	Description string `json:"description,omitempty"`
+	Provider    int    `json:"-"`
+	ProviderID  uint64 `json:"-"`
+	Source      string `json:"-"`
+	SourceIndex int    `json:"-"`
+}
+
+type AutocompleteSuggestions struct {
+	Items  []AutocompleteItem `json:"items"`
+	Prefix string             `json:"prefix,omitempty"`
+}
+
+type AutocompleteRequest struct {
+	Lines      []string `json:"lines,omitempty"`
+	CursorLine int      `json:"cursorLine"`
+	CursorCol  int      `json:"cursorCol"`
+	Input      string   `json:"input,omitempty"`
+	Cursor     int      `json:"cursor,omitempty"`
+	Force      bool     `json:"force,omitempty"`
+}
+
+type AutocompleteApplyRequest struct {
+	Lines      []string         `json:"lines,omitempty"`
+	CursorLine int              `json:"cursorLine"`
+	CursorCol  int              `json:"cursorCol"`
+	Input      string           `json:"input,omitempty"`
+	Cursor     int              `json:"cursor,omitempty"`
+	Item       AutocompleteItem `json:"item"`
+	Prefix     string           `json:"prefix,omitempty"`
+}
+
+type AutocompleteApplyResult struct {
+	Lines      []string `json:"lines,omitempty"`
+	CursorLine int      `json:"cursorLine"`
+	CursorCol  int      `json:"cursorCol"`
+	Input      string   `json:"input,omitempty"`
+	Cursor     int      `json:"cursor,omitempty"`
+}
+
+type AutocompleteProviderDefinition struct {
+	ID      uint64 `json:"-"`
+	Source  string
+	Suggest func(context.Context, AutocompleteRequest) (AutocompleteSuggestions, error)      `json:"-"`
+	Apply   func(context.Context, AutocompleteApplyRequest) (AutocompleteApplyResult, error) `json:"-"`
+}
+
+type ProviderDefinition struct {
+	API          string
+	ProviderName string
+	Source       string
+	Provider     ai.Provider     `json:"-"`
+	ModelConfig  json.RawMessage `json:"-"`
+}
+
+type MessageRenderRequest struct {
+	CustomType  string `json:"customType"`
+	Content     any    `json:"content,omitempty"`
+	Display     bool   `json:"display"`
+	Details     any    `json:"details,omitempty"`
+	Expanded    bool   `json:"expanded"`
+	Width       int    `json:"width,omitempty"`
+	TimestampMs int64  `json:"timestamp,omitempty"`
+}
+
+type MessageRenderResult struct {
+	Lines []string `json:"lines,omitempty"`
+}
+
+type MessageRendererDefinition struct {
+	CustomType string
+	Source     string
+	Render     func(context.Context, MessageRenderRequest) (MessageRenderResult, error) `json:"-"`
+}
+
 // FlagDefinition is a CLI flag declared by an extension (mirroring the upstream
 // ExtensionFlag). Type is "boolean" or "string"; Default is the value used when
 // the flag is not supplied on the command line.
@@ -23,6 +108,37 @@ type FlagDefinition struct {
 	Type        string
 	Default     any
 }
+
+// ExtensionContextSnapshot is the host-backed state exposed to script
+// extensions as ExtensionContext. The bridge sends a fresh snapshot with each
+// host-initiated request so ctx values mirror the live session instead of the
+// compatibility-only defaults used before the host is bound.
+type ExtensionContextSnapshot struct {
+	CWD                string     `json:"cwd,omitempty"`
+	Mode               string     `json:"mode,omitempty"`
+	HasUI              bool       `json:"hasUI"`
+	Model              *ai.Model  `json:"model,omitempty"`
+	Models             []ai.Model `json:"models,omitempty"`
+	AvailableModels    []ai.Model `json:"availableModels,omitempty"`
+	IsIdle             bool       `json:"isIdle"`
+	HasPendingMessages bool       `json:"hasPendingMessages"`
+	SystemPrompt       string     `json:"systemPrompt,omitempty"`
+	SessionID          string     `json:"sessionId,omitempty"`
+	SessionFile        string     `json:"sessionFile,omitempty"`
+	Entries            any        `json:"entries,omitempty"`
+	BranchEntries      any        `json:"branchEntries,omitempty"`
+	LeafID             string     `json:"leafId,omitempty"`
+	ContextUsage       any        `json:"contextUsage,omitempty"`
+}
+
+type ExtensionContextProvider func() ExtensionContextSnapshot
+
+type ExtensionContextAction struct {
+	Name   string
+	Params json.RawMessage
+}
+
+type ExtensionContextActionHandler func(context.Context, ExtensionContextAction) (json.RawMessage, error)
 
 type ToolDefinition struct {
 	Name        string

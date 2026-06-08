@@ -423,10 +423,10 @@ func forkSessionAtPosition(source *SessionManager, entryID string, position Fork
 	}
 	leafID := entryID
 	if leafID == "" {
-		if source.CurrentID == nil {
+		leafID = source.CurrentLeafID()
+		if leafID == "" {
 			return nil, "", fmt.Errorf("nothing to clone yet")
 		}
-		leafID = *source.CurrentID
 	}
 	branch, err := source.BranchFrom(leafID)
 	if err != nil {
@@ -461,7 +461,7 @@ func cloneImportedSession(source *SessionManager, sessionDir string) (*SessionMa
 	if err != nil {
 		return nil, err
 	}
-	target.Entries = append(target.Entries, source.Entries...)
+	target.Entries = append(target.Entries, source.EntriesSnapshot()...)
 	retargetSessionLeaf(target)
 	return target.rewrite()
 }

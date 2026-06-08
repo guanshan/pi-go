@@ -1,28 +1,16 @@
 package harness
 
 import (
-	"encoding/json"
-	"fmt"
 	"time"
 
 	"github.com/guanshan/pi-go/packages/agent"
 	"github.com/guanshan/pi-go/packages/ai"
 )
 
-const CompactionSummaryPrefix = `The conversation history before this point was compacted into the following summary:
-
-<summary>
-`
-
-const CompactionSummarySuffix = `
-</summary>`
-
-const BranchSummaryPrefix = `The following is a summary of a branch that this conversation came back from:
-
-<summary>
-`
-
-const BranchSummarySuffix = `</summary>`
+const CompactionSummaryPrefix = ai.CompactionSummaryPrefix
+const CompactionSummarySuffix = ai.CompactionSummarySuffix
+const BranchSummaryPrefix = ai.BranchSummaryPrefix
+const BranchSummarySuffix = ai.BranchSummarySuffix
 
 type BashExecutionMessage struct {
 	Role               string `json:"role,omitempty"`
@@ -54,7 +42,7 @@ type CustomMessage struct {
 func (m CustomMessage) MessageRole() string { return "custom" }
 func (m CustomMessage) Timestamp() int64    { return m.TimestampMs }
 func (m CustomMessage) ContentBlocks() []ai.ContentBlock {
-	blocks, _ := customContentBlocks(m.Content)
+	blocks, _ := ai.CustomContentBlocks(m.Content)
 	return blocks
 }
 
@@ -68,7 +56,7 @@ type BranchSummaryMessage struct {
 func (m BranchSummaryMessage) MessageRole() string { return "branchSummary" }
 func (m BranchSummaryMessage) Timestamp() int64    { return m.TimestampMs }
 func (m BranchSummaryMessage) ContentBlocks() []ai.ContentBlock {
-	return ai.TextBlocks(BranchSummaryPrefix + m.Summary + BranchSummarySuffix)
+	return ai.TextBlocks(ai.BranchSummaryText(m.Summary))
 }
 
 type CompactionSummaryMessage struct {
@@ -81,46 +69,32 @@ type CompactionSummaryMessage struct {
 func (m CompactionSummaryMessage) MessageRole() string { return "compactionSummary" }
 func (m CompactionSummaryMessage) Timestamp() int64    { return m.TimestampMs }
 func (m CompactionSummaryMessage) ContentBlocks() []ai.ContentBlock {
-	return ai.TextBlocks(CompactionSummaryPrefix + m.Summary + CompactionSummarySuffix)
+	return ai.TextBlocks(ai.CompactionSummaryText(m.Summary))
 }
 
 func BashExecutionToText(msg agent.AgentMessage) string {
 	switch m := msg.(type) {
 	case BashExecutionMessage:
-		return formatBashExecution(m.Command, m.Output, m.ExitCode, m.Cancelled, m.Truncated, m.FullOutputPath)
+		return ai.FormatBashExecutionText(m.Command, m.Output, m.ExitCode, m.Cancelled, m.Truncated, m.FullOutputPath)
 	case *BashExecutionMessage:
 		if m == nil {
 			return ""
 		}
-		return formatBashExecution(m.Command, m.Output, m.ExitCode, m.Cancelled, m.Truncated, m.FullOutputPath)
+		return ai.FormatBashExecutionText(m.Command, m.Output, m.ExitCode, m.Cancelled, m.Truncated, m.FullOutputPath)
 	default:
 		custom, _ := ai.AsCustomMessage(msg)
-		return formatBashExecution(custom.Command, custom.Output, custom.ExitCode, custom.Cancelled, custom.Truncated, custom.FullOutputPath)
+		return ai.FormatBashExecutionText(custom.Command, custom.Output, custom.ExitCode, custom.Cancelled, custom.Truncated, custom.FullOutputPath)
 	}
-}
-
-func formatBashExecution(command string, output string, exitCode *int, cancelled bool, truncated bool, fullOutputPath string) string {
-	text := fmt.Sprintf("Ran `%s`\n", command)
-	if output != "" {
-		text += "```\n" + output + "\n```"
-	} else {
-		text += "(no output)"
-	}
-	if cancelled {
-		text += "\n\n(command cancelled)"
-	} else if exitCode != nil && *exitCode != 0 {
-		text += fmt.Sprintf("\n\nCommand exited with code %d", *exitCode)
-	}
-	if truncated && fullOutputPath != "" {
-		text += "\n\n[Output truncated. Full output: " + fullOutputPath + "]"
-	}
-	return text
 }
 
 func ConvertToLLM(messages []agent.AgentMessage) ([]ai.Message, error) {
 	out := make([]ai.Message, 0, len(messages))
 	for _, message := range messages {
 		if converted, ok := convertKnownHarnessMessage(message); ok {
+			out = append(out, converted...)
+			continue
+		}
+		if converted, ok := ai.NormalizeProviderContentMessage(message); ok {
 			out = append(out, converted...)
 			continue
 		}
@@ -146,13 +120,13 @@ func convertCustomAIMessage(custom ai.CustomMessage) []ai.Message {
 		}
 		return []ai.Message{ai.UserMessage{Role: "user", Content: ai.TextBlocks(BashExecutionToText(custom)), TimestampMs: custom.Timestamp()}}
 	case "custom":
-		if blocks, ok := customContentBlocks(custom.Content); ok {
+		if blocks, ok := ai.CustomContentBlocks(custom.Content); ok && len(blocks) > 0 {
 			return []ai.Message{ai.UserMessage{Role: "user", Content: blocks, TimestampMs: custom.Timestamp()}}
 		}
 	case "branchSummary":
-		return []ai.Message{ai.UserMessage{Role: "user", Content: ai.TextBlocks(BranchSummaryPrefix + custom.Summary + BranchSummarySuffix), TimestampMs: custom.Timestamp()}}
+		return []ai.Message{ai.UserMessage{Role: "user", Content: ai.TextBlocks(ai.BranchSummaryText(custom.Summary)), TimestampMs: custom.Timestamp()}}
 	case "compactionSummary":
-		return []ai.Message{ai.UserMessage{Role: "user", Content: ai.TextBlocks(CompactionSummaryPrefix + custom.Summary + CompactionSummarySuffix), TimestampMs: custom.Timestamp()}}
+		return []ai.Message{ai.UserMessage{Role: "user", Content: ai.TextBlocks(ai.CompactionSummaryText(custom.Summary)), TimestampMs: custom.Timestamp()}}
 	}
 	return nil
 }
@@ -170,7 +144,7 @@ func convertKnownHarnessMessage(message agent.AgentMessage) ([]ai.Message, bool)
 		}
 		return []ai.Message{ai.UserMessage{Role: "user", Content: ai.TextBlocks(BashExecutionToText(m)), TimestampMs: m.Timestamp()}}, true
 	case CustomMessage:
-		if blocks, ok := customContentBlocks(m.Content); ok {
+		if blocks, ok := ai.CustomContentBlocks(m.Content); ok && len(blocks) > 0 {
 			return []ai.Message{ai.UserMessage{Role: "user", Content: blocks, TimestampMs: m.Timestamp()}}, true
 		}
 		return nil, true
@@ -178,7 +152,7 @@ func convertKnownHarnessMessage(message agent.AgentMessage) ([]ai.Message, bool)
 		if m == nil {
 			return nil, true
 		}
-		if blocks, ok := customContentBlocks(m.Content); ok {
+		if blocks, ok := ai.CustomContentBlocks(m.Content); ok && len(blocks) > 0 {
 			return []ai.Message{ai.UserMessage{Role: "user", Content: blocks, TimestampMs: m.Timestamp()}}, true
 		}
 		return nil, true
@@ -199,45 +173,6 @@ func convertKnownHarnessMessage(message agent.AgentMessage) ([]ai.Message, bool)
 	default:
 		return nil, false
 	}
-}
-
-func customContentBlocks(content any) ([]ai.ContentBlock, bool) {
-	switch value := content.(type) {
-	case string:
-		// TS: typeof content === "string" ? [{type:"text", text: content}] : content.
-		return ai.TextBlocks(value), true
-	case []ai.ContentBlock:
-		return value, true
-	case nil:
-		// TS still emits a user message with the (empty/undefined) content array.
-		return nil, true
-	default:
-		// After reloading a session from JSONL, an array content field decodes to
-		// []interface{} (each element a map[string]any), not []ai.ContentBlock.
-		// TS passes m.content through unchanged; the Go equivalent re-encodes the
-		// decoded value and parses it into typed content blocks so text and image
-		// blocks survive. This mirrors how ai.UnmarshalMessageJSON parses content.
-		blocks, err := normalizeContentBlocks(value)
-		if err != nil {
-			return nil, false
-		}
-		return blocks, true
-	}
-}
-
-// normalizeContentBlocks converts a JSON-decoded content value (typically
-// []interface{} of map[string]any from a reloaded session) into typed
-// ai.ContentBlock values by round-tripping through JSON.
-func normalizeContentBlocks(value any) ([]ai.ContentBlock, error) {
-	raw, err := json.Marshal(value)
-	if err != nil {
-		return nil, err
-	}
-	var blocks []ai.ContentBlock
-	if err := json.Unmarshal(raw, &blocks); err != nil {
-		return nil, err
-	}
-	return blocks, nil
 }
 
 func CreateBranchSummaryMessage(summary, fromID, timestamp string) agent.AgentMessage {

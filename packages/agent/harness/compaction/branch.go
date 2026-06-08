@@ -2,7 +2,6 @@ package compaction
 
 import (
 	"context"
-	"encoding/json"
 	"time"
 
 	"github.com/guanshan/pi-go/packages/agent"
@@ -214,6 +213,10 @@ func messageFromEntry(entry session.Entry) (agent.AgentMessage, bool) {
 func messagesToLLM(messages []agent.AgentMessage) ([]ai.Message, error) {
 	out := make([]ai.Message, 0, len(messages))
 	for _, message := range messages {
+		if converted, ok := ai.NormalizeProviderContentMessage(message); ok {
+			out = append(out, converted...)
+			continue
+		}
 		switch m := message.(type) {
 		case ai.UserMessage, *ai.UserMessage, ai.AssistantMessage, *ai.AssistantMessage, ai.ToolResultMessage, *ai.ToolResultMessage:
 			out = append(out, message)
@@ -235,42 +238,15 @@ func convertCompactionCustomMessage(custom ai.CustomMessage) []ai.Message {
 		// produces a user message for custom entries, passing array content through
 		// unchanged. After reloading a session from JSONL the content decodes to
 		// []interface{}, so normalize it to typed blocks rather than dropping it.
-		if blocks, ok := compactionCustomContentBlocks(custom.Content); ok {
+		if blocks, ok := ai.CustomContentBlocks(custom.Content); ok && len(blocks) > 0 {
 			return []ai.Message{ai.UserMessage{Role: "user", Content: blocks, TimestampMs: custom.Timestamp()}}
 		}
 	case "branchSummary":
-		return []ai.Message{ai.UserMessage{Role: "user", Content: ai.TextBlocks(branchSummaryPrefix + custom.Summary + branchSummarySuffix), TimestampMs: custom.Timestamp()}}
+		return []ai.Message{ai.UserMessage{Role: "user", Content: ai.TextBlocks(ai.BranchSummaryText(custom.Summary)), TimestampMs: custom.Timestamp()}}
 	case "compactionSummary":
-		return []ai.Message{ai.UserMessage{Role: "user", Content: ai.TextBlocks(compactionSummaryPrefix + custom.Summary + compactionSummarySuffix), TimestampMs: custom.Timestamp()}}
+		return []ai.Message{ai.UserMessage{Role: "user", Content: ai.TextBlocks(ai.CompactionSummaryText(custom.Summary)), TimestampMs: custom.Timestamp()}}
 	}
 	return nil
-}
-
-// compactionCustomContentBlocks mirrors harness.customContentBlocks: it turns a
-// custom message's content (string, typed blocks, or the []interface{} shape
-// produced by reloading a session from JSONL) into typed content blocks. The
-// bool reports whether a user message should be emitted (always true except when
-// the content cannot be normalized at all), matching TS which never drops a
-// custom message.
-func compactionCustomContentBlocks(content any) ([]ai.ContentBlock, bool) {
-	switch value := content.(type) {
-	case string:
-		return ai.TextBlocks(value), true
-	case []ai.ContentBlock:
-		return value, true
-	case nil:
-		return nil, true
-	default:
-		raw, err := json.Marshal(value)
-		if err != nil {
-			return nil, false
-		}
-		var blocks []ai.ContentBlock
-		if err := json.Unmarshal(raw, &blocks); err != nil {
-			return nil, false
-		}
-		return blocks, true
-	}
 }
 
 func commonAncestorID(a, b []session.Entry) *string {
@@ -326,23 +302,8 @@ Use this EXACT format:
 
 Keep each section concise. Preserve exact file paths, function names, and error messages.`
 
-const compactionSummaryPrefix = `The conversation history before this point was compacted into the following summary:
-
-<summary>
-`
-
-const compactionSummarySuffix = `
-</summary>`
-
-const branchSummaryPrefix = `The following is a summary of a branch that this conversation came back from:
-
-<summary>
-`
-
-const branchSummarySuffix = `</summary>`
-
 func createBranchSummaryMessage(summary, fromID, timestamp string) agent.AgentMessage {
-	return ai.CustomMessage{
+	return session.BranchSummaryMessage{
 		Role:        "branchSummary",
 		Summary:     summary,
 		FromID:      fromID,
@@ -351,7 +312,7 @@ func createBranchSummaryMessage(summary, fromID, timestamp string) agent.AgentMe
 }
 
 func createCompactionSummaryMessage(summary string, tokensBefore int, timestamp string) agent.AgentMessage {
-	return ai.CustomMessage{
+	return session.CompactionSummaryMessage{
 		Role:         "compactionSummary",
 		Summary:      summary,
 		TokensBefore: tokensBefore,
@@ -360,7 +321,7 @@ func createCompactionSummaryMessage(summary string, tokensBefore int, timestamp 
 }
 
 func createCustomMessage(customType string, content any, display bool, details any, timestamp string) agent.AgentMessage {
-	return ai.CustomMessage{
+	return session.CustomSessionMessage{
 		Role:        "custom",
 		CustomType:  customType,
 		Content:     content,

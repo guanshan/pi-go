@@ -1,0 +1,26 @@
+{
+  "input": [
+    {
+      "content": "system prompt",
+      "role": "system"
+    },
+    {
+      "content": [
+        {
+          "text": "describe this",
+          "type": "input_text"
+        },
+        {
+          "detail": "auto",
+          "image_url": "data:image/png;base64,aGVsbG8=",
+          "type": "input_image"
+        }
+      ],
+      "role": "user"
+    }
+  ],
+  "max_output_tokens": 64,
+  "model": "gpt-image-golden",
+  "store": false,
+  "stream": false
+}

@@ -91,4 +91,5 @@ func TestAnthropicMessagesPayloadGolden(t *testing.T) {
 	if !bytes.Equal(got, want) {
 		t.Fatalf("Anthropic messages payload golden mismatch\n--- got ---\n%s\n--- want ---\n%s", got, want)
 	}
+	assertTSProviderFixture(t, got, "anthropic_messages_payload.golden.json")
 }

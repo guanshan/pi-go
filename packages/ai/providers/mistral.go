@@ -117,8 +117,9 @@ func MistralMessages(system string, messages []MistralMessage, supportsImages bo
 	}
 	normalizer := NewMistralToolCallIDNormalizer()
 	for _, msg := range messages {
+		msg.Role = providerMessageRoleAsUser(msg.Role)
 		switch msg.Role {
-		case "user", "compactionSummary", "branchSummary", "custom":
+		case "user":
 			if mapped, ok := mistralUserMessage(msg, supportsImages); ok {
 				out = append(out, mapped)
 			}

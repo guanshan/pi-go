@@ -2,6 +2,7 @@ package core
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -69,6 +70,35 @@ func TestCreateAgentSessionServicesLoadsResourcesAndDiagnostics(t *testing.T) {
 	}
 }
 
+func TestLoadResourcesAnnotatesPromptAndSkillSourceInfo(t *testing.T) {
+	cwd := t.TempDir()
+	agentDir := t.TempDir()
+	projectPromptDir := filepath.Join(ProjectPiDir(cwd), "prompts")
+	userSkillDir := filepath.Join(agentDir, "skills", "go")
+	if err := os.MkdirAll(projectPromptDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(userSkillDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(projectPromptDir, "review.md"), []byte("Review code carefully"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(userSkillDir, "SKILL.md"), []byte("---\ndescription: Use Go guidance\n---\nbody"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	resources := LoadResources(cwd, agentDir, cli.Args{NoContextFiles: true, NoExtensions: true, NoThemes: true}, NewSettingsManager(cwd, agentDir))
+	prompt := resources.PromptTemplates["review"]
+	if prompt.SourceInfo.Scope != "project" || prompt.SourceInfo.Source != "auto" || prompt.SourceInfo.Path == "" {
+		t.Fatalf("prompt source info=%#v", prompt.SourceInfo)
+	}
+	skill := resources.Skills["go"]
+	if skill.SourceInfo.Scope != "user" || skill.SourceInfo.Source != "auto" || skill.SourceInfo.Path == "" {
+		t.Fatalf("skill source info=%#v", skill.SourceInfo)
+	}
+}
+
 func TestCreateAgentSessionFromServicesUsesScopedModelAndToolFilter(t *testing.T) {
 	cwd := t.TempDir()
 	agentDir := t.TempDir()
@@ -115,6 +145,79 @@ func TestCreateAgentSessionFromServicesUsesScopedModelAndToolFilter(t *testing.T
 	}
 	if created.ModelFallbackMessage != "" {
 		t.Fatalf("unexpected fallback=%q", created.ModelFallbackMessage)
+	}
+}
+
+func TestCreateAgentSessionFromServicesBindsScriptExtensionContext(t *testing.T) {
+	if _, err := exec.LookPath("node"); err != nil {
+		t.Skip("node not available")
+	}
+	cwd := t.TempDir()
+	agentDir := t.TempDir()
+	ext := writeScriptExtension(t, `export default function (pi) {
+		pi.registerTool({
+			name: "ctxprobe",
+			description: "read host-backed context",
+			parameters: { type: "object", properties: {} },
+			execute(_id, _params, _signal, _update, ctx) {
+				return { content: [{ type: "text", text: JSON.stringify({
+					cwd: ctx.cwd,
+					mode: ctx.mode,
+					model: ctx.model?.provider + "/" + ctx.model?.id,
+					systemPrompt: ctx.getSystemPrompt(),
+					branch: ctx.sessionManager.getBranch().length,
+					leaf: ctx.sessionManager.getLeafId(),
+					models: ctx.modelRegistry.list("faux").length,
+					idle: ctx.isIdle(),
+				}) }] };
+			},
+		});
+	}`)
+	registry := ai.NewModelRegistry(agentDir, ai.NewAuthStorage(agentDir))
+	faux, ok, _ := registry.Match("faux", "faux")
+	if !ok {
+		t.Fatal("missing faux model")
+	}
+	services, err := CreateAgentSessionServices(context.Background(), CreateAgentSessionServicesOptions{
+		Cwd:           cwd,
+		AgentDir:      agentDir,
+		ModelRegistry: registry,
+		ResourceLoaderOptions: DefaultResourceLoaderOptions{
+			AdditionalExtensionPaths: []string{ext},
+			NoContextFiles:           true,
+			NoSkills:                 true,
+			NoPromptTemplates:        true,
+			NoThemes:                 true,
+			SystemPrompt:             "custom system prompt",
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	created, err := CreateAgentSessionFromServices(context.Background(), CreateAgentSessionFromServicesOptions{
+		Services: services,
+		Model:    faux,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { created.Session.shutdownExtensionRuntime(context.Background()) })
+	if err := created.Session.Session.AppendMessage(ai.NewUserMessage("hello", nil)); err != nil {
+		t.Fatal(err)
+	}
+	tool := created.Session.Tools["ctxprobe"]
+	if tool == nil {
+		t.Fatalf("ctxprobe tool missing; tools=%v", created.Session.Tools)
+	}
+	result := tool.Execute(context.Background(), json.RawMessage(`{}`), nil)
+	got := ai.MessageText(ai.ToolResultMessage{Content: result.Content})
+	for _, want := range []string{`"cwd":"` + cwd + `"`, `"mode":"print"`, `"model":"faux/faux"`, `"systemPrompt":"custom system prompt`, `"branch":1`, `"models":1`, `"idle":true`} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("context output missing %s in %s", want, got)
+		}
+	}
+	if strings.Contains(got, `"leaf":""`) {
+		t.Fatalf("expected non-empty leaf id in %s", got)
 	}
 }
 

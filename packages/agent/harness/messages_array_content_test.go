@@ -99,6 +99,37 @@ func TestConvertToLLMPreservesArrayContentCustomMessage(t *testing.T) {
 	}
 }
 
+func TestConvertToLLMDropsEmptyCustomContent(t *testing.T) {
+	llm, err := ConvertToLLM([]agent.AgentMessage{
+		CustomMessage{Role: "custom", CustomType: "empty", Content: nil, TimestampMs: 5},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(llm) != 0 {
+		t.Fatalf("empty custom content should be dropped, got %#v", llm)
+	}
+}
+
+func TestConvertToLLMConvertsScalarCustomContentToText(t *testing.T) {
+	llm, err := ConvertToLLM([]agent.AgentMessage{
+		CustomMessage{Role: "custom", CustomType: "flag", Content: true, TimestampMs: 5},
+		session.CustomSessionMessage{Role: "custom", CustomType: "count", Content: float64(42), TimestampMs: 6},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(llm) != 2 {
+		t.Fatalf("expected two scalar custom messages, got %#v", llm)
+	}
+	if got := ai.MessageText(llm[0]); got != "true" {
+		t.Fatalf("bool custom text=%q", got)
+	}
+	if got := ai.MessageText(llm[1]); got != "42" {
+		t.Fatalf("number custom text=%q", got)
+	}
+}
+
 // TestSessionReloadPreservesArrayContentCustomMessage verifies R3-P1-1 end to
 // end: a custom message with array content (text + image) written to a JSONL
 // session must, after reload, still appear in the LLM context with both blocks.

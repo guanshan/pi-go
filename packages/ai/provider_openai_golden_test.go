@@ -89,4 +89,5 @@ func TestOpenAIChatPayloadGolden(t *testing.T) {
 	if !bytes.Equal(got, want) {
 		t.Fatalf("OpenAI chat payload golden mismatch\n--- got ---\n%s\n--- want ---\n%s", got, want)
 	}
+	assertTSProviderFixture(t, got, "openai_chat_payload.golden.json")
 }

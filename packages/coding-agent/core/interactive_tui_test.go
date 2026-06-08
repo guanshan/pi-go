@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
@@ -137,6 +138,177 @@ func TestInteractiveBashSubmitIsCancellable(t *testing.T) {
 	}
 }
 
+func TestInteractiveLargePasteFoldsAndExpandsOnSubmit(t *testing.T) {
+	runtime := testInteractiveRuntime(t)
+	model, err := newInteractiveModel(context.Background(), runtime, "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := numberedLines(12)
+	model.Update(tea.PasteMsg{Content: lines})
+	marker := "[paste #1 +12 lines]"
+	if got := model.input.Value(); got != marker {
+		t.Fatalf("input after large paste=%q want %q", got, marker)
+	}
+	if expanded := model.expandedInputText(); expanded != lines {
+		t.Fatalf("expanded paste=%q want original", expanded)
+	}
+
+	cmd := model.submitInputWithBehavior("")
+	if cmd == nil {
+		t.Fatal("submit returned nil command")
+	}
+	msg := cmd()
+	if done, ok := msg.(interactivePromptDoneMsg); !ok || done.Err != nil {
+		t.Fatalf("prompt cmd result=%#v", msg)
+	}
+	if model.input.Value() != "" {
+		t.Fatalf("input not reset: %q", model.input.Value())
+	}
+	if len(model.pastes) != 0 {
+		t.Fatalf("pastes not cleared: %#v", model.pastes)
+	}
+	if len(model.history) != 1 || model.history[0] != lines {
+		t.Fatalf("history=%#v want expanded paste", model.history)
+	}
+	ctx := runtime.Session().Session.BuildContext()
+	if len(ctx.Messages) < 1 || ai.MessageText(ctx.Messages[0]) != lines {
+		t.Fatalf("session messages=%#v want expanded paste", ctx.Messages)
+	}
+	rendered := model.renderTranscript(100)
+	if !strings.Contains(rendered, marker) {
+		t.Fatalf("transcript should echo collapsed marker, got:\n%s", rendered)
+	}
+}
+
+func TestInteractivePasteCleaningAndPathSpacing(t *testing.T) {
+	if got := cleanPastedText("a\r\nb\x1b[106;5uc\t"); got != "a\nb\nc    " {
+		t.Fatalf("cleanPastedText=%q", got)
+	}
+	if !shouldPrependSpaceForPastedPath("./file.go", 'x') {
+		t.Fatal("expected path paste after word rune to request a leading space")
+	}
+	if shouldPrependSpaceForPastedPath("./file.go", ' ') {
+		t.Fatal("space before path should not request another leading space")
+	}
+	runtime := testInteractiveRuntime(t)
+	model, err := newInteractiveModel(context.Background(), runtime, "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	model.input.SetValue("open")
+	model.input.MoveToEnd()
+	model.Update(tea.PasteMsg{Content: "./file.go"})
+	if got := model.input.Value(); got != "open ./file.go" {
+		t.Fatalf("path paste input=%q", got)
+	}
+}
+
+func TestInteractiveLargeCharPasteUsesCharMarker(t *testing.T) {
+	runtime := testInteractiveRuntime(t)
+	model, err := newInteractiveModel(context.Background(), runtime, "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := strings.Repeat("x", largePasteCharThreshold+1)
+	model.handlePaste(text)
+	if got := model.input.Value(); got != "[paste #1 1001 chars]" {
+		t.Fatalf("char paste marker=%q", got)
+	}
+	if model.expandedInputText() != text {
+		t.Fatal("char paste marker did not expand to original text")
+	}
+}
+
+func TestInteractiveToolTranscriptPreviewAndExpand(t *testing.T) {
+	runtime := testInteractiveRuntime(t)
+	model, err := newInteractiveModel(context.Background(), runtime, "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	model.messages = nil
+	model.appendMessageEntry(interactiveMessage{
+		Role:     interactiveRoleTool,
+		Kind:     interactiveMessageTool,
+		ToolName: "read",
+		Text:     numberedLines(25),
+	})
+
+	collapsed := model.renderTranscript(80)
+	if !strings.Contains(collapsed, "[read]") || !strings.Contains(collapsed, "... 5 more lines") {
+		t.Fatalf("collapsed transcript missing title/preview notice:\n%s", collapsed)
+	}
+	if strings.Contains(collapsed, "line-01") || !strings.Contains(collapsed, "line-25") {
+		t.Fatalf("collapsed transcript did not show tail preview:\n%s", collapsed)
+	}
+
+	model.toolsExpanded = true
+	expanded := model.renderTranscript(80)
+	if !strings.Contains(expanded, "line-01") || !strings.Contains(expanded, "ctrl+o to collapse") {
+		t.Fatalf("expanded transcript missing full output/collapse hint:\n%s", expanded)
+	}
+}
+
+func TestInteractiveToolEventRendersArgsAndErrorState(t *testing.T) {
+	runtime := testInteractiveRuntime(t)
+	model, err := newInteractiveModel(context.Background(), runtime, "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	model.messages = nil
+	model.toolsExpanded = true
+
+	model.applyAgentEvent(ai.Event{
+		"type":       "tool_execution_start",
+		"toolName":   "edit",
+		"toolCallId": "call-1",
+		"args":       json.RawMessage(`{"file":"main.go"}`),
+	})
+	model.applyAgentEvent(ai.Event{
+		"type":       "tool_execution_end",
+		"toolName":   "edit",
+		"toolCallId": "call-1",
+		"result":     ai.ToolResult{Content: ai.TextBlocks("-old\n+new"), IsError: true},
+		"isError":    true,
+	})
+
+	rendered := model.renderTranscript(80)
+	for _, want := range []string{"[edit]", "error", "args:", "\"file\": \"main.go\"", "-old", "+new"} {
+		if !strings.Contains(rendered, want) {
+			t.Fatalf("rendered transcript missing %q:\n%s", want, rendered)
+		}
+	}
+}
+
+func TestInteractiveBashTranscriptPreview(t *testing.T) {
+	runtime := testInteractiveRuntime(t)
+	model, err := newInteractiveModel(context.Background(), runtime, "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	model.messages = nil
+	exit := 1
+	model.appendBashMessage(interactiveBashResult{
+		Command:  "printf lines",
+		Output:   numberedLines(25),
+		ExitCode: &exit,
+		IsError:  true,
+	})
+
+	collapsed := model.renderTranscript(80)
+	if !strings.Contains(collapsed, "$ printf lines") || !strings.Contains(collapsed, "... 5 more lines") || !strings.Contains(collapsed, "exit 1") {
+		t.Fatalf("collapsed bash transcript missing command/status:\n%s", collapsed)
+	}
+	if strings.Contains(collapsed, "line-01") {
+		t.Fatalf("collapsed bash transcript showed hidden head:\n%s", collapsed)
+	}
+	model.toolsExpanded = true
+	expanded := model.renderTranscript(80)
+	if !strings.Contains(expanded, "line-01") || !strings.Contains(expanded, "ctrl+o to collapse") {
+		t.Fatalf("expanded bash transcript missing full output/collapse hint:\n%s", expanded)
+	}
+}
+
 func TestInteractiveModelAndResourceSuggestions(t *testing.T) {
 	runtime := testInteractiveRuntime(t)
 	agent := runtime.Session()
@@ -156,6 +328,186 @@ func TestInteractiveModelAndResourceSuggestions(t *testing.T) {
 	if !slices.Contains(suggestions, "/model openai/zz-test") {
 		t.Fatalf("model suggestion missing: %#v", suggestions)
 	}
+}
+
+func TestInteractiveAutocompleteDropdownRendersDescriptions(t *testing.T) {
+	runtime := testInteractiveRuntime(t)
+	agent := runtime.Session()
+	agent.Resources.PromptTemplates["review"] = PromptTemplate{Name: "review", Content: "Review code carefully\nwith extra context"}
+	agent.Resources.Skills["go"] = Skill{Name: "go", Description: "Use Go project guidance"}
+	agent.SetScopedModels([]ScopedModel{{Model: ai.Model{Provider: "openai", ID: "zz-test"}}})
+	api := coreext.NewAPI()
+	api.RegisterCommandHandler("deploy", "Deploy the current app", nil)
+	agent.extensionRuntime = coreext.NewRunnerWithAPI(api)
+
+	model, err := newInteractiveModel(context.Background(), runtime, "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	model.width = 100
+
+	model.input.SetValue("/mo")
+	rendered := model.renderSuggestions()
+	if !strings.Contains(rendered, "/model") || !strings.Contains(rendered, "Select model") {
+		t.Fatalf("slash command description missing:\n%s", rendered)
+	}
+	for _, suggestion := range model.currentSuggestions() {
+		if strings.Contains(suggestion, "Select model") {
+			t.Fatalf("currentSuggestions should contain values only, got %#v", model.currentSuggestions())
+		}
+	}
+
+	model.input.SetValue("/review")
+	if rendered = model.renderSuggestions(); !strings.Contains(rendered, "Review code carefully") {
+		t.Fatalf("prompt template description missing:\n%s", rendered)
+	}
+	model.input.SetValue("/skill:g")
+	if rendered = model.renderSuggestions(); !strings.Contains(rendered, "Use Go project guidance") {
+		t.Fatalf("skill description missing:\n%s", rendered)
+	}
+	model.input.SetValue("/dep")
+	if rendered = model.renderSuggestions(); !strings.Contains(rendered, "Deploy the current app") {
+		t.Fatalf("extension command description missing:\n%s", rendered)
+	}
+	model.input.SetValue("/model zz")
+	if rendered = model.renderSuggestions(); !strings.Contains(rendered, "/model openai/zz-test") || !strings.Contains(rendered, "openai") {
+		t.Fatalf("model suggestion description missing:\n%s", rendered)
+	}
+}
+
+func TestInteractiveAutocompletePrefixesSourceDescriptions(t *testing.T) {
+	runtime := testInteractiveRuntime(t)
+	agent := runtime.Session()
+	agent.Resources.PromptTemplates["review"] = PromptTemplate{
+		Name:       "review",
+		Content:    "Review code carefully",
+		SourceInfo: ResourceSourceInfo{Source: "auto", Scope: "project"},
+	}
+	agent.Resources.Skills["go"] = Skill{
+		Name:        "go",
+		Description: "Use Go guidance",
+		SourceInfo:  ResourceSourceInfo{Source: "local", Scope: "user"},
+	}
+	agent.Resources.Skills["ship"] = Skill{
+		Name:        "ship",
+		Description: "Ship package flow",
+		SourceInfo:  ResourceSourceInfo{Source: "npm:@scope/pkg@1.2.3", Scope: "user"},
+	}
+
+	model, err := newInteractiveModel(context.Background(), runtime, "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	model.width = 120
+
+	model.input.SetValue("/review")
+	if rendered := model.renderSuggestions(); !strings.Contains(rendered, "[p] Review code carefully") {
+		t.Fatalf("project source tag missing:\n%s", rendered)
+	}
+	model.input.SetValue("/skill:g")
+	if rendered := model.renderSuggestions(); !strings.Contains(rendered, "[u] Use Go guidance") {
+		t.Fatalf("user source tag missing:\n%s", rendered)
+	}
+	model.input.SetValue("/skill:s")
+	if rendered := model.renderSuggestions(); !strings.Contains(rendered, "[u:npm:@scope/pkg@1.2.3] Ship package flow") {
+		t.Fatalf("npm source tag missing:\n%s", rendered)
+	}
+	for _, suggestion := range model.currentSuggestions() {
+		if strings.Contains(suggestion, "[") {
+			t.Fatalf("source tag leaked into completion value: %#v", model.currentSuggestions())
+		}
+	}
+}
+
+func TestInteractiveExtensionAutocompleteReplacesPrefix(t *testing.T) {
+	runtime := testInteractiveRuntime(t)
+	api := coreext.NewAPI()
+	api.RegisterAutocompleteProvider(coreext.AutocompleteProviderDefinition{
+		Source: "test",
+		Suggest: func(_ context.Context, request coreext.AutocompleteRequest) (coreext.AutocompleteSuggestions, error) {
+			if !strings.HasSuffix(request.Input, "#1") {
+				return coreext.AutocompleteSuggestions{}, nil
+			}
+			return coreext.AutocompleteSuggestions{
+				Prefix: "#1",
+				Items: []coreext.AutocompleteItem{{
+					Value:       "#123",
+					Label:       "#123",
+					Description: "Fix login flow",
+				}},
+			}, nil
+		},
+	})
+	runtime.Session().extensionRuntime = coreext.NewRunnerWithAPI(api)
+
+	model, err := newInteractiveModel(context.Background(), runtime, "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	model.input.SetValue("fix #1")
+	suggestions := model.currentSuggestions()
+	if !slices.Contains(suggestions, "#123") {
+		t.Fatalf("extension suggestion missing: %#v", suggestions)
+	}
+	if rendered := model.renderSuggestions(); !strings.Contains(rendered, "Fix login flow") {
+		t.Fatalf("extension autocomplete description missing:\n%s", rendered)
+	}
+	if !model.completeSlashCommand() {
+		t.Fatal("expected extension completion")
+	}
+	if got := model.input.Value(); got != "fix #123 " {
+		t.Fatalf("completed value=%q want prefix replacement", got)
+	}
+}
+
+func TestInteractiveExtensionAutocompleteUsesApplyCompletion(t *testing.T) {
+	runtime := testInteractiveRuntime(t)
+	api := coreext.NewAPI()
+	api.RegisterAutocompleteProvider(coreext.AutocompleteProviderDefinition{
+		Source: "test",
+		Suggest: func(_ context.Context, request coreext.AutocompleteRequest) (coreext.AutocompleteSuggestions, error) {
+			if !strings.HasSuffix(request.Input, "#1") {
+				return coreext.AutocompleteSuggestions{}, nil
+			}
+			return coreext.AutocompleteSuggestions{
+				Prefix: "#1",
+				Items: []coreext.AutocompleteItem{{
+					Value: "#123",
+					Label: "#123",
+				}},
+			}, nil
+		},
+		Apply: func(_ context.Context, request coreext.AutocompleteApplyRequest) (coreext.AutocompleteApplyResult, error) {
+			lines := append([]string(nil), request.Lines...)
+			replacement := "issue:" + strings.TrimPrefix(request.Item.Value, "#")
+			lines[request.CursorLine] = strings.Replace(lines[request.CursorLine], request.Prefix, replacement+" tail", 1)
+			return coreext.AutocompleteApplyResult{Lines: lines, CursorLine: request.CursorLine, CursorCol: len("fix " + replacement)}, nil
+		},
+	})
+	runtime.Session().extensionRuntime = coreext.NewRunnerWithAPI(api)
+
+	model, err := newInteractiveModel(context.Background(), runtime, "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	model.input.SetValue("fix #1")
+	if !model.completeSlashCommand() {
+		t.Fatal("expected extension completion")
+	}
+	if got := model.input.Value(); got != "fix issue:123 tail" {
+		t.Fatalf("completed value=%q want custom apply result", got)
+	}
+	if model.input.Line() != 0 || model.input.Column() != len("fix issue:123") {
+		t.Fatalf("cursor line/col=%d/%d want 0/%d", model.input.Line(), model.input.Column(), len("fix issue:123"))
+	}
+}
+
+func numberedLines(count int) string {
+	var lines []string
+	for i := 1; i <= count; i++ {
+		lines = append(lines, fmt.Sprintf("line-%02d", i))
+	}
+	return strings.Join(lines, "\n")
 }
 
 func TestInteractiveInputHistoryNavigation(t *testing.T) {
@@ -411,6 +763,43 @@ func TestInteractivePathCompletionQuotedDirectoryContinues(t *testing.T) {
 	}
 }
 
+func TestInteractiveFileCompletionCachesDirectoryReadForSameInput(t *testing.T) {
+	runtime := testInteractiveRuntime(t)
+	cwd := runtime.Session().Session.CWD()
+	if err := os.WriteFile(filepath.Join(cwd, "src.go"), []byte("package main"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	model, err := newInteractiveModel(context.Background(), runtime, "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	oldReadDir := interactiveReadDir
+	readCount := 0
+	interactiveReadDir = func(name string) ([]os.DirEntry, error) {
+		readCount++
+		return oldReadDir(name)
+	}
+	t.Cleanup(func() { interactiveReadDir = oldReadDir })
+
+	model.input.SetValue("@")
+	if suggestions := model.currentSuggestions(); !slices.Contains(suggestions, "@src.go") {
+		t.Fatalf("expected @ file suggestion, got %#v", suggestions)
+	}
+	if suggestions := model.currentSuggestions(); !slices.Contains(suggestions, "@src.go") {
+		t.Fatalf("expected cached @ file suggestion, got %#v", suggestions)
+	}
+	if readCount != 1 {
+		t.Fatalf("same input should read directory once, got %d reads", readCount)
+	}
+
+	model.input.SetValue("@s")
+	_ = model.currentSuggestions()
+	if readCount != 2 {
+		t.Fatalf("changed input should refresh directory suggestions, got %d reads", readCount)
+	}
+}
+
 func TestLineExtensionUIHandlerAnswersPrompts(t *testing.T) {
 	scanner := bufio.NewScanner(strings.NewReader("y\n2\nhello\n"))
 	var stdout bytes.Buffer
@@ -438,6 +827,57 @@ func TestLineExtensionUIHandlerAnswersPrompts(t *testing.T) {
 	}
 	if string(result) != `"hello"` {
 		t.Fatalf("input result=%s want %q", result, `"hello"`)
+	}
+}
+
+func TestInteractiveExtensionStatusesSortSanitizeAndClear(t *testing.T) {
+	model := &interactiveModel{}
+	alpha := " Alpha\nready "
+	zeta := " Zeta\tbusy "
+	model.setExtensionStatus("zeta", &zeta)
+	model.setExtensionStatus("alpha", &alpha)
+	if got := model.extensionStatusValues(); len(got) != 2 || got[0] != "Alpha ready" || got[1] != "Zeta busy" {
+		t.Fatalf("statuses=%#v", got)
+	}
+	model.setExtensionStatus("alpha", nil)
+	if got := model.extensionStatusValues(); len(got) != 1 || got[0] != "Zeta busy" {
+		t.Fatalf("statuses after clear=%#v", got)
+	}
+}
+
+func TestInteractiveExtensionUISetStatusBindsRuntimeHandler(t *testing.T) {
+	runtime := testInteractiveRuntime(t)
+	api := coreext.NewAPI()
+	runtime.Session().extensionRuntime = coreext.NewRunnerWithAPI(api)
+
+	model, err := newInteractiveModel(context.Background(), runtime, "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	posted := make(chan struct{}, 1)
+	model.post = func(msg tea.Msg) {
+		model.Update(msg)
+		posted <- struct{}{}
+	}
+	model.bindExtensionUIHandler()
+	handler := api.UIHandler()
+	if handler == nil {
+		t.Fatal("expected interactive model to bind extension UI handler")
+	}
+	result, err := handler(context.Background(), "setStatus", json.RawMessage(`{"key":"build","text":"Building"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(result) != "null" {
+		t.Fatalf("result=%s want null", result)
+	}
+	select {
+	case <-posted:
+	case <-time.After(time.Second):
+		t.Fatal("setStatus message was not posted to the TUI")
+	}
+	if got := model.extensionStatusValues(); len(got) != 1 || got[0] != "Building" {
+		t.Fatalf("statuses=%#v", got)
 	}
 }
 
@@ -491,6 +931,51 @@ func TestInteractiveExtensionUIConfirmBindsRuntimeHandler(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("extension UI handler did not receive the confirm response")
+	}
+}
+
+func TestInteractiveExtensionTriggerTurnQueuesFollowUpWhileBusy(t *testing.T) {
+	runtime := testInteractiveRuntime(t)
+	model, err := newInteractiveModel(context.Background(), runtime, "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	posted := make(chan tea.Msg, 1)
+	model.post = func(msg tea.Msg) {
+		posted <- msg
+	}
+	model.bindExtensionUIHandler()
+	agent := runtime.Session()
+	agent.mu.Lock()
+	handler := agent.extensionTriggerTurnHandler
+	agent.mu.Unlock()
+	if handler == nil {
+		t.Fatal("expected interactive model to bind extension triggerTurn handler")
+	}
+	if err := handler(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case msg := <-posted:
+		if _, ok := msg.(interactiveExtensionTriggerTurnMsg); !ok {
+			t.Fatalf("posted msg=%T", msg)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("trigger turn message was not posted to the TUI")
+	}
+
+	model.unbindSession()
+	model.busy = true
+	model.busyKind = interactiveBusyAgent
+	cmd := model.handleExtensionTriggerTurn()
+	if cmd == nil {
+		t.Fatal("expected triggerTurn to return a queue command while busy")
+	}
+	if done, ok := cmd().(interactiveQueueDoneMsg); !ok || done.Err != nil {
+		t.Fatalf("queue result=%#v", done)
+	}
+	if len(agent.followUpQueue) != 1 || agent.followUpQueue[0].Message != "" {
+		t.Fatalf("followUpQueue=%#v", agent.followUpQueue)
 	}
 }
 

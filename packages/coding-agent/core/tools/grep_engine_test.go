@@ -12,8 +12,8 @@ import (
 // ripgrep path produces output byte-identical to the RE2 fallback, so swapping
 // engines (rg present vs absent) never changes what the model sees.
 func TestSearchRipgrepMatchesRE2Format(t *testing.T) {
-	rg, ok := findRipgrep("")
-	if !ok {
+	rg := resolveManagedTool(context.Background(), managedToolRG, "").Path
+	if rg == "" {
 		t.Skip("rg not available on PATH")
 	}
 	root := t.TempDir()
@@ -38,7 +38,7 @@ func TestSearchRipgrepMatchesRE2Format(t *testing.T) {
 // explanatory error instead of silently mismatching.
 func TestGrepFallsBackToRE2WhenNoRipgrep(t *testing.T) {
 	old := ripgrepFinder
-	ripgrepFinder = func(string) (string, bool) { return "", false }
+	ripgrepFinder = func(context.Context, string) managedToolResult { return managedToolResult{} }
 	defer func() { ripgrepFinder = old }()
 
 	root := t.TempDir()
@@ -52,8 +52,16 @@ func TestGrepFallsBackToRE2WhenNoRipgrep(t *testing.T) {
 	if !advanced.IsError {
 		t.Fatal("RE2 fallback should error on a look-around pattern")
 	}
-	if msg := toolText(advanced.Content); !strings.Contains(msg, "RE2") {
-		t.Fatalf("fallback error should explain the RE2 limitation, got: %q", msg)
+	if msg := toolText(advanced.Content); strings.Contains(msg, "ripgrep") || strings.Contains(msg, "RE2") {
+		t.Fatalf("fallback reason should be hidden when no bin dir is configured, got: %q", msg)
+	}
+
+	managed := GrepTool{CWD: root, BinDir: t.TempDir()}.Execute(context.Background(), raw(map[string]any{"pattern": "foo(?=bar)"}), nil)
+	if !managed.IsError {
+		t.Fatal("RE2 fallback with managed bin dir should still error on a look-around pattern")
+	}
+	if msg := toolText(managed.Content); !strings.Contains(msg, "ripgrep") || !strings.Contains(msg, "RE2") {
+		t.Fatalf("managed fallback error should explain the engine fallback, got: %q", msg)
 	}
 }
 

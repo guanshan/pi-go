@@ -192,6 +192,12 @@ func (m *DefaultPackageManager) Install(source string, local bool, progress Prog
 		defer os.RemoveAll(staged)
 		// Full clone (no --depth 1) to match TS, so the later `git checkout <ref>`
 		// and Update's `git pull --ff-only` work on arbitrary history.
+		// Seed the git root with a .gitignore ("*\n!.gitignore\n") so a managed
+		// checkout under a synced/tracked tree is ignored, mirroring installGit ->
+		// ensureGitIgnore(gitRoot) in package-manager.ts (~1766).
+		if err := m.ensureGitIgnore(gitRoot); err != nil {
+			return core.PackageRecord{}, err
+		}
 		args := []string{"clone", gitSource.Repo, staged}
 		if err := runPM("", "git", args...); err != nil {
 			return core.PackageRecord{}, err
@@ -213,13 +219,22 @@ func (m *DefaultPackageManager) Install(source string, local bool, progress Prog
 		// with transitive deps. Mirrors installNpm -> getNpmInstallArgs in
 		// package-manager.ts (~1730): `npm install <spec> --prefix <root>`.
 		npmRoot := m.npmInstallRoot(local)
-		if err := os.MkdirAll(npmRoot, 0o755); err != nil {
+		installPath = filepath.Join(npmRoot, "node_modules", filepath.FromSlash(parsed.Name))
+		// Establish the managed npm project (mkdir + cloud-sync mark + .gitignore +
+		// package.json) before any cache-hit return, mirroring installNpm ->
+		// ensureNpmProject in package-manager.ts (~1738).
+		if err := m.ensureNpmProject(npmRoot); err != nil {
 			return core.PackageRecord{}, err
 		}
-		// Keep the shared node_modules tree out of cloud-sync clients (Dropbox,
-		// iCloud), mirroring ensureNpmProject -> markPathIgnoredByCloudSync in
-		// package-manager.ts (~1865).
-		MarkPathIgnoredByCloudSync(npmRoot)
+		// Cache hit: a present package whose installed version already satisfies the
+		// pinned ref needs no reinstall. Mirrors resolvePackageSources' needsInstall
+		// gate (`parsed.pinned && !installedNpmMatchesPinnedVersion(...)`) in
+		// package-manager.ts (~1241). An unpinned npm source always reinstalls so
+		// it can advance to the latest published version.
+		if fileExistsLocal(installPath) && parsed.Pinned && installedNpmMatchesPinnedVersion(installPath, parsed.Ref) {
+			emitProgress(progress, "done", "installed "+source, installPath)
+			return core.PackageRecord{Source: source, Path: installPath, Local: local, Pinned: parsed.Pinned}, nil
+		}
 		spec := parsed.Name
 		if parsed.Ref != "" {
 			spec += "@" + parsed.Ref
@@ -227,7 +242,6 @@ func (m *DefaultPackageManager) Install(source string, local bool, progress Prog
 		if err := m.runNpm("", m.npmInstallArgs(spec, npmRoot)...); err != nil {
 			return core.PackageRecord{}, err
 		}
-		installPath = filepath.Join(npmRoot, "node_modules", filepath.FromSlash(parsed.Name))
 	case "path":
 		path := core.ResolveInCWD(m.CWD, parsed.Name)
 		emitProgress(progress, "start", "installing "+source, path)
@@ -352,8 +366,22 @@ func (m *DefaultPackageManager) Update(source string, progress ProgressCallback)
 		}
 		if _, err := os.Stat(filepath.Join(record.Path, ".git")); err == nil {
 			emitProgress(progress, "start", "updating "+record.Source, record.Path)
-			if err := runPM(record.Path, "git", "pull", "--ff-only"); err != nil {
-				return err
+			if ref := ParsePackageSource(record.Source).Ref; ref != "" {
+				// Ref-bearing git source: fetch only that ref then hard-reset the
+				// checkout to the fetched commit (FETCH_HEAD), mirroring updateGit ->
+				// ensureGitRef(targetDir, ["fetch","origin",<ref>], "FETCH_HEAD") in
+				// package-manager.ts (~1789). (Pinned sources are skipped earlier; an
+				// unpinned source carrying an explicit ref still lands here.)
+				if err := m.ensureGitRef(record.Path, []string{"fetch", "origin", ref}, "FETCH_HEAD"); err != nil {
+					return err
+				}
+			} else {
+				// No ref recorded: fast-forward the current branch. Deriving the
+				// origin-HEAD/upstream target (getLocalGitUpdateTarget) is deferred;
+				// see docs/TS_COMPATIBILITY.md.
+				if err := runPM(record.Path, "git", "pull", "--ff-only"); err != nil {
+					return err
+				}
 			}
 			if err := m.installPackageDependencies(record.Path); err != nil {
 				return err
@@ -368,10 +396,9 @@ func (m *DefaultPackageManager) Update(source string, progress ProgressCallback)
 		// versions are fixed and were already skipped above.
 		if parsed := ParsePackageSource(record.Source); parsed.Kind == "npm" {
 			npmRoot := m.npmInstallRoot(record.Local)
-			if err := os.MkdirAll(npmRoot, 0o755); err != nil {
+			if err := m.ensureNpmProject(npmRoot); err != nil {
 				return err
 			}
-			MarkPathIgnoredByCloudSync(npmRoot)
 			emitProgress(progress, "start", "updating "+record.Source, record.Path)
 			if err := m.runNpm("", m.npmInstallArgs(parsed.Name+"@latest", npmRoot)...); err != nil {
 				return err
@@ -665,6 +692,128 @@ func (m *DefaultPackageManager) gitDependencyInstallArgs() []string {
 	return []string{"install", "--omit=dev"}
 }
 
+// ensureNpmProject establishes the managed npm install root, mirroring
+// ensureNpmProject in package-manager.ts (~1868): create the directory, keep it
+// out of cloud-sync clients, seed a .gitignore, and write a minimal
+// package.json ({"name":"pi-extensions","private":true}, 2-space indent) when
+// none exists so npm treats the root as a project.
+func (m *DefaultPackageManager) ensureNpmProject(installRoot string) error {
+	if err := os.MkdirAll(installRoot, 0o755); err != nil {
+		return err
+	}
+	MarkPathIgnoredByCloudSync(installRoot)
+	if err := ensureGitIgnore(installRoot); err != nil {
+		return err
+	}
+	packageJSONPath := filepath.Join(installRoot, "package.json")
+	if fileExistsLocal(packageJSONPath) {
+		return nil
+	}
+	pkg := map[string]any{"name": "pi-extensions", "private": true}
+	data, err := json.MarshalIndent(pkg, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(packageJSONPath, data, 0o644)
+}
+
+// ensureGitIgnore writes "*\n!.gitignore\n" into <dir>/.gitignore when absent,
+// mirroring ensureGitIgnore in package-manager.ts (~1881) so a managed install
+// root is ignored by any enclosing repository.
+func ensureGitIgnore(dir string) error {
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	ignorePath := filepath.Join(dir, ".gitignore")
+	if fileExistsLocal(ignorePath) {
+		return nil
+	}
+	return os.WriteFile(ignorePath, []byte("*\n!.gitignore\n"), 0o644)
+}
+
+// ensureGitIgnore on the manager just forwards to the package-level helper so
+// callers inside Install read naturally; both share one implementation.
+func (m *DefaultPackageManager) ensureGitIgnore(dir string) error {
+	return ensureGitIgnore(dir)
+}
+
+// ensureGitRef fetches into an existing checkout and hard-resets to the fetched
+// commit when the local HEAD differs, then reinstalls dependencies. Mirrors
+// ensureGitRef in package-manager.ts (~1798): run the given fetch args, compare
+// `git rev-parse HEAD` against `git rev-parse <ref>^{commit}`, and on divergence
+// `git reset --hard <ref>^{commit}` + `git clean -fdx` before re-running the git
+// dependency install. updateGit passes fetchArgs ["fetch","origin",<source.ref>]
+// with ref "FETCH_HEAD", so the reset targets the just-fetched commit rather
+// than the stale local branch tip.
+func (m *DefaultPackageManager) ensureGitRef(targetDir string, fetchArgs []string, ref string) error {
+	if err := runPM(targetDir, "git", fetchArgs...); err != nil {
+		return err
+	}
+	commitRef := ref + "^{commit}"
+	localHead, err := runPMCapture(targetDir, "git", "rev-parse", "HEAD")
+	if err != nil {
+		return err
+	}
+	targetHead, err := runPMCapture(targetDir, "git", "rev-parse", commitRef)
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(localHead) == strings.TrimSpace(targetHead) {
+		return nil
+	}
+	if err := runPM(targetDir, "git", "reset", "--hard", commitRef); err != nil {
+		return err
+	}
+	// Extensions should be pristine; drop any untracked/ignored files.
+	if err := runPM(targetDir, "git", "clean", "-fdx"); err != nil {
+		return err
+	}
+	return m.installPackageDependencies(targetDir)
+}
+
+// installedNpmMatchesPinnedVersion reports whether an already-installed npm
+// package satisfies a pinned ref, mirroring installedNpmMatchesPinnedVersion in
+// package-manager.ts (~1412): read <path>/package.json's version; a missing
+// version is never a match, an empty/dist-tag pin (e.g. "latest") always
+// matches a present install, and a concrete pin must equal the installed
+// version exactly.
+func installedNpmMatchesPinnedVersion(installedPath, ref string) bool {
+	raw, err := os.ReadFile(filepath.Join(installedPath, "package.json"))
+	if err != nil {
+		return false
+	}
+	var pkg struct {
+		Version string `json:"version"`
+	}
+	if err := json.Unmarshal(raw, &pkg); err != nil {
+		return false
+	}
+	if pkg.Version == "" {
+		return false
+	}
+	if ref == "" {
+		return true
+	}
+	return pkg.Version == ref
+}
+
+// offlineModeEnabled reports whether PI_OFFLINE requests skipping network
+// operations, mirroring isOfflineModeEnabled in package-manager.ts (~41):
+// "1"/"true"/"yes" (case-insensitive) enable offline mode; anything else
+// (including unset) does not.
+func offlineModeEnabled() bool {
+	value := strings.TrimSpace(os.Getenv(core.EnvOffline))
+	if value == "" {
+		return false
+	}
+	switch strings.ToLower(value) {
+	case "1", "true", "yes":
+		return true
+	default:
+		return false
+	}
+}
+
 func packageNeedsInstall(dir string) (bool, error) {
 	raw, err := os.ReadFile(filepath.Join(dir, "package.json"))
 	if os.IsNotExist(err) {
@@ -814,6 +963,19 @@ func runPM(dir, name string, args ...string) error {
 	// mirroring TS's windowsHide: true; no-op on other platforms.
 	hidePMWindow(cmd)
 	return cmd.Run()
+}
+
+// runPMCapture runs a package-manager/git command and returns its stdout,
+// mirroring runCommandCapture in package-manager.ts; used for `git rev-parse`
+// comparisons in ensureGitRef.
+func runPMCapture(dir, name string, args ...string) (string, error) {
+	cmd := exec.Command(name, args...)
+	if dir != "" {
+		cmd.Dir = dir
+	}
+	hidePMWindow(cmd)
+	out, err := cmd.Output()
+	return string(out), err
 }
 
 func sanitizePackageSource(source string) string {

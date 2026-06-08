@@ -9,7 +9,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"strings"
 
 	"github.com/guanshan/pi-go/packages/ai"
@@ -50,17 +49,25 @@ func (t FindTool) Execute(ctx context.Context, raw json.RawMessage, _ ToolUpdate
 	if limit <= 0 {
 		// An explicit limit:0 yields zero results, matching fd --max-results 0 /
 		// the `results.length >= 0` guard in find.ts (effectiveLimit 0).
-		return formatFindResults(nil, false, limit)
+		return formatFindResults(nil, false, limit, "")
 	}
 	var results []string
 	limitReached := false
-	if fdPath, ok := fdFinder(t.BinDir); ok {
-		fdResults, fdLimit, fdErr := searchFd(ctx, fdPath, root, args.Pattern, limit)
+	fallbackReason := ""
+	if fd := fdFinder(ctx, t.BinDir); fd.Path != "" {
+		fdResults, fdLimit, fdErr := searchFd(ctx, fd.Path, root, args.Pattern, limit)
 		if fdErr == nil {
 			results = fdResults
 			limitReached = fdLimit
-			return formatFindResults(results, limitReached, limit)
+			return formatFindResults(results, limitReached, limit, "")
 		}
+		fallbackReason = fmt.Sprintf("fd failed: %v; the built-in filesystem walk was used", fdErr)
+	} else if t.BinDir != "" {
+		// Match grep's gating: only surface the "fd not found, built-in walk
+		// used" notice when an agent bin dir is configured (i.e. fd was expected
+		// to be managed). With no bin dir the built-in walk is the normal
+		// baseline and the notice is just noise.
+		fallbackReason = fdFallbackReason(fd.Diagnostic)
 	}
 	_ = walkFiltered(root, true, func(path string, d os.DirEntry) error {
 		if globMatch(args.Pattern, path, root) {
@@ -77,18 +84,27 @@ func (t FindTool) Execute(ctx context.Context, raw json.RawMessage, _ ToolUpdate
 		}
 		return nil
 	})
-	return formatFindResults(results, limitReached, limit)
+	return formatFindResults(results, limitReached, limit, fallbackReason)
 }
 
-func formatFindResults(results []string, limitReached bool, limit int) ai.ToolResult {
+func formatFindResults(results []string, limitReached bool, limit int, fallbackReason string) ai.ToolResult {
+	details := map[string]any{}
 	if len(results) == 0 {
-		return ai.ToolResult{Content: ai.TextBlocks("No files found matching pattern")}
+		text := "No files found matching pattern"
+		if fallbackReason != "" {
+			text += "\n\n[" + fallbackReason + "]"
+			details["engineFallback"] = fallbackReason
+		}
+		return ai.ToolResult{Content: ai.TextBlocks(text), Details: detailsOrNil(details)}
 	}
 	rawOutput := strings.Join(results, "\n")
 	trunc := TruncateHead(rawOutput, 1<<30, DefaultMaxBytes)
 	text := trunc.Content
-	details := map[string]any{}
 	notices := []string{}
+	if fallbackReason != "" {
+		details["engineFallback"] = fallbackReason
+		notices = append(notices, fallbackReason)
+	}
 	if limitReached {
 		details["resultLimitReached"] = limit
 		notices = append(notices, fmt.Sprintf("%d results limit reached. Use limit=%d for more, or refine pattern", limit, limit*2))
@@ -103,27 +119,15 @@ func formatFindResults(results []string, limitReached bool, limit int) ai.ToolRe
 	return ai.ToolResult{Content: ai.TextBlocks(text), Details: detailsOrNil(details)}
 }
 
-var fdFinder = findFd
+var fdFinder = func(ctx context.Context, binDir string) managedToolResult {
+	return resolveManagedTool(ctx, managedToolFD, binDir)
+}
 
-func findFd(binDir string) (string, bool) {
-	names := []string{"fd"}
-	if runtime.GOOS == "windows" {
-		names = []string{"fd.exe"}
+func fdFallbackReason(diagnostic string) string {
+	if strings.TrimSpace(diagnostic) != "" {
+		return diagnostic + "; the built-in filesystem walk was used"
 	}
-	if binDir != "" {
-		for _, name := range names {
-			candidate := filepath.Join(binDir, name)
-			if info, err := os.Stat(candidate); err == nil && !info.IsDir() {
-				return candidate, true
-			}
-		}
-	}
-	for _, name := range append(names, "fdfind") {
-		if path, err := exec.LookPath(name); err == nil && path != "" {
-			return path, true
-		}
-	}
-	return "", false
+	return "fd was not found, so the built-in filesystem walk was used"
 }
 
 func searchFd(ctx context.Context, fdPath, root, pattern string, limit int) ([]string, bool, error) {

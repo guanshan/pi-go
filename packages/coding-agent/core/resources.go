@@ -14,9 +14,10 @@ import (
 )
 
 type PromptTemplate struct {
-	Name    string
-	Path    string
-	Content string
+	Name       string
+	Path       string
+	Content    string
+	SourceInfo ResourceSourceInfo
 }
 
 type Skill struct {
@@ -24,6 +25,13 @@ type Skill struct {
 	Path        string
 	Description string
 	Content     string
+	SourceInfo  ResourceSourceInfo
+}
+
+type ResourceSourceInfo struct {
+	Path   string
+	Source string
+	Scope  string
 }
 
 type ResourceLoader struct {
@@ -67,34 +75,36 @@ func LoadResources(cwd, agentDir string, args cli.Args, settings *SettingsManage
 	)
 
 	if !args.NoPromptTemplates {
-		loader.loadConfiguredResourceType("prompts", agentDir, globalSettings.Prompts)
-		loader.loadAutoResourceType("prompts", filepath.Join(agentDir, "prompts"), agentDir, globalSettings.Prompts)
-		loader.loadConfiguredResourceType("prompts", projectBaseDir, projectSettings.Prompts)
-		loader.loadAutoResourceType("prompts", filepath.Join(projectBaseDir, "prompts"), projectBaseDir, projectSettings.Prompts)
+		loader.loadConfiguredResourceType("prompts", agentDir, globalSettings.Prompts, userResourceSource("local"))
+		loader.loadAutoResourceType("prompts", filepath.Join(agentDir, "prompts"), agentDir, globalSettings.Prompts, userResourceSource("auto"))
+		loader.loadConfiguredResourceType("prompts", projectBaseDir, projectSettings.Prompts, projectResourceSource("local"))
+		loader.loadAutoResourceType("prompts", filepath.Join(projectBaseDir, "prompts"), projectBaseDir, projectSettings.Prompts, projectResourceSource("auto"))
 	}
 	for _, path := range args.PromptTemplates {
-		loader.loadPromptTemplates(ResolveInCWD(cwd, path))
+		resolved := ResolveInCWD(cwd, path)
+		loader.loadPromptTemplates(resolved, cliResourceSource(resolved))
 	}
 
 	if !args.NoSkills {
-		loader.loadConfiguredResourceType("skills", agentDir, globalSettings.Skills)
-		loader.loadAutoResourceType("skills", filepath.Join(agentDir, "skills"), agentDir, globalSettings.Skills)
-		loader.loadAutoResourceType("skills", filepath.Join(HomeDir(), ".agents", "skills"), filepath.Join(HomeDir(), ".agents"), globalSettings.Skills)
-		loader.loadConfiguredResourceType("skills", projectBaseDir, projectSettings.Skills)
+		loader.loadConfiguredResourceType("skills", agentDir, globalSettings.Skills, userResourceSource("local"))
+		loader.loadAutoResourceType("skills", filepath.Join(agentDir, "skills"), agentDir, globalSettings.Skills, userResourceSource("auto"))
+		loader.loadAutoResourceType("skills", filepath.Join(HomeDir(), ".agents", "skills"), filepath.Join(HomeDir(), ".agents"), globalSettings.Skills, userResourceSource("auto"))
+		loader.loadConfiguredResourceType("skills", projectBaseDir, projectSettings.Skills, projectResourceSource("local"))
 		for _, dir := range ancestorDirs(cwd) {
-			loader.loadAutoResourceType("skills", filepath.Join(dir, ".pi", "skills"), filepath.Join(dir, ".pi"), projectSettings.Skills)
-			loader.loadAutoResourceType("skills", filepath.Join(dir, ".agents", "skills"), filepath.Join(dir, ".agents"), projectSettings.Skills)
+			loader.loadAutoResourceType("skills", filepath.Join(dir, ".pi", "skills"), filepath.Join(dir, ".pi"), projectSettings.Skills, projectResourceSource("auto"))
+			loader.loadAutoResourceType("skills", filepath.Join(dir, ".agents", "skills"), filepath.Join(dir, ".agents"), projectSettings.Skills, projectResourceSource("auto"))
 		}
 	}
 	for _, path := range args.Skills {
-		loader.loadSkills(ResolveInCWD(cwd, path))
+		resolved := ResolveInCWD(cwd, path)
+		loader.loadSkills(resolved, cliResourceSource(resolved))
 	}
 
 	if !args.NoThemes {
-		loader.loadConfiguredResourceType("themes", agentDir, globalSettings.Themes)
-		loader.loadAutoResourceType("themes", filepath.Join(agentDir, "themes"), agentDir, globalSettings.Themes)
-		loader.loadConfiguredResourceType("themes", projectBaseDir, projectSettings.Themes)
-		loader.loadAutoResourceType("themes", filepath.Join(projectBaseDir, "themes"), projectBaseDir, projectSettings.Themes)
+		loader.loadConfiguredResourceType("themes", agentDir, globalSettings.Themes, userResourceSource("local"))
+		loader.loadAutoResourceType("themes", filepath.Join(agentDir, "themes"), agentDir, globalSettings.Themes, userResourceSource("auto"))
+		loader.loadConfiguredResourceType("themes", projectBaseDir, projectSettings.Themes, projectResourceSource("local"))
+		loader.loadAutoResourceType("themes", filepath.Join(projectBaseDir, "themes"), projectBaseDir, projectSettings.Themes, projectResourceSource("auto"))
 	}
 	for _, path := range args.Themes {
 		loader.loadThemes(ResolveInCWD(cwd, path))
@@ -105,10 +115,10 @@ func LoadResources(cwd, agentDir string, args cli.Args, settings *SettingsManage
 	}
 
 	if !args.NoExtensions {
-		loader.loadConfiguredResourceType("extensions", agentDir, globalSettings.Extensions)
-		loader.loadAutoResourceType("extensions", filepath.Join(agentDir, "extensions"), agentDir, globalSettings.Extensions)
-		loader.loadConfiguredResourceType("extensions", projectBaseDir, projectSettings.Extensions)
-		loader.loadAutoResourceType("extensions", filepath.Join(projectBaseDir, "extensions"), projectBaseDir, projectSettings.Extensions)
+		loader.loadConfiguredResourceType("extensions", agentDir, globalSettings.Extensions, userResourceSource("local"))
+		loader.loadAutoResourceType("extensions", filepath.Join(agentDir, "extensions"), agentDir, globalSettings.Extensions, userResourceSource("auto"))
+		loader.loadConfiguredResourceType("extensions", projectBaseDir, projectSettings.Extensions, projectResourceSource("local"))
+		loader.loadAutoResourceType("extensions", filepath.Join(projectBaseDir, "extensions"), projectBaseDir, projectSettings.Extensions, projectResourceSource("auto"))
 	}
 	for _, ext := range args.Extensions {
 		loader.Extensions = append(loader.Extensions, ResolveInCWD(cwd, ext))
@@ -290,26 +300,51 @@ func ancestorDirs(cwd string) []string {
 	return dirs
 }
 
-func (r *ResourceLoader) loadConfiguredResourceType(resourceType, baseDir string, entries []string) {
+func userResourceSource(source string) ResourceSourceInfo {
+	return ResourceSourceInfo{Source: source, Scope: "user"}
+}
+
+func projectResourceSource(source string) ResourceSourceInfo {
+	return ResourceSourceInfo{Source: source, Scope: "project"}
+}
+
+func cliResourceSource(path string) ResourceSourceInfo {
+	return ResourceSourceInfo{Path: path, Source: "cli", Scope: "temporary"}
+}
+
+func packageResourceSource(entry packageEntry) ResourceSourceInfo {
+	scope := "user"
+	if entry.Record.Local {
+		scope = "project"
+	}
+	return ResourceSourceInfo{Source: entry.Record.Source, Scope: scope}
+}
+
+func withResourceSourcePath(source ResourceSourceInfo, path string) ResourceSourceInfo {
+	source.Path = path
+	return source
+}
+
+func (r *ResourceLoader) loadConfiguredResourceType(resourceType, baseDir string, entries []string, source ResourceSourceInfo) {
 	for _, path := range configuredResourcePaths(resourceType, baseDir, entries) {
-		r.loadResourcePath(resourceType, path)
+		r.loadResourcePath(resourceType, path, withResourceSourcePath(source, path))
 	}
 }
 
-func (r *ResourceLoader) loadAutoResourceType(resourceType, root, baseDir string, entries []string) {
+func (r *ResourceLoader) loadAutoResourceType(resourceType, root, baseDir string, entries []string, source ResourceSourceInfo) {
 	for _, path := range autoResourcePaths(resourceType, root) {
 		if resourceEnabledByOverrides(path, entries, baseDir) {
-			r.loadResourcePath(resourceType, path)
+			r.loadResourcePath(resourceType, path, withResourceSourcePath(source, path))
 		}
 	}
 }
 
-func (r *ResourceLoader) loadResourcePath(resourceType, path string) {
+func (r *ResourceLoader) loadResourcePath(resourceType, path string, source ResourceSourceInfo) {
 	switch resourceType {
 	case "prompts":
-		r.loadPromptTemplates(path)
+		r.loadPromptTemplates(path, withResourceSourcePath(source, path))
 	case "skills":
-		r.loadSkills(path)
+		r.loadSkills(path, withResourceSourcePath(source, path))
 	case "themes":
 		r.loadThemes(path)
 	case "extensions":
@@ -424,58 +459,60 @@ func isResourceOverridePattern(pattern string) bool {
 	return strings.HasPrefix(pattern, "!") || strings.HasPrefix(pattern, "+") || strings.HasPrefix(pattern, "-")
 }
 
-func (r *ResourceLoader) loadPromptTemplates(path string) {
+func (r *ResourceLoader) loadPromptTemplates(path string, source ResourceSourceInfo) {
 	info, err := os.Stat(path)
 	if err != nil {
 		return
 	}
 	if !info.IsDir() {
-		r.addPromptTemplate(path)
+		r.addPromptTemplate(path, withResourceSourcePath(source, path))
 		return
 	}
 	_ = filepath.WalkDir(path, func(p string, d os.DirEntry, err error) error {
 		if err != nil || d.IsDir() || !strings.HasSuffix(strings.ToLower(d.Name()), ".md") {
 			return nil
 		}
-		r.addPromptTemplate(p)
+		r.addPromptTemplate(p, withResourceSourcePath(source, p))
 		return nil
 	})
 }
 
-func (r *ResourceLoader) addPromptTemplate(path string) {
+func (r *ResourceLoader) addPromptTemplate(path string, source ResourceSourceInfo) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		r.Diagnostics = append(r.Diagnostics, cli.Diagnostic{Type: "warning", Message: err.Error()})
 		return
 	}
 	name := strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
-	r.PromptTemplates[name] = PromptTemplate{Name: name, Path: path, Content: stripFrontmatter(string(data))}
+	r.PromptTemplates[name] = PromptTemplate{Name: name, Path: path, Content: stripFrontmatter(string(data)), SourceInfo: withResourceSourcePath(source, path)}
 }
 
-func (r *ResourceLoader) loadSkills(path string) {
+func (r *ResourceLoader) loadSkills(path string, source ResourceSourceInfo) {
 	info, err := os.Stat(path)
 	if err != nil {
 		return
 	}
 	if !info.IsDir() {
 		if filepath.Base(path) == "SKILL.md" {
-			r.addSkill(filepath.Dir(path), path)
+			r.addSkill(filepath.Dir(path), path, withResourceSourcePath(source, path))
 		}
 		return
 	}
 	if fileExists(filepath.Join(path, "SKILL.md")) {
-		r.addSkill(path, filepath.Join(path, "SKILL.md"))
+		skillPath := filepath.Join(path, "SKILL.md")
+		r.addSkill(path, skillPath, withResourceSourcePath(source, skillPath))
 		return
 	}
 	entries, _ := os.ReadDir(path)
 	for _, entry := range entries {
 		if entry.IsDir() && fileExists(filepath.Join(path, entry.Name(), "SKILL.md")) {
-			r.addSkill(filepath.Join(path, entry.Name()), filepath.Join(path, entry.Name(), "SKILL.md"))
+			skillPath := filepath.Join(path, entry.Name(), "SKILL.md")
+			r.addSkill(filepath.Join(path, entry.Name()), skillPath, withResourceSourcePath(source, skillPath))
 		}
 	}
 }
 
-func (r *ResourceLoader) addSkill(dir, skillPath string) {
+func (r *ResourceLoader) addSkill(dir, skillPath string, source ResourceSourceInfo) {
 	data, err := os.ReadFile(skillPath)
 	if err != nil {
 		r.Diagnostics = append(r.Diagnostics, cli.Diagnostic{Type: "warning", Message: err.Error()})
@@ -484,7 +521,7 @@ func (r *ResourceLoader) addSkill(dir, skillPath string) {
 	name := filepath.Base(dir)
 	content := string(data)
 	description := extractSkillDescription(content)
-	r.Skills[name] = Skill{Name: name, Path: skillPath, Description: description, Content: content}
+	r.Skills[name] = Skill{Name: name, Path: skillPath, Description: description, Content: content, SourceInfo: withResourceSourcePath(source, skillPath)}
 }
 
 func (r *ResourceLoader) loadThemes(path string) {
@@ -521,28 +558,30 @@ func (r *ResourceLoader) loadPackageEntryResources(entry packageEntry, args cli.
 	if root == "" {
 		return
 	}
+	source := packageResourceSource(entry)
 	manifest := readPackageManifest(root)
 	if !args.NoPromptTemplates {
-		r.loadPackageResourceType(root, "prompts", entry.Setting.Prompts, entry.Setting.Prompts != nil, manifest.Prompts)
+		r.loadPackageResourceType(root, "prompts", entry.Setting.Prompts, entry.Setting.Prompts != nil, manifest.Prompts, source)
 	}
 	if !args.NoSkills {
-		r.loadPackageResourceType(root, "skills", entry.Setting.Skills, entry.Setting.Skills != nil, manifest.Skills)
+		r.loadPackageResourceType(root, "skills", entry.Setting.Skills, entry.Setting.Skills != nil, manifest.Skills, source)
 	}
 	if !args.NoThemes {
-		r.loadPackageResourceType(root, "themes", entry.Setting.Themes, entry.Setting.Themes != nil, manifest.Themes)
+		r.loadPackageResourceType(root, "themes", entry.Setting.Themes, entry.Setting.Themes != nil, manifest.Themes, source)
 	}
 	if !args.NoExtensions {
-		r.loadPackageResourceType(root, "extensions", entry.Setting.Extensions, entry.Setting.Extensions != nil, manifest.Extensions)
+		r.loadPackageResourceType(root, "extensions", entry.Setting.Extensions, entry.Setting.Extensions != nil, manifest.Extensions, source)
 	}
 }
 
-func (r *ResourceLoader) loadPackageResourceType(root, resourceType string, filter []string, hasFilter bool, manifestEntries []string) {
+func (r *ResourceLoader) loadPackageResourceType(root, resourceType string, filter []string, hasFilter bool, manifestEntries []string, source ResourceSourceInfo) {
 	for _, path := range packageResourcePaths(root, resourceType, filter, hasFilter, manifestEntries) {
+		source := withResourceSourcePath(source, path)
 		switch resourceType {
 		case "prompts":
-			r.addPromptTemplate(path)
+			r.addPromptTemplate(path, source)
 		case "skills":
-			r.loadSkills(path)
+			r.loadSkills(path, source)
 		case "themes":
 			r.loadThemes(path)
 		case "extensions":

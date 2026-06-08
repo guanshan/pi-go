@@ -21,13 +21,27 @@ func BuiltinTools(cwd string, settings *SettingsManager) ToolSet {
 // BuiltinToolsForModel builds the builtin toolset with the active model's image
 // capability so the read tool can mirror read.ts getNonVisionImageNote.
 func BuiltinToolsForModel(cwd string, settings *SettingsManager, modelSupportsImages bool) ToolSet {
-	options := catools.BuiltinToolOptions{AutoResize: true, BinDir: BinDir(), ModelSupportsImages: modelSupportsImages}
+	options := catools.BuiltinToolOptions{AutoResize: true, BinDir: settingsBinDir(settings), ModelSupportsImages: modelSupportsImages}
 	if settings != nil {
 		options.ShellPath = settings.mergedString(settings.Global.ShellPath, settings.Project.ShellPath, "")
 		options.CommandPrefix = settings.ShellCommandPrefix()
 		options.AutoResize = settings.ImageAutoResize()
 	}
 	return ToolSet(catools.BuiltinTools(cwd, options))
+}
+
+func settingsBinDir(settings *SettingsManager) string {
+	if settings != nil && settings.AgentDir != "" {
+		return BinDirForAgentDir(settings.AgentDir)
+	}
+	return BinDir()
+}
+
+func agentSessionBinDir(agent *AgentSession) string {
+	if agent != nil {
+		return settingsBinDir(agent.Settings)
+	}
+	return BinDir()
 }
 
 func FilterTools(all ToolSet, args cli.Args) ToolSet {

@@ -2,6 +2,7 @@ package ai
 
 import (
 	"encoding/json"
+	"fmt"
 	"strings"
 	"time"
 
@@ -45,6 +46,8 @@ type Model struct {
 	Cost             ModelCost          `json:"cost,omitempty"`
 	Headers          map[string]string  `json:"headers,omitempty"`
 	Compat           OpenAICompat       `json:"compat,omitempty"`
+	Source           string             `json:"-"`
+	Shadowed         *Model             `json:"-"`
 	Raw              json.RawMessage    `json:"-"`
 }
 
@@ -560,11 +563,11 @@ type ToolResultMessage struct {
 func (m ToolResultMessage) MessageRole() string { return "toolResult" }
 func (m ToolResultMessage) Timestamp() int64    { return m.TimestampMs }
 
-// CustomMessage is a layering exception kept for persisted agent session
+// CustomMessage is a layering exception kept for persisted legacy session
 // compatibility. The upstream TS ai layer only has user, assistant, and
-// toolResult messages; migrate this shape to packages/agent once the
-// coding-agent and harness session readers no longer construct ai.CustomMessage
-// directly. TODO(ai-custom-message-layering): track and complete that migration.
+// toolResult messages; coding-agent/core and agent/harness now construct
+// package-owned session message types for new context entries, while this shape
+// remains readable for older JSONL sessions and compatibility tests.
 type CustomMessage struct {
 	Role               string `json:"role"`
 	Command            string `json:"command,omitempty"`
@@ -713,28 +716,100 @@ func MessageBlocks(msg Message) []ContentBlock {
 		}
 		return m.Content
 	case CustomMessage:
-		if blocks, ok := m.Content.([]ContentBlock); ok {
-			return blocks
-		}
-		if text, ok := m.Content.(string); ok && text != "" {
-			return []ContentBlock{{Type: "text", Text: text}}
-		}
+		blocks, _ := CustomContentBlocks(m.Content)
+		return blocks
 	case *CustomMessage:
 		if m == nil {
 			return nil
 		}
-		if blocks, ok := m.Content.([]ContentBlock); ok {
-			return blocks
-		}
-		if text, ok := m.Content.(string); ok && text != "" {
-			return []ContentBlock{{Type: "text", Text: text}}
-		}
+		blocks, _ := CustomContentBlocks(m.Content)
+		return blocks
 	case interface{ ContentBlocks() []ContentBlock }:
 		return m.ContentBlocks()
 	default:
 		return nil
 	}
-	return nil
+}
+
+// CustomContentBlocks normalizes a custom/session message's content (a string,
+// already-typed []ContentBlock, nil, a scalar, or the []interface{} shape
+// produced by reloading a session from JSONL) into typed content blocks. The
+// bool reports whether the content could be normalized (true except when the
+// value cannot be turned into content blocks at all). This is the single shared
+// implementation reused by the harness, compaction, and coding-agent packages.
+func CustomContentBlocks(content any) ([]ContentBlock, bool) {
+	switch value := content.(type) {
+	case string:
+		return TextBlocks(value), true
+	case []ContentBlock:
+		if contentBlocksValid(value) {
+			return sanitizeContentBlocks(value), true
+		}
+		return contentAsJSONText(value)
+	case nil:
+		return nil, true
+	default:
+		if text, ok := ScalarContentText(value); ok {
+			return TextBlocks(text), true
+		}
+		raw, err := json.Marshal(value)
+		if err != nil {
+			text := strings.TrimSpace(fmt.Sprint(value))
+			if text == "" {
+				return nil, true
+			}
+			return TextBlocks(text), true
+		}
+		var blocks []ContentBlock
+		if err := json.Unmarshal(raw, &blocks); err == nil && contentBlocksValid(blocks) {
+			return sanitizeContentBlocks(blocks), true
+		}
+		text := strings.TrimSpace(string(raw))
+		if text == "" || text == "null" {
+			return nil, true
+		}
+		return TextBlocks(text), true
+	}
+}
+
+func contentBlocksValid(blocks []ContentBlock) bool {
+	for _, block := range blocks {
+		if strings.TrimSpace(block.Type) == "" {
+			return false
+		}
+	}
+	return true
+}
+
+func contentAsJSONText(value any) ([]ContentBlock, bool) {
+	raw, err := json.Marshal(value)
+	if err != nil {
+		text := strings.TrimSpace(fmt.Sprint(value))
+		if text == "" {
+			return nil, true
+		}
+		return TextBlocks(text), true
+	}
+	text := strings.TrimSpace(string(raw))
+	if text == "" || text == "null" {
+		return nil, true
+	}
+	return TextBlocks(text), true
+}
+
+// ScalarContentText renders a scalar custom-content value (bool, integer,
+// float, or json.Number) as text, reporting false for any non-scalar value.
+func ScalarContentText(value any) (string, bool) {
+	switch value.(type) {
+	case bool,
+		int, int8, int16, int32, int64,
+		uint, uint8, uint16, uint32, uint64, uintptr,
+		float32, float64,
+		json.Number:
+		return fmt.Sprint(value), true
+	default:
+		return "", false
+	}
 }
 
 func MessageRole(msg Message) string {

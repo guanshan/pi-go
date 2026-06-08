@@ -429,7 +429,14 @@ func DebugLogPath() string {
 // package-installed executables (fd, rg, CLIs) live. Mirrors getBinDir() in
 // src/config.ts:519-520. The bash tool prepends this to PATH for every command.
 func BinDir() string {
-	return filepath.Join(AgentDir(), "bin")
+	return BinDirForAgentDir(AgentDir())
+}
+
+func BinDirForAgentDir(agentDir string) string {
+	if agentDir == "" {
+		agentDir = AgentDir()
+	}
+	return filepath.Join(agentDir, "bin")
 }
 
 func GetPackageDir() string {
@@ -520,6 +527,10 @@ func (s *SettingsManager) DefaultProvider() string {
 
 func (s *SettingsManager) DefaultModel() string {
 	return s.mergedString(s.Global.DefaultModel, s.Project.DefaultModel, "")
+}
+
+func (s *SettingsManager) Theme() string {
+	return s.mergedString(s.Global.Theme, s.Project.Theme, "")
 }
 
 func (s *SettingsManager) DefaultThinkingLevel() ai.ThinkingLevel {
@@ -652,6 +663,11 @@ func (s *SettingsManager) ProviderRetryMaxDelayMS() int {
 
 func (s *SettingsManager) HideThinkingBlock() bool {
 	return s.Bool(s.Project.HideThinkingBlock, s.Global.HideThinkingBlock, false)
+}
+
+func (s *SettingsManager) SetHideThinkingBlock(value bool) error {
+	s.Global.HideThinkingBlock = &value
+	return s.SaveGlobal()
 }
 
 func (s *SettingsManager) QuietStartup() bool {

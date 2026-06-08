@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"sync"
 	"time"
 
 	aiproviders "github.com/guanshan/pi-go/packages/ai/providers"
@@ -22,6 +23,7 @@ const (
 var errOAuthRefreshUnavailable = errors.New("oauth refresh unavailable")
 
 type ModelRegistry struct {
+	mu     sync.RWMutex
 	Models []Model
 	Auth   *AuthStorage
 }
@@ -73,12 +75,39 @@ func NewModelRegistry(agentDir string, auth *AuthStorage) *ModelRegistry {
 	return &ModelRegistry{Auth: auth, Models: models}
 }
 
+func (r *ModelRegistry) ModelsSnapshot() []Model {
+	if r == nil {
+		return nil
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return append([]Model(nil), r.Models...)
+}
+
+func (r *ModelRegistry) ReplaceModels(models []Model) {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.Models = append([]Model(nil), models...)
+}
+
+func (r *ModelRegistry) MutateModels(update func([]Model) []Model) {
+	if r == nil || update == nil {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.Models = update(r.Models)
+}
+
 func (r *ModelRegistry) Find(provider, id string) (Model, bool) {
-	return Find(r.Models, provider, id)
+	return Find(r.ModelsSnapshot(), provider, id)
 }
 
 func (r *ModelRegistry) Match(provider, pattern string) (Model, bool, string) {
-	return Match(r.Models, provider, pattern)
+	return Match(r.ModelsSnapshot(), provider, pattern)
 }
 
 func (r *ModelRegistry) InitialModel(options InitialModelOptions) (Model, bool, string) {
@@ -100,7 +129,7 @@ func (r *ModelRegistry) InitialModel(options InitialModelOptions) (Model, bool, 
 			return model, true, ""
 		}
 	}
-	for _, m := range r.Models {
+	for _, m := range r.ModelsSnapshot() {
 		if m.Provider != "faux" && r.HasAuth(m) {
 			return m, true, ""
 		}
@@ -110,7 +139,7 @@ func (r *ModelRegistry) InitialModel(options InitialModelOptions) (Model, bool, 
 
 func (r *ModelRegistry) AvailableConfigured() []Model {
 	var out []Model
-	for _, m := range r.Models {
+	for _, m := range r.ModelsSnapshot() {
 		if r.HasAuth(m) || m.Provider == "faux" {
 			out = append(out, m)
 		}
@@ -199,7 +228,7 @@ func (r *ModelRegistry) APIKey(ctx context.Context, model Model) (string, error)
 }
 
 func (r *ModelRegistry) List(search string) []Model {
-	return List(r.Models, search)
+	return List(r.ModelsSnapshot(), search)
 }
 
 func (r *ModelRegistry) StreamlessChat(ctx context.Context, req ChatRequest) (ChatResponse, error) {
